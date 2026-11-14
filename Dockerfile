@@ -42,7 +42,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-builder /app/target/release/rx-emby /app/rx-emby
-COPY config.toml /app/config.example.toml
+COPY deploy/config.example.toml /app/config.example.toml
 
 RUN mkdir -p /app/cache/images
 

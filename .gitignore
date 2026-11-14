@@ -1,5 +1,9 @@
 /target/
 /cache/
 /pg_data/
+/web_ui/*
+!/web_ui/.gitkeep
+/config.toml
 /frontend/node_modules/
+/frontend/bun.lock
 .DS_Store
