@@ -1,0 +1,9 @@
+/target/
+/cache/
+/pg_data/
+/web_ui/
+/frontend/node_modules/
+.git/
+.github/
+.DS_Store
+*.log
