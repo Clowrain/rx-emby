@@ -69,21 +69,29 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
         return Ok(None);
     }
 
-    // 显式补齐任务即使关闭全库自动刮削也可运行；自动更新遵守后台开关。
-    let refresh: Option<i64> = sqlx::query_scalar(r#"
-        SELECT id FROM media_items WHERE NOT is_ignored AND NOT is_locked
+    // 1. 显式触发的元数据补齐任务（即使关闭全库自动刮削也优先执行）
+    let explicit_refresh: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM media_items
+        WHERE NOT is_ignored
+          AND NOT is_locked
+          AND metadata_refresh_requested = TRUE
           AND (metadata_retry_at IS NULL OR metadata_retry_at <= NOW())
           AND metadata_retry_count < 3
-          AND (metadata_refresh_requested OR ($1 AND scrape_status IN (1,3) AND
-            (metadata_version < 2 OR metadata_fetched_at < NOW() - CASE
-                WHEN tmdb_metadata->>'status' = 'Returning Series' THEN INTERVAL '1 day'
-                ELSE INTERVAL '7 days' END)))
-        ORDER BY metadata_refresh_requested DESC, id ASC LIMIT 1
-    "#).bind(cfg.scraper_auto_background).fetch_optional(&state.db).await?;
-    if refresh.is_some() { return Ok(refresh); }
-    if !cfg.scraper_auto_background { return Ok(None); }
+        ORDER BY id ASC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.db)
+    .await?;
+    if explicit_refresh.is_some() {
+        return Ok(explicit_refresh);
+    }
+    if !cfg.scraper_auto_background {
+        return Ok(None);
+    }
 
-    // 1. 优先消化尚未完成主条目刮削的影视
+    // 2. 优先消化尚未完成主条目刮削的新入库/待重试影视
     let id: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT id FROM media_items
@@ -104,7 +112,7 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
         return Ok(id);
     }
 
-    // 2. 消化已刮削剧集中存在“未刮削新季/新集 (scrape_attempts = 0)”或“连载残缺集已过 24h 冷却期 (meta_incomplete = TRUE)”的条目
+    // 3. 消化已刮削剧集中存在“未刮削新季/新集 (scrape_attempts = 0)”或“连载残缺集已过 24h 冷却期 (meta_incomplete = TRUE)”的条目
     let season_pending_id: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT m.id
@@ -142,7 +150,34 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
     .fetch_optional(&state.db)
     .await?;
 
-    Ok(season_pending_id)
+    if season_pending_id.is_some() {
+        return Ok(season_pending_id);
+    }
+
+    // 4. 最后再被动补齐/刷新已刮削老条目的扩展元数据（避免堵死待刮削新片队列）
+    let passive_refresh: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM media_items
+        WHERE NOT is_ignored
+          AND NOT is_locked
+          AND scrape_status IN (1, 3)
+          AND (metadata_retry_at IS NULL OR metadata_retry_at <= NOW())
+          AND metadata_retry_count < 3
+          AND (
+              metadata_version < 2
+              OR metadata_fetched_at < NOW() - CASE
+                  WHEN tmdb_metadata->>'status' = 'Returning Series' THEN INTERVAL '1 day'
+                  ELSE INTERVAL '7 days'
+              END
+          )
+        ORDER BY id ASC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.db)
+    .await?;
+
+    Ok(passive_refresh)
 }
 
 pub async fn scrape_single_media(state: &AppState, media_id: i64) -> Result<()> {
@@ -275,6 +310,11 @@ pub async fn scrape_single_media_with_mode(
             .bind(serde_json::to_value(&meta.extra)?)
             .execute(&state.db)
             .await?;
+
+            info!(
+                "✅ [Scraper] 刮削完成 media_id={} tmdb_id={} type={} title={:?}",
+                item.id, meta.tmdb_id, meta.media_type, meta.title
+            );
 
             // 主条目刮削成功后，若为剧集则继续刮削其下所有季与单集元数据
             if meta.media_type == "tv" {
