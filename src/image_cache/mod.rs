@@ -3,6 +3,14 @@ use anyhow::{anyhow, Context, Result};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{fs, time::sleep};
 use tracing::{debug, error, info};
+use xxhash_rust::xxh3::xxh3_64;
+
+/// 计算基于文件名 xxh3 哈希前 2 位十六进制的分片相对路径（如 `w500/3a/xxx.jpg`）
+fn image_shard_rel_path(size: &str, file_name: &str) -> String {
+    let hash = xxh3_64(file_name.as_bytes());
+    let shard = (hash & 0xff) as u8;
+    format!("{}/{:02x}/{}", size, shard, file_name)
+}
 
 impl AppState {
     /// 获取本地缓存的图片字节流（首次访问自动回源 TMDB 并落盘，防并发击穿）
@@ -13,11 +21,17 @@ impl AppState {
         }
 
         let cache_key = format!("{}/{}", size, file_name);
+        let rel_path = image_shard_rel_path(size, file_name);
         let cfg = self.config.load();
-        let full_path = cfg.image_cache_dir.join(size).join(file_name);
+        let full_path = cfg.image_cache_dir.join(&rel_path);
+        let legacy_path = cfg.image_cache_dir.join(size).join(file_name);
 
-        // 1. 命中本地磁盘缓存
+        // 1. 命中本地磁盘缓存（优先分片路径，兼容历史平铺路径）
         if let Ok(bytes) = fs::read(&full_path).await {
+            self.touch_image_lru(&cache_key).await;
+            return Ok(bytes);
+        }
+        if let Ok(bytes) = fs::read(&legacy_path).await {
             self.touch_image_lru(&cache_key).await;
             return Ok(bytes);
         }
@@ -31,6 +45,10 @@ impl AppState {
 
         // 二次检查是否已被前序并发请求落盘
         if let Ok(bytes) = fs::read(&full_path).await {
+            self.touch_image_lru(&cache_key).await;
+            return Ok(bytes);
+        }
+        if let Ok(bytes) = fs::read(&legacy_path).await {
             self.touch_image_lru(&cache_key).await;
             return Ok(bytes);
         }
@@ -48,18 +66,18 @@ impl AppState {
         let bytes = resp.bytes().await?.to_vec();
         let size_bytes = bytes.len() as i64;
 
-        // 4. 异步写入本地磁盘并更新 LRU 索引
+        // 4. 异步写入本地分片磁盘并更新 LRU 索引
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
         }
         fs::write(&full_path, &bytes).await?;
 
-        let rel_path = format!("{}/{}", size, file_name);
         let _ = sqlx::query(
             r#"
             INSERT INTO image_cache_index (cache_key, local_rel_path, size_bytes, last_accessed_at)
             VALUES ($1, $2, $3, NOW())
             ON CONFLICT (cache_key) DO UPDATE SET
+                local_rel_path = EXCLUDED.local_rel_path,
                 size_bytes = EXCLUDED.size_bytes,
                 last_accessed_at = NOW()
             "#,
@@ -162,4 +180,23 @@ pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {
     }
 
     Ok(freed_bytes as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_shard_rel_path;
+
+    #[test]
+    fn test_image_shard_rel_path() {
+        let p1 = image_shard_rel_path("w500", "18vQBzGNLrEYCUaU9SaWanpms8D.jpg");
+        let p2 = image_shard_rel_path("w500", "18vQBzGNLrEYCUaU9SaWanpms8D.jpg");
+        assert_eq!(p1, p2);
+
+        let parts: Vec<&str> = p1.split('/').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "w500");
+        assert_eq!(parts[1].len(), 2);
+        assert!(parts[1].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(parts[2], "18vQBzGNLrEYCUaU9SaWanpms8D.jpg");
+    }
 }
