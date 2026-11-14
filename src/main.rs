@@ -3,6 +3,7 @@ mod config;
 mod image_cache;
 mod scraper;
 mod state;
+mod smart_views;
 mod sync;
 mod web;
 

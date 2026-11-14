@@ -201,10 +201,10 @@ pub async fn apply_sync_diff(
 
             sqlx::query(
                 r#"
-                INSERT INTO seasons (media_item_id, season_number, name, episode_count)
+                INSERT INTO seasons (media_item_id, season_number, name, scrape_attempts)
                 SELECT *, 0 FROM UNNEST($1::int8[], $2::int4[], $3::varchar[])
                 ON CONFLICT (media_item_id, season_number) DO UPDATE SET
-                    episode_count = 0
+                    scrape_attempts = 0
                 "#,
             )
             .bind(&m_ids)

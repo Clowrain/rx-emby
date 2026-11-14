@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -15,27 +15,8 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VirtualLibraryRule {
-    #[serde(default)]
-    pub media_type: Option<String>,
-    #[serde(default)]
-    pub categories: Vec<String>,
-    #[serde(default)]
-    pub countries: Vec<String>,
-    #[serde(default)]
-    pub networks: Vec<String>,
-    #[serde(default)]
-    pub genres: Vec<String>,
-    #[serde(default)]
-    pub year_min: Option<i32>,
-    #[serde(default)]
-    pub year_max: Option<i32>,
-    #[serde(default)]
-    pub min_rating: Option<f32>,
-    #[serde(default)]
-    pub keyword: Option<String>,
-}
+pub use crate::smart_views::VirtualLibraryRule;
+use crate::smart_views::can_access_view;
 
 pub fn router() -> Router<Arc<AppState>> {
     let core = Router::new()
@@ -222,6 +203,20 @@ async fn get_user_views(
         ("lib_variety", "综艺", "tvshows"),
     ];
 
+    let base_cover_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT config_key, config_value FROM system_configs WHERE config_key LIKE 'base_lib_cover:%'",
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let base_cover_map: HashMap<String, String> = base_cover_rows
+        .into_iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("base_lib_cover:")
+                .map(|id| (id.to_string(), v))
+        })
+        .collect();
+
     let mut items: Vec<Value> = base_libs
         .into_iter()
         .filter(|(id, name, _)| {
@@ -231,33 +226,31 @@ async fn get_user_views(
             }
         })
         .map(|(id, name, ctype)| {
+            let tag = compute_cover_image_tag(base_cover_map.get(id).map(|s| s.as_str()));
             json!({
                 "Id": id,
                 "Name": name,
                 "ServerId": cfg.server_id,
                 "Type": "CollectionFolder",
                 "CollectionType": ctype,
-                "IsFolder": true
+                "IsFolder": true,
+                "ImageTags": { "Primary": tag },
+                "BackdropImageTags": [tag]
             })
         })
         .collect();
 
     // 追加已启用的自定义虚拟媒体库 (Smart Views)
-    let vlibs: Vec<(i32, String, String)> = sqlx::query_as(
-        "SELECT id, name, icon_type FROM virtual_libraries WHERE is_enabled = TRUE ORDER BY sort_order ASC, id ASC",
+    let vlibs: Vec<(i32, String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, name, icon_type, cover_image, cover_revision FROM virtual_libraries WHERE is_enabled = TRUE ORDER BY sort_order ASC, id ASC",
     )
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
 
-    for (vid, vname, icon_type) in vlibs {
+    for (vid, vname, icon_type, cover_image, revision) in vlibs {
         let view_id = format!("lib_vlib_{}", vid);
-        let allowed = match &allowed_cats {
-            None => true,
-            Some(cats) => cats
-                .iter()
-                .any(|c| c == "*" || c == "vlib_*" || c == &view_id || c == &vname),
-        };
+        let allowed = can_access_view(allowed_cats.as_deref(), &view_id, &vname);
         if !allowed {
             continue;
         }
@@ -266,13 +259,16 @@ async fn get_user_views(
         } else {
             "tvshows"
         };
+        let image_tag = format!("{}_{}", compute_cover_image_tag(cover_image.as_deref()), revision);
         items.push(json!({
             "Id": view_id,
             "Name": vname,
             "ServerId": cfg.server_id,
             "Type": "CollectionFolder",
             "CollectionType": ctype,
-            "IsFolder": true
+            "IsFolder": true,
+            "ImageTags": { "Primary": image_tag },
+            "BackdropImageTags": [image_tag]
         }));
     }
 
@@ -403,28 +399,30 @@ async fn get_user_items(
         }
     }
 
-    // 3.5 解析自定义虚拟媒体库 (ParentId 为 "lib_vlib_1") 及用户分类访问权限
+    // 视图授权独立于基础分类；获得某个视图权限即可访问其匹配内容。
+    let mut allowed_user_cats = get_user_allowed_categories(&state, &user_id).await;
     let mut vlib_rule: Option<VirtualLibraryRule> = None;
-    if let Some(ref pid) = q.parent_id {
-        if let Some(raw_vid) = pid.strip_prefix("lib_vlib_") {
-            if let Ok(vid) = raw_vid.parse::<i32>() {
-                let raw_json: Option<Value> = sqlx::query_scalar(
-                    "SELECT filter_rules FROM virtual_libraries WHERE id = $1 AND is_enabled = TRUE",
-                )
-                .bind(vid)
-                .fetch_optional(&state.db)
-                .await
-                .unwrap_or(None);
-                if let Some(val) = raw_json {
-                    vlib_rule = serde_json::from_value::<VirtualLibraryRule>(val).ok();
-                } else {
-                    return Ok(Json(json!({ "Items": [], "TotalRecordCount": 0 })));
-                }
-            }
+    if let Some(pid) = q.parent_id.as_deref().filter(|p| p.starts_with("lib_vlib_")) {
+        let vid = pid.trim_start_matches("lib_vlib_").parse::<i32>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的智能视图 ID".into()))?;
+        let row: Option<(String, Value)> = sqlx::query_as(
+            "SELECT name, filter_rules FROM virtual_libraries WHERE id=$1 AND is_enabled=TRUE")
+            .bind(vid).fetch_optional(&state.db).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+        let Some((name, rules)) = row else {
+            return Err((StatusCode::NOT_FOUND, "智能视图不存在或已停用".into()));
+        };
+        if !can_access_view(allowed_user_cats.as_deref(), pid, &name) {
+            return Err((StatusCode::FORBIDDEN, "没有该智能视图的访问权限".into()));
         }
+        let rule: VirtualLibraryRule = serde_json::from_value(rules)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,format!("智能视图规则损坏：{}",e)))?;
+        rule.validate().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e))?;
+        vlib_rule = Some(rule);
+        allowed_user_cats = None;
     }
-
-    let allowed_user_cats = get_user_allowed_categories(&state, &user_id).await;
+    let rule_json = vlib_rule.as_ref().map(serde_json::to_value).transpose()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
 
     let category_filter = match q.parent_id.as_deref() {
         Some("lib_movie") => Some("电影"),
@@ -435,41 +433,12 @@ async fn get_user_items(
         _ => None,
     };
 
-    let media_type_filter = if !type_set.is_empty() {
-        match (type_set.contains("Movie"), type_set.contains("Series")) {
-            (true, false) => Some("movie".to_string()),
-            (false, true) => Some("tv".to_string()),
-            _ => vlib_rule.as_ref().and_then(|r| r.media_type.clone()).filter(|s| !s.is_empty()),
-        }
-    } else {
-        vlib_rule.as_ref().and_then(|r| r.media_type.clone()).filter(|s| !s.is_empty())
+    // 客户端类型与视图规则各自过滤，冲突时结果为空。
+    let media_type_filter = match (type_set.contains("Movie"), type_set.contains("Series")) {
+        (true, false) => Some("movie"),
+        (false, true) => Some("tv"),
+        _ => None,
     };
-
-    let vlib_categories: Option<Vec<String>> = vlib_rule
-        .as_ref()
-        .map(|r| r.categories.clone())
-        .filter(|v| !v.is_empty());
-    let vlib_countries: Option<Vec<String>> = vlib_rule
-        .as_ref()
-        .map(|r| r.countries.clone())
-        .filter(|v| !v.is_empty());
-    let vlib_networks: Option<Vec<String>> = vlib_rule
-        .as_ref()
-        .map(|r| r.networks.clone())
-        .filter(|v| !v.is_empty());
-    let vlib_genres: Option<Vec<String>> = vlib_rule
-        .as_ref()
-        .map(|r| r.genres.clone())
-        .filter(|v| !v.is_empty());
-    let vlib_year_min: Option<i32> = vlib_rule.as_ref().and_then(|r| r.year_min);
-    let vlib_year_max: Option<i32> = vlib_rule.as_ref().and_then(|r| r.year_max);
-    let vlib_min_rating: Option<f32> = vlib_rule.as_ref().and_then(|r| r.min_rating);
-    let vlib_kw: Option<String> = vlib_rule
-        .as_ref()
-        .and_then(|r| r.keyword.as_deref())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("%{}%", s));
 
     let only_favorite = filter_set.contains("IsFavorite");
     let only_played = filter_set.contains("IsPlayed");
@@ -500,13 +469,15 @@ async fn get_user_items(
         .as_deref()
         .map(|s| s.eq_ignore_ascii_case("Ascending"))
         .unwrap_or(false);
-    let sort_key = q.sort_by.as_deref().unwrap_or("");
+    let sort_key = q.sort_by.as_deref().or_else(|| vlib_rule.as_ref().and_then(|r| r.sort_by.as_deref())).unwrap_or("");
     let order_clause = if sort_key.contains("DateCreated") {
         if is_asc {
             "created_at ASC, id ASC"
         } else {
             "created_at DESC, id DESC"
         }
+    } else if sort_key == "Popularity" {
+        if is_asc { "popularity ASC NULLS LAST, id ASC" } else { "popularity DESC NULLS LAST, id DESC" }
     } else if sort_key.contains("CommunityRating") {
         if is_asc {
             "rating ASC, id DESC"
@@ -530,7 +501,7 @@ async fn get_user_items(
         SELECT id, media_type, tmdb_id, title, original_title, year, overview, rating, poster_path, backdrop_path
         FROM (
             SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-                m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.overview, m.rating, m.poster_path, m.backdrop_path, m.created_at
+                m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.overview, m.rating, m.poster_path, m.backdrop_path, m.created_at, (m.tmdb_metadata->>'popularity')::float8 AS popularity
             FROM media_items m
             WHERE m.is_ignored = FALSE
               AND ($1::text IS NULL OR m.category = $1)
@@ -553,14 +524,7 @@ async fn get_user_items(
                     AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.media_item_id = m.id)
               ))
               AND ($11::text[] IS NULL OR m.category = ANY($11))
-              AND ($12::text[] IS NULL OR m.category = ANY($12))
-              AND ($13::text[] IS NULL OR m.countries && $13)
-              AND ($14::text[] IS NULL OR m.networks && $14)
-              AND ($15::text[] IS NULL OR m.genres && $15)
-              AND ($16::int4 IS NULL OR m.year >= $16)
-              AND ($17::int4 IS NULL OR m.year <= $17)
-              AND ($18::float4 IS NULL OR m.rating >= $18)
-              AND ($19::text IS NULL OR m.title ILIKE $19 OR m.original_title ILIKE $19 OR m.root_dir ILIKE $19)
+              AND ($12::jsonb IS NULL OR {view_predicate})
             ORDER BY
                 COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
                 (m.scrape_status IN (1, 3)) DESC,
@@ -570,7 +534,8 @@ async fn get_user_items(
         ORDER BY {}
         LIMIT $9 OFFSET $10
         "#,
-        order_clause
+        order_clause,
+        view_predicate = vlib_rule.as_ref().map(|r| r.sql_predicate("$12::jsonb")).unwrap_or_else(|| "($12::jsonb IS NULL)".into())
     );
 
     let rows: Vec<MediaListRow> = sqlx::query_as(&sql)
@@ -585,20 +550,13 @@ async fn get_user_items(
         .bind(limit)
         .bind(offset)
         .bind(&allowed_user_cats)
-        .bind(&vlib_categories)
-        .bind(&vlib_countries)
-        .bind(&vlib_networks)
-        .bind(&vlib_genres)
-        .bind(vlib_year_min)
-        .bind(vlib_year_max)
-        .bind(vlib_min_rating)
-        .bind(&vlib_kw)
+    .bind(&rule_json)
         .fetch_all(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let total: i64 = sqlx::query_scalar(
-        r#"
+        &format!(r#"
         SELECT COUNT(DISTINCT COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
         FROM media_items m
         WHERE m.is_ignored = FALSE
@@ -622,15 +580,8 @@ async fn get_user_items(
                 AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.media_item_id = m.id)
           ))
           AND ($9::text[] IS NULL OR m.category = ANY($9))
-          AND ($10::text[] IS NULL OR m.category = ANY($10))
-          AND ($11::text[] IS NULL OR m.countries && $11)
-          AND ($12::text[] IS NULL OR m.networks && $12)
-          AND ($13::text[] IS NULL OR m.genres && $13)
-          AND ($14::int4 IS NULL OR m.year >= $14)
-          AND ($15::int4 IS NULL OR m.year <= $15)
-          AND ($16::float4 IS NULL OR m.rating >= $16)
-          AND ($17::text IS NULL OR m.title ILIKE $17 OR m.original_title ILIKE $17 OR m.root_dir ILIKE $17)
-        "#,
+          AND ($10::jsonb IS NULL OR {})
+        "#, vlib_rule.as_ref().map(|r| r.sql_predicate("$10::jsonb")).unwrap_or_else(|| "TRUE".into())),
     )
     .bind(category_filter)
     .bind(&search_pattern)
@@ -641,17 +592,10 @@ async fn get_user_items(
     .bind(only_played)
     .bind(only_unplayed)
     .bind(&allowed_user_cats)
-    .bind(&vlib_categories)
-    .bind(&vlib_countries)
-    .bind(&vlib_networks)
-    .bind(&vlib_genres)
-    .bind(vlib_year_min)
-    .bind(vlib_year_max)
-    .bind(vlib_min_rating)
-    .bind(&vlib_kw)
+    .bind(&rule_json)
     .fetch_one(&state.db)
     .await
-    .unwrap_or(rows.len() as i64);
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
 
     // 批量加载当前用户的收藏集合，填充 UserData
     let fav_set = load_user_favorite_keys(&state, &user_id).await;
@@ -1353,6 +1297,70 @@ async fn get_item_image(
     State(state): State<Arc<AppState>>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<Response, (StatusCode, String)> {
+    if let Some(base_cat) = base_library_category(&item_id) {
+        let cfg_key = format!("base_lib_cover:{}", item_id);
+        let custom_cover: Option<String> =
+            sqlx::query_scalar("SELECT config_value FROM system_configs WHERE config_key = $1")
+                .bind(&cfg_key)
+                .fetch_optional(&state.db)
+                .await
+                .unwrap_or(None);
+
+        let clean_custom = custom_cover
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let rule = VirtualLibraryRule {
+            categories: vec![base_cat.to_string()],
+            ..Default::default()
+        };
+        if let Some(resp) =
+            try_serve_dynamic_cover(&state, &item_id, clean_custom, &rule).await
+        {
+            return Ok(resp);
+        }
+
+        let cover_key = clean_custom
+            .filter(|k| is_builtin_cover_key(k))
+            .unwrap_or(&item_id);
+        return serve_embedded_cover(cover_key);
+    }
+
+    if let Some(raw_vid) = item_id.strip_prefix("lib_vlib_") {
+        let vid = raw_vid
+            .parse::<i32>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的智能视图 ID".to_string()))?;
+
+        let row: Option<(String, String, Option<String>, serde_json::Value)> = sqlx::query_as(
+            "SELECT name, icon_type, cover_image, filter_rules FROM virtual_libraries WHERE id = $1",
+        )
+        .bind(vid)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let Some((vname, icon_type, cover_image, rules_val)) = row else {
+            return Err((StatusCode::NOT_FOUND, "智能视图不存在".to_string()));
+        };
+
+        let custom_cover = cover_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let rule: VirtualLibraryRule = serde_json::from_value(rules_val)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("智能视图规则损坏：{}", e)))?;
+        if let Some(resp) =
+            try_serve_dynamic_cover(&state, &item_id, custom_cover, &rule).await
+        {
+            return Ok(resp);
+        }
+
+        let cover_key = resolve_virtual_library_cover_key(custom_cover, &vname, &icon_type);
+        return serve_embedded_cover(cover_key);
+    }
+
     let (size, raw_file): (&str, Option<String>) = if let Some(raw_eid) = item_id.strip_prefix("ep_") {
         let eid = raw_eid
             .parse::<i64>()
@@ -2566,61 +2574,256 @@ async fn load_media_episode_histories(
 }
 
 /// 统计某个虚拟媒体库规则当前在库内命中的影视条目数（同 TMDB 自动去重）
-pub async fn count_virtual_library_matches(state: &AppState, rule: &VirtualLibraryRule) -> i64 {
-    let media_type = rule.media_type.clone().filter(|s| !s.is_empty());
-    let categories = if rule.categories.is_empty() {
-        None
-    } else {
-        Some(rule.categories.clone())
-    };
-    let countries = if rule.countries.is_empty() {
-        None
-    } else {
-        Some(rule.countries.clone())
-    };
-    let networks = if rule.networks.is_empty() {
-        None
-    } else {
-        Some(rule.networks.clone())
-    };
-    let genres = if rule.genres.is_empty() {
-        None
-    } else {
-        Some(rule.genres.clone())
-    };
-    let kw = rule
-        .keyword
-        .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("%{}%", s));
-
-    sqlx::query_scalar(
-        r#"
-        SELECT COUNT(DISTINCT COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-        FROM media_items m
-        WHERE m.is_ignored = FALSE
-          AND ($1::text IS NULL OR m.media_type = $1)
-          AND ($2::text[] IS NULL OR m.category = ANY($2))
-          AND ($3::text[] IS NULL OR m.countries && $3)
-          AND ($4::text[] IS NULL OR m.networks && $4)
-          AND ($5::text[] IS NULL OR m.genres && $5)
-          AND ($6::int4 IS NULL OR m.year >= $6)
-          AND ($7::int4 IS NULL OR m.year <= $7)
-          AND ($8::float4 IS NULL OR m.rating >= $8)
-          AND ($9::text IS NULL OR m.title ILIKE $9 OR m.original_title ILIKE $9 OR m.root_dir ILIKE $9)
-        "#,
-    )
-    .bind(media_type)
-    .bind(categories)
-    .bind(countries)
-    .bind(networks)
-    .bind(genres)
-    .bind(rule.year_min)
-    .bind(rule.year_max)
-    .bind(rule.min_rating)
-    .bind(kw)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0)
+pub async fn count_virtual_library_matches(state: &AppState, rule: &VirtualLibraryRule) -> Result<i64, sqlx::Error> {
+    let sql = format!("SELECT COUNT(DISTINCT COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text)) FROM media_items m WHERE NOT m.is_ignored AND $1::jsonb IS NOT NULL AND {}",rule.sql_predicate("$1::jsonb"));
+    sqlx::query_scalar(&sql)
+        .bind(serde_json::to_value(rule).expect("已校验的规则"))
+        .fetch_one(&state.db).await
 }
+
+fn base_library_category(item_id: &str) -> Option<&'static str> {
+    match item_id {
+        "lib_movie" => Some("电影"),
+        "lib_tv" => Some("电视剧"),
+        "lib_anime" => Some("动漫"),
+        "lib_doc" => Some("纪录片"),
+        "lib_variety" => Some("综艺"),
+        _ => None,
+    }
+}
+
+fn compute_cover_image_tag(cover_image: Option<&str>) -> String {
+    match cover_image.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(c) => {
+            let clean: String = c
+                .chars()
+                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .take(24)
+                .collect();
+            if clean.is_empty() {
+                "v1".to_string()
+            } else {
+                if c == "auto" || c.starts_with("collage_") {
+                    format!("v1_{}_{}", clean, chrono::Utc::now().timestamp() / 300)
+                } else { format!("v1_{}", clean) }
+            }
+        }
+        None => "v1".to_string(),
+    }
+}
+
+fn is_builtin_cover_key(key: &str) -> bool {
+    matches!(
+        key,
+        "lib_movie"
+            | "lib_tv"
+            | "lib_anime"
+            | "lib_doc"
+            | "lib_variety"
+            | "vlib_top_rated"
+            | "vlib_streaming"
+            | "vlib_chinese"
+            | "vlib_kr_jp"
+            | "vlib_latest"
+            | "vlib_default_movies"
+            | "vlib_default_tv"
+    )
+}
+
+async fn try_serve_dynamic_cover(
+    state: &AppState,
+    view_id: &str,
+    custom_cover: Option<&str>,
+    rule: &VirtualLibraryRule,
+) -> Option<Response> {
+    if custom_cover == Some("auto") {
+        if let Some(file_path) = fetch_virtual_library_auto_image(state, rule).await {
+            let clean_name = file_path.trim_start_matches('/');
+            if let Ok(bytes) = state.get_or_fetch_tmdb_image("w1280", clean_name).await {
+                let content_type = if clean_name.ends_with(".png") {
+                    "image/png"
+                } else {
+                    "image/jpeg"
+                };
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .header(header::CACHE_CONTROL, "public, max-age=300")
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap(),
+                );
+            }
+        }
+    } else if let Some(style) = custom_cover.and_then(crate::image_cache::collage::CollageStyle::from_key) {
+        if let Some(bytes) = fetch_or_build_virtual_library_collage(state, view_id, rule, style).await {
+            return Some(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/jpeg")
+                    .header(header::CACHE_CONTROL, "public, max-age=300")
+                    .body(axum::body::Body::from(bytes))
+                    .unwrap(),
+            );
+        }
+    }
+    None
+}
+
+fn serve_embedded_cover(cover_key: &str) -> Result<Response, (StatusCode, String)> {
+    let asset_path = format!("covers/{}.jpg", cover_key);
+    let asset = crate::web::get_embedded_asset(&asset_path)
+        .or_else(|| crate::web::get_embedded_asset("covers/vlib_default_tv.jpg"))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "封面资源未找到".to_string()))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(axum::body::Body::from(asset.data.into_owned()))
+        .unwrap())
+}
+
+pub fn resolve_virtual_library_cover_key<'a>(
+    custom_cover: Option<&'a str>,
+    name: &str,
+    icon_type: &str,
+) -> &'a str {
+    if let Some(key) = custom_cover {
+        if is_builtin_cover_key(key) {
+            return key;
+        }
+    }
+
+    if name.contains("8.0+") || name.contains("高分") {
+        "vlib_top_rated"
+    } else if name.contains("Netflix") || name.contains("HBO") || name.contains("精品") {
+        "vlib_streaming"
+    } else if name.contains("华语") {
+        "vlib_chinese"
+    } else if name.contains("日韩") {
+        "vlib_kr_jp"
+    } else if name.contains("最新") || name.contains("2025") || name.contains("2026") {
+        "vlib_latest"
+    } else if icon_type == "movies" || icon_type == "movie" {
+        "vlib_default_movies"
+    } else {
+        "vlib_default_tv"
+    }
+}
+
+async fn fetch_virtual_library_top_media_images(
+    state: &AppState,
+    rule: &VirtualLibraryRule,
+    limit: i64,
+) -> Vec<(Option<String>, Option<String>)> {
+    sqlx::query_as(&format!(r#"
+        SELECT backdrop_path, poster_path FROM (
+            SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
+                m.id, m.rating, m.year, m.backdrop_path, m.poster_path
+            FROM media_items m
+            WHERE NOT m.is_ignored AND (m.backdrop_path IS NOT NULL OR m.poster_path IS NOT NULL)
+                AND $1::jsonb IS NOT NULL AND {}
+            ORDER BY COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
+                m.rating DESC, m.year DESC NULLS LAST, m.id DESC
+        ) deduped ORDER BY rating DESC, year DESC NULLS LAST, id DESC LIMIT $2
+    "#,rule.sql_predicate("$1::jsonb")))
+    .bind(serde_json::to_value(rule).ok())
+    .bind(limit)
+    .fetch_all(&state.db).await.unwrap_or_default()
+}
+
+async fn fetch_virtual_library_auto_image(
+    state: &AppState,
+    rule: &VirtualLibraryRule,
+) -> Option<String> {
+    let rows = fetch_virtual_library_top_media_images(state, rule, 1).await;
+    rows.into_iter()
+        .next()
+        .and_then(|(backdrop, poster)| backdrop.or(poster))
+}
+
+async fn fetch_or_build_virtual_library_collage(
+    state: &AppState,
+    view_id: &str,
+    rule: &VirtualLibraryRule,
+    style: crate::image_cache::collage::CollageStyle,
+) -> Option<Vec<u8>> {
+    let rows = fetch_virtual_library_top_media_images(state, rule, 4).await;
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut sig = String::from(style.as_str());
+    for (b, p) in &rows {
+        sig.push('|');
+        if let Some(s) = b {
+            sig.push_str(s);
+        }
+        sig.push(',');
+        if let Some(s) = p {
+            sig.push_str(s);
+        }
+    }
+    let hash = xxhash_rust::xxh3::xxh3_64(sig.as_bytes());
+
+    let cfg = state.config.load();
+    let covers_dir = cfg.image_cache_dir.join("covers");
+    let cache_path = covers_dir.join(format!("{}_{}_{:016x}.jpg", view_id, style.as_str(), hash));
+
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        return Some(bytes);
+    }
+
+    let inflight_key = format!("collage:{}:{}:{:016x}", view_id, style.as_str(), hash);
+    let _guard = state
+        .caches
+        .image_fetch_inflight
+        .get_with(inflight_key, async { () })
+        .await;
+
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        return Some(bytes);
+    }
+
+    let mut posters: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
+    let mut primary_backdrop: Option<Vec<u8>> = None;
+
+    for (backdrop, poster) in &rows {
+        if primary_backdrop.is_none() {
+            if let Some(b_path) = backdrop {
+                let clean = b_path.trim_start_matches('/');
+                if let Ok(bytes) = state.get_or_fetch_tmdb_image("w1280", clean).await {
+                    primary_backdrop = Some(bytes);
+                }
+            }
+        }
+        if let Some(p_path) = poster.as_ref().or(backdrop.as_ref()) {
+            let clean = p_path.trim_start_matches('/');
+            if let Ok(bytes) = state.get_or_fetch_tmdb_image("w500", clean).await {
+                posters.push(bytes);
+            }
+        }
+    }
+
+    if posters.is_empty() && primary_backdrop.is_none() {
+        return None;
+    }
+
+    let rendered = tokio::task::spawn_blocking(move || {
+        crate::image_cache::collage::render_collage(style, &posters, primary_backdrop.as_deref())
+    })
+    .await
+    .ok()?
+    .ok()?;
+
+    if tokio::fs::create_dir_all(&covers_dir).await.is_ok() {
+        let _ = tokio::fs::write(&cache_path, &rendered).await;
+    }
+
+    Some(rendered)
+}
+
+#[cfg(test)]
+#[path = "smart_view_tests.rs"]
+mod smart_view_tests;

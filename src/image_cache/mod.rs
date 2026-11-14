@@ -1,3 +1,5 @@
+pub mod collage;
+
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use std::{path::PathBuf, sync::Arc, time::Duration};

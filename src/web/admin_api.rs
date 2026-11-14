@@ -3,21 +3,225 @@ use crate::{
     image_cache::enforce_image_cache_quota,
     scraper::scrape_single_media,
     state::AppState,
-    web::emby_api::{count_virtual_library_matches, VirtualLibraryRule},
+    web::emby_api::{
+        count_virtual_library_matches, resolve_virtual_library_cover_key, VirtualLibraryRule,
+    },
 };
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
-pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminUser {
+    pub id: String,
+    pub username: String,
+    pub is_admin: bool,
+}
+
+fn extract_admin_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        let trimmed = auth.trim();
+        if let Some(token) = trimmed
+            .strip_prefix("Bearer ")
+            .or_else(|| trimmed.strip_prefix("bearer "))
+        {
+            let t = token.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    for key in ["X-Admin-Token", "X-Emby-Token"] {
+        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            let t = val.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn require_admin_auth(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, String)> {
+    let token = extract_admin_token(req.headers())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "未登录，请先使用系统管理员账号登录".to_string()))?;
+
+    let row: Option<(String, String, bool)> = sqlx::query_as(
+        r#"
+        SELECT u.id, u.username, u.is_admin
+        FROM access_tokens t
+        JOIN users u ON u.id = t.user_id
+        WHERE t.token = $1
+        "#,
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (user_id, username, is_admin) = row.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "登录凭证无效或已过期，请重新登录".to_string(),
+        )
+    })?;
+
+    if !is_admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "无权访问：仅系统管理员权限角色可访问管理后台".to_string(),
+        ));
+    }
+
+    let db = state.db.clone();
+    let tok = token.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query("UPDATE access_tokens SET last_used_at = NOW() WHERE token = $1")
+            .bind(&tok)
+            .execute(&db)
+            .await;
+    });
+
+    req.extensions_mut().insert(AdminUser {
+        id: user_id,
+        username,
+        is_admin,
+    });
+
+    Ok(next.run(req).await)
+}
+
+#[derive(Deserialize)]
+struct AdminLoginReq {
+    username: String,
+    #[serde(default)]
+    password: String,
+}
+
+async fn admin_login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminLoginReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let username = payload.username.trim();
+    if username.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "请输入用户名".to_string()));
+    }
+
+    let user_row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT id, password_hash, is_admin FROM users WHERE username = $1",
+    )
+    .bind(username)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (user_id, is_admin) = match user_row {
+        Some((uid, stored_pw, admin)) => {
+            if !stored_pw.is_empty() && stored_pw != payload.password {
+                return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
+            }
+            (uid, admin)
+        }
+        None => {
+            // 若库中尚无任何用户，自动初始化首个系统管理员账号
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or(0);
+            if count == 0 {
+                let new_id = Uuid::new_v4().simple().to_string()[..16].to_string();
+                sqlx::query(
+                    "INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, $2, $3, TRUE)",
+                )
+                .bind(&new_id)
+                .bind(username)
+                .bind(&payload.password)
+                .execute(&state.db)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                (new_id, true)
+            } else {
+                return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
+            }
+        }
+    };
+
+    if !is_admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "无权登录：仅系统管理员权限角色可登录管理后台".to_string(),
+        ));
+    }
+
+    let token = Uuid::new_v4().simple().to_string();
+    let client_ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("Web 管理后台")
+        .chars()
+        .take(60)
+        .collect::<String>();
+
+    sqlx::query(
+        "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&token)
+    .bind(&user_id)
+    .bind(format!("admin-{}", &token[..8]))
+    .bind(&client_ua)
+    .bind("RX-Emby Admin")
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({
+        "token": token,
+        "user": {
+            "id": user_id,
+            "username": username,
+            "is_admin": true
+        }
+    })))
+}
+
+async fn admin_logout(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if let Some(token) = extract_admin_token(&headers) {
+        let _ = sqlx::query("DELETE FROM access_tokens WHERE token = $1")
+            .bind(&token)
+            .execute(&state.db)
+            .await;
+    }
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn admin_me(Extension(user): Extension<AdminUser>) -> Json<Value> {
+    Json(json!({ "user": user }))
+}
+
+pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    let public_auth = Router::new()
+        .route("/api/admin/auth/login", post(admin_login))
+        .route("/api/admin/auth/logout", post(admin_logout));
+
+    let protected = Router::new()
+        .route("/api/admin/auth/me", get(admin_me))
         .route("/api/admin/overview", get(get_admin_overview))
         .route("/api/admin/configs", get(list_configs).post(update_configs))
         .route("/api/admin/sync/trigger", post(trigger_sync))
@@ -35,6 +239,9 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/admin/virtual_libraries",
             get(list_virtual_libraries).post(save_virtual_library),
         )
+        .route("/api/admin/virtual_libraries/options", get(smart_view_options))
+        .route("/api/admin/virtual_libraries/preview", post(preview_smart_view))
+        .route("/api/admin/virtual_libraries/backfill", post(queue_metadata_backfill))
         .route(
             "/api/admin/virtual_libraries/presets",
             post(seed_preset_virtual_libraries),
@@ -43,9 +250,16 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/admin/virtual_libraries/:id",
             delete(delete_virtual_library),
         )
+        .route(
+            "/api/admin/base_libraries/covers",
+            get(list_base_library_covers).post(save_base_library_cover),
+        )
         .route("/api/admin/users", get(list_users_and_sessions).post(save_user))
         .route("/api/admin/users/:id", delete(delete_user))
         .route("/api/admin/tokens/:token", delete(revoke_access_token))
+        .route_layer(middleware::from_fn_with_state(state, require_admin_auth));
+
+    Router::new().merge(public_auth).merge(protected)
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -594,7 +808,7 @@ async fn bind_tmdb_id(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
-    let _ = sqlx::query("UPDATE seasons SET episode_count = 0 WHERE media_item_id = ANY($1)")
+    let _ = sqlx::query("UPDATE seasons SET scrape_attempts = 0 WHERE media_item_id = ANY($1)")
         .bind(&sibling_ids)
         .execute(&state.db)
         .await;
@@ -624,7 +838,7 @@ async fn scrape_one_now(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let _ = sqlx::query("UPDATE seasons SET episode_count = 0 WHERE media_item_id = ANY($1)")
+    let _ = sqlx::query("UPDATE seasons SET scrape_attempts = 0 WHERE media_item_id = ANY($1)")
         .bind(&sibling_ids)
         .execute(&state.db)
         .await;
@@ -693,13 +907,14 @@ struct VirtualLibDbRow {
     sort_order: i32,
     filter_rules: Value,
     is_enabled: bool,
+    cover_image: Option<String>,
 }
 
 async fn list_virtual_libraries(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let rows: Vec<VirtualLibDbRow> = sqlx::query_as(
-        "SELECT id, name, icon_type, sort_order, filter_rules, is_enabled FROM virtual_libraries ORDER BY sort_order ASC, id ASC",
+        "SELECT id, name, icon_type, sort_order, filter_rules, is_enabled, cover_image FROM virtual_libraries ORDER BY sort_order ASC, id ASC",
     )
     .fetch_all(&state.db)
     .await
@@ -707,8 +922,15 @@ async fn list_virtual_libraries(
 
     let mut libraries = Vec::with_capacity(rows.len());
     for r in rows {
-        let rule: VirtualLibraryRule = serde_json::from_value(r.filter_rules.clone()).unwrap_or_default();
-        let matched_count = count_virtual_library_matches(&state, &rule).await;
+        let rule: VirtualLibraryRule = serde_json::from_value(r.filter_rules.clone())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,format!("视图 {} 规则损坏：{}",r.id,e)))?;
+        let matched_count = count_virtual_library_matches(&state, &rule).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+        let resolved_cover = resolve_virtual_library_cover_key(
+            r.cover_image.as_deref(),
+            &r.name,
+            &r.icon_type,
+        );
         libraries.push(json!({
             "id": r.id,
             "view_id": format!("lib_vlib_{}", r.id),
@@ -717,6 +939,8 @@ async fn list_virtual_libraries(
             "sort_order": r.sort_order,
             "filter_rules": rule,
             "is_enabled": r.is_enabled,
+            "cover_image": r.cover_image,
+            "resolved_cover": resolved_cover,
             "matched_count": matched_count
         }));
     }
@@ -734,6 +958,8 @@ struct SaveVirtualLibReq {
     filter_rules: VirtualLibraryRule,
     #[serde(default = "default_true")]
     is_enabled: bool,
+    #[serde(default)]
+    cover_image: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -745,18 +971,28 @@ async fn save_virtual_library(
     Json(payload): Json<SaveVirtualLibReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let name = payload.name.trim();
-    if name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "智能视图名称不能为空".to_string()));
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err((StatusCode::BAD_REQUEST, "智能视图名称须为 1～64 个字符".to_string()));
     }
+    if !["movies", "tvshows"].contains(&payload.icon_type.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, "请选择电影或剧集展示样式".into()));
+    }
+    payload.filter_rules.validate().map_err(|e| (StatusCode::BAD_REQUEST,e))?;
     let rules_json = serde_json::to_value(&payload.filter_rules)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let cover_image = payload
+        .cover_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     if let Some(vid) = payload.id {
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE virtual_libraries
-            SET name = $1, icon_type = $2, sort_order = $3, filter_rules = $4, is_enabled = $5
-            WHERE id = $6
+            SET name = $1, icon_type = $2, sort_order = $3, filter_rules = $4, is_enabled = $5, cover_image = $6, cover_revision = cover_revision + 1
+            WHERE id = $7
             "#,
         )
         .bind(name)
@@ -764,15 +1000,19 @@ async fn save_virtual_library(
         .bind(payload.sort_order)
         .bind(&rules_json)
         .bind(payload.is_enabled)
+        .bind(&cover_image)
         .bind(vid)
         .execute(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if result.rows_affected() == 0 {
+            return Err((StatusCode::NOT_FOUND, "智能视图已被删除，请刷新列表".into()));
+        }
     } else {
         sqlx::query(
             r#"
-            INSERT INTO virtual_libraries (name, icon_type, sort_order, filter_rules, is_enabled)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO virtual_libraries (name, icon_type, sort_order, filter_rules, is_enabled, cover_image)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(name)
@@ -780,6 +1020,7 @@ async fn save_virtual_library(
         .bind(payload.sort_order)
         .bind(&rules_json)
         .bind(payload.is_enabled)
+        .bind(&cover_image)
         .execute(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -791,10 +1032,11 @@ async fn save_virtual_library(
 async fn seed_preset_virtual_libraries(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let presets: Vec<(&str, &str, i32, VirtualLibraryRule)> = vec![
+    let presets: Vec<(&str, &str, &str, i32, VirtualLibraryRule)> = vec![
         (
             "🔥 TMDB 8.0+ 高分佳作",
             "tvshows",
+            "vlib_top_rated",
             10,
             VirtualLibraryRule {
                 min_rating: Some(8.0),
@@ -804,6 +1046,7 @@ async fn seed_preset_virtual_libraries(
         (
             "🎬 Netflix / HBO 精品剧场",
             "tvshows",
+            "vlib_streaming",
             20,
             VirtualLibraryRule {
                 media_type: Some("tv".to_string()),
@@ -820,6 +1063,7 @@ async fn seed_preset_virtual_libraries(
         (
             "🇨🇳 华语热播剧场",
             "tvshows",
+            "vlib_chinese",
             30,
             VirtualLibraryRule {
                 media_type: Some("tv".to_string()),
@@ -831,6 +1075,7 @@ async fn seed_preset_virtual_libraries(
         (
             "🇰🇷 日韩剧集精选",
             "tvshows",
+            "vlib_kr_jp",
             40,
             VirtualLibraryRule {
                 media_type: Some("tv".to_string()),
@@ -842,41 +1087,41 @@ async fn seed_preset_virtual_libraries(
         (
             "🎞️ 2025-2026 最新院线与新番",
             "movies",
+            "vlib_latest",
             50,
             VirtualLibraryRule {
                 year_min: Some(2025),
                 ..Default::default()
             },
         ),
+        ("高分口碑电影", "movies", "vlib_top_rated", 60, VirtualLibraryRule {
+            media_type: Some("movie".into()), min_rating: Some(8.0), min_votes: Some(1000), ..Default::default()
+        }),
+        ("已完结短剧", "tvshows", "vlib_default_tv", 70, VirtualLibraryRule {
+            media_type: Some("tv".into()), statuses: vec!["Ended".into()], episodes_max: Some(12), ..Default::default()
+        }),
+        ("90 分钟内电影", "movies", "vlib_default_movies", 80, VirtualLibraryRule {
+            media_type: Some("movie".into()), runtime_max: Some(90), ..Default::default()
+        }),
+        ("4K 杜比视界", "movies", "vlib_default_movies", 90, VirtualLibraryRule {
+            version_tags: vec!["4K".into(), "杜比视界".into()], ..Default::default()
+        }),
     ];
 
+    let mut tx = state.db.begin().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(728314)").execute(&mut *tx).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
     let mut inserted = 0;
-    for (name, icon_type, sort_order, rule) in presets {
-        let exists: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM virtual_libraries WHERE name = $1 LIMIT 1")
-                .bind(name)
-                .fetch_optional(&state.db)
-                .await
-                .unwrap_or(None);
-        if exists.is_some() {
-            continue;
-        }
-        if let Ok(rules_json) = serde_json::to_value(&rule) {
-            if sqlx::query(
-                "INSERT INTO virtual_libraries (name, icon_type, sort_order, filter_rules, is_enabled) VALUES ($1, $2, $3, $4, TRUE)",
-            )
-            .bind(name)
-            .bind(icon_type)
-            .bind(sort_order)
-            .bind(rules_json)
-            .execute(&state.db)
-            .await
-            .is_ok()
-            {
-                inserted += 1;
-            }
-        }
+    for (name, icon_type, cover_image, sort_order, rule) in presets {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM virtual_libraries WHERE name=$1)")
+            .bind(name).fetch_one(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+        if exists { continue; }
+        sqlx::query("INSERT INTO virtual_libraries (name,icon_type,sort_order,filter_rules,is_enabled,cover_image) VALUES ($1,$2,$3,$4,TRUE,$5)")
+            .bind(name).bind(icon_type).bind(sort_order).bind(serde_json::to_value(rule).unwrap()).bind(cover_image)
+            .execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+        inserted += 1;
     }
+    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
 
     Ok(Json(json!({
         "status": "ok",
@@ -896,6 +1141,95 @@ async fn delete_virtual_library(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "status": "ok", "message": "智能视图已删除" })))
+}
+
+async fn list_base_library_covers(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT config_key, config_value FROM system_configs WHERE config_key LIKE 'base_lib_cover:%'",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let cover_map: std::collections::HashMap<String, String> = rows
+        .into_iter()
+        .filter_map(|(k, v)| k.strip_prefix("base_lib_cover:").map(|id| (id.to_string(), v)))
+        .collect();
+
+    let base_libs = [
+        ("lib_movie", "电影"),
+        ("lib_tv", "电视剧"),
+        ("lib_anime", "动漫"),
+        ("lib_doc", "纪录片"),
+        ("lib_variety", "综艺"),
+    ];
+
+    let libraries: Vec<Value> = base_libs
+        .into_iter()
+        .map(|(id, name)| {
+            let cover_image = cover_map.get(id).cloned().filter(|s| !s.trim().is_empty());
+            json!({
+                "id": id,
+                "name": name,
+                "cover_image": cover_image
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "libraries": libraries })))
+}
+
+#[derive(Deserialize)]
+struct SaveBaseLibCoverReq {
+    id: String,
+    #[serde(default)]
+    cover_image: Option<String>,
+}
+
+async fn save_base_library_cover(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SaveBaseLibCoverReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !matches!(
+        payload.id.as_str(),
+        "lib_movie" | "lib_tv" | "lib_anime" | "lib_doc" | "lib_variety"
+    ) {
+        return Err((StatusCode::BAD_REQUEST, "无效的基础媒体库 ID".to_string()));
+    }
+
+    let cfg_key = format!("base_lib_cover:{}", payload.id);
+    let clean_cover = payload
+        .cover_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(cover) = clean_cover {
+        sqlx::query(
+            r#"
+            INSERT INTO system_configs (config_key, config_value, value_type, description, updated_at)
+            VALUES ($1, $2, 'string', '基础媒体库封面配置', NOW())
+            ON CONFLICT (config_key) DO UPDATE SET
+                config_value = EXCLUDED.config_value,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&cfg_key)
+        .bind(cover)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    } else {
+        sqlx::query("DELETE FROM system_configs WHERE config_key = $1")
+            .bind(&cfg_key)
+            .execute(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    Ok(Json(json!({ "status": "ok", "message": "基础媒体库封面已更新" })))
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -1120,4 +1454,46 @@ async fn revoke_access_token(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "status": "ok", "message": "已注销该客户端设备" })))
+}
+
+async fn preview_smart_view(
+    State(state): State<Arc<AppState>>,
+    Json(rule): Json<VirtualLibraryRule>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    rule.validate().map_err(|e| (StatusCode::BAD_REQUEST,e))?;
+    let count = count_virtual_library_matches(&state,&rule).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    Ok(Json(json!({"matched_count": count})))
+}
+
+async fn smart_view_options(State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode,String)> {
+    let mut result = json!({});
+    for (key,expr) in [
+        ("networks", "m.tmdb_metadata->'networks'"),
+        ("companies", "m.tmdb_metadata->'production_companies'"),
+        ("collections", "CASE WHEN m.tmdb_metadata->'collection'->>'id' IS NOT NULL THEN jsonb_build_array(m.tmdb_metadata->'collection') ELSE '[]'::jsonb END"),
+        ("keywords", "m.tmdb_metadata->'keyword_items'"),
+        ("directors", "m.tmdb_metadata->'directors'"),
+        ("cast", "m.tmdb_metadata->'cast'"),
+        ("watch_providers", "m.tmdb_metadata->'watch_providers'"),
+    ] {
+        let sql = format!("SELECT DISTINCT (v->>'id')::int AS id, v->>'name' AS name FROM media_items m CROSS JOIN LATERAL jsonb_array_elements(COALESCE({},'[]')) v WHERE NOT m.is_ignored AND v->>'id' IS NOT NULL ORDER BY name,id LIMIT 500",expr);
+        let rows: Vec<(i32,String)> = sqlx::query_as(&sql).fetch_all(&state.db).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+        result[key] = json!(rows.into_iter().map(|(id,name)|json!({"id":id,"name":name})).collect::<Vec<_>>());
+    }
+    let stats: (i64,i64,i64,i64) = sqlx::query_as("SELECT COUNT(DISTINCT COALESCE(tmdb_id::text||':'||media_type,'raw:'||id::text)), COUNT(DISTINCT COALESCE(tmdb_id::text||':'||media_type,'raw:'||id::text)) FILTER(WHERE metadata_version>=2), COUNT(*) FILTER(WHERE metadata_refresh_requested), COUNT(*) FILTER(WHERE metadata_refresh_requested AND metadata_retry_count>=3) FROM media_items WHERE NOT is_ignored")
+        .fetch_one(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    result["metadata"] = json!({"total":stats.0,"enriched":stats.1,"queued":stats.2,"failed":stats.3});
+    Ok(Json(result))
+}
+
+async fn queue_metadata_backfill(State(state): State<Arc<AppState>>) -> Result<Json<Value>,(StatusCode,String)> {
+    let cfg = state.config.load();
+    if cfg.tmdb_api_key.trim().is_empty() || cfg.tmdb_api_key == "your_tmdb_api_key" {
+        return Err((StatusCode::BAD_REQUEST,"请先在系统设置中配置 TMDB API Key".into()));
+    }
+    let result = sqlx::query("UPDATE media_items SET metadata_refresh_requested=TRUE, metadata_retry_count=0, metadata_retry_at=NULL WHERE NOT is_locked AND NOT is_ignored AND scrape_status IN (1,3) AND (metadata_version<2 OR metadata_retry_count>0)")
+        .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    Ok(Json(json!({"queued":result.rows_affected(),"message":format!("已将 {} 条已刮削目录加入补齐队列，同作品共享更新结果",result.rows_affected())})))
 }

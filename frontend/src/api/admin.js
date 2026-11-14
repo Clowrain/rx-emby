@@ -1,13 +1,71 @@
+const TOKEN_KEY = 'rx_emby_admin_token'
+let unauthorizedHandler = null
+
+export function getAdminToken() {
+  try {
+    return localStorage.getItem(TOKEN_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+export function setAdminToken(token) {
+  try {
+    localStorage.setItem(TOKEN_KEY, token)
+  } catch {
+    // 忽略隐私模式存储限制
+  }
+}
+
+export function clearAdminToken() {
+  try {
+    localStorage.removeItem(TOKEN_KEY)
+  } catch {
+    // 忽略隐私模式存储限制
+  }
+}
+
+export function setUnauthorizedHandler(handler) {
+  unauthorizedHandler = handler
+}
+
 async function requestJson(url, options = {}) {
-  const res = await fetch(url, options)
+  const token = getAdminToken()
+  const headers = new Headers(options.headers || {})
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
+
+  const res = await fetch(url, { ...options, headers })
   if (!res.ok) {
     const errText = await res.text()
+    if ((res.status === 401 || res.status === 403) && !url.startsWith('/api/admin/auth/login')) {
+      clearAdminToken()
+      if (unauthorizedHandler) {
+        unauthorizedHandler(errText || '登录已失效，请重新登录')
+      }
+    }
     throw new Error(errText || `HTTP ${res.status}`)
   }
   return res.json()
 }
 
 export const adminApi = {
+  // 鉴权与会话
+  login(username, password) {
+    return requestJson('/api/admin/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    })
+  },
+  logout() {
+    return requestJson('/api/admin/auth/logout', { method: 'POST' })
+  },
+  getMe() {
+    return requestJson('/api/admin/auth/me')
+  },
+
   // 0. 全局概览仪表盘
   getOverview() {
     return requestJson('/api/admin/overview')
@@ -49,6 +107,11 @@ export const adminApi = {
   listVirtualLibraries() {
     return requestJson('/api/admin/virtual_libraries')
   },
+  smartViewOptions() { return requestJson('/api/admin/virtual_libraries/options') },
+  previewSmartView(rules) {
+    return requestJson('/api/admin/virtual_libraries/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rules) })
+  },
+  backfillSmartViewMetadata() { return requestJson('/api/admin/virtual_libraries/backfill', { method: 'POST' }) },
   saveVirtualLibrary(payload) {
     return requestJson('/api/admin/virtual_libraries', {
       method: 'POST',
@@ -61,6 +124,16 @@ export const adminApi = {
   },
   deleteVirtualLibrary(id) {
     return requestJson(`/api/admin/virtual_libraries/${id}`, { method: 'DELETE' })
+  },
+  listBaseLibraryCovers() {
+    return requestJson('/api/admin/base_libraries/covers')
+  },
+  saveBaseLibraryCover(payload) {
+    return requestJson('/api/admin/base_libraries/covers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
   },
 
   // 3. 多用户账号、分类权限与在线会话

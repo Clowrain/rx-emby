@@ -1,70 +1,43 @@
 <template>
   <section class="space-y-6">
-    <!-- 1. 实时活跃播放会话监控 -->
-    <div class="card p-6 rounded-2xl">
-      <div class="flex items-center justify-between mb-4">
-        <div>
-          <h2 class="text-base font-bold text-white flex items-center gap-2">
-            <Activity class="w-4 h-4 text-emerald-400" aria-hidden="true" />
-            <span>实时播放会话</span>
-          </h2>
-          <p class="text-xs text-slate-400 mt-0.5">
-            展示当前正在播放的客户端会话。单集播放至 85% 时自动预热下一集直链，达 90% 时自动标记为已看。
-          </p>
-        </div>
+    <!-- 二级 Tab 切换：用户账号与权限 / 已登录设备 -->
+    <div class="card p-3 rounded-2xl flex flex-wrap items-center justify-between gap-3">
+      <div role="tablist" aria-label="用户与设备管理" class="flex flex-wrap gap-2">
         <button
           type="button"
-          @click="loadAll"
-          class="cursor-pointer bg-slate-800 hover:bg-slate-700 px-3.5 py-1.5 rounded-xl text-xs font-medium transition-colors flex items-center gap-1.5"
+          role="tab"
+          :aria-selected="activeTab === 'users'"
+          @click="activeTab = 'users'"
+          class="cursor-pointer px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2"
+          :class="
+            activeTab === 'users'
+              ? 'bg-emerald-600 text-white shadow-sm'
+              : 'bg-slate-900/90 text-slate-400 hover:text-slate-200 border border-slate-800'
+          "
         >
-          <RefreshCw class="w-3.5 h-3.5 text-slate-300" aria-hidden="true" />
-          <span>刷新状态</span>
+          <Users class="w-3.5 h-3.5" aria-hidden="true" />
+          <span>用户账号与权限（{{ users.length }}）</span>
         </button>
-      </div>
-
-      <div
-        v-if="activeSessions.length === 0"
-        class="bg-slate-950/60 border border-slate-800/80 rounded-xl p-6 text-center text-xs text-slate-500"
-      >
-        当前没有正在播放的会话
-      </div>
-      <div v-else class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-        <div
-          v-for="s in activeSessions"
-          :key="s.session_id"
-          class="bg-slate-950/80 border border-emerald-500/30 rounded-xl p-4 space-y-2.5 tabular-nums"
+        <button
+          type="button"
+          role="tab"
+          :aria-selected="activeTab === 'devices'"
+          @click="activeTab = 'devices'"
+          class="cursor-pointer px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2"
+          :class="
+            activeTab === 'devices'
+              ? 'bg-emerald-600 text-white shadow-sm'
+              : 'bg-slate-900/90 text-slate-400 hover:text-slate-200 border border-slate-800'
+          "
         >
-          <div class="flex items-center justify-between gap-2">
-            <div class="flex items-center gap-2 min-w-0">
-              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping shrink-0"></span>
-              <span class="font-bold text-white text-sm truncate">{{ s.playing_title }}</span>
-            </div>
-            <span
-              class="px-2 py-0.5 rounded-md text-[10px] font-medium shrink-0 flex items-center gap-1"
-              :class="
-                s.next_ep_prewarmed
-                  ? 'bg-indigo-950 text-indigo-300 border border-indigo-500/40'
-                  : 'bg-emerald-950 text-emerald-300 border border-emerald-500/40'
-              "
-            >
-              <FastForward v-if="s.next_ep_prewarmed" class="w-3 h-3" aria-hidden="true" />
-              <Play v-else class="w-3 h-3 fill-current" aria-hidden="true" />
-              <span>{{ s.next_ep_prewarmed ? '下一集已预热' : '直链播放中' }}</span>
-            </span>
-          </div>
-          <div class="text-xs text-slate-300 flex items-center justify-between font-mono">
-            <span>已播放进度: {{ Math.floor(s.position_sec / 60) }}分{{ s.position_sec % 60 }}秒</span>
-            <span class="text-slate-500">心跳: {{ s.idle_sec }}s 前</span>
-          </div>
-          <div class="text-[11px] text-slate-400 truncate">
-            客户端设备: {{ s.client_name }} · 用户 ID: <span class="font-mono">{{ s.user_id }}</span>
-          </div>
-        </div>
+          <KeyRound class="w-3.5 h-3.5" aria-hidden="true" />
+          <span>已登录设备（{{ tokens.length }}）</span>
+        </button>
       </div>
     </div>
 
-    <!-- 2. 多用户账号与分类访问权限 -->
-    <div class="card rounded-2xl overflow-hidden">
+    <!-- 1. 多用户账号与分类访问权限 -->
+    <div v-if="activeTab === 'users'" class="card rounded-2xl overflow-hidden">
       <div class="px-6 py-4 border-b border-slate-800 flex flex-wrap gap-3 items-center justify-between">
         <div>
           <h2 id="users-table-heading" class="text-base font-bold text-white flex items-center gap-2">
@@ -179,8 +152,8 @@
       </div>
     </div>
 
-    <!-- 3. 客户端设备访问令牌 -->
-    <div class="card rounded-2xl overflow-hidden">
+    <!-- 2. 客户端设备访问令牌 -->
+    <div v-else class="card rounded-2xl overflow-hidden">
       <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
         <div>
           <h2 id="tokens-table-heading" class="text-base font-bold text-white flex items-center gap-2">
@@ -370,9 +343,9 @@ import { useToast, useConfirm } from '../composables/useToast'
 
 const toast = useToast()
 const confirmModal = useConfirm()
+const activeTab = ref('users')
 const users = ref([])
 const tokens = ref([])
-const activeSessions = ref([])
 
 const categoryOptions = [
   { value: '*', label: '全部媒体库（不限）', icon: LayoutGrid },
@@ -398,7 +371,6 @@ async function loadAll() {
     const data = await adminApi.listUsersAndSessions()
     users.value = data.users || []
     tokens.value = data.tokens || []
-    activeSessions.value = data.active_sessions || []
   } catch (err) {
     toast.error('加载用户与会话失败：' + err.message)
   }

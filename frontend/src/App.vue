@@ -1,5 +1,24 @@
 <template>
-  <div class="min-h-dvh flex bg-[#060911] text-slate-100">
+  <!-- 1. 鉴权检查中：不渲染任何后台管理页面内容 -->
+  <div
+    v-if="authChecking"
+    class="min-h-dvh flex flex-col items-center justify-center bg-[#060911] text-slate-300 gap-3"
+  >
+    <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-500 to-cyan-600 flex items-center justify-center shadow-lg shadow-emerald-950/80 animate-pulse">
+      <Play class="w-4 h-4 text-white fill-current ml-0.5" aria-hidden="true" />
+    </div>
+    <p class="text-xs text-slate-400">正在验证管理员会话…</p>
+  </div>
+
+  <!-- 2. 未登录或非系统管理员：仅渲染登录页，禁止访问后台页面 -->
+  <LoginView
+    v-else-if="!currentUser"
+    :notice="authNotice"
+    @logged-in="handleLoggedIn"
+  />
+
+  <!-- 3. 已登录系统管理员：渲染完整后台管理工作区 -->
+  <div v-else class="min-h-dvh flex bg-[#060911] text-slate-100">
     <!-- 键盘无障碍跳转链接 -->
     <a href="#main-workspace" class="skip-link visually-hidden">跳转到主工作区</a>
 
@@ -23,7 +42,7 @@
         </div>
 
         <!-- 分组菜单 -->
-        <nav aria-label="主导航" class="p-3.5 space-y-5">
+        <nav aria-label="主导航" class="p-3.5 space-y-4 overflow-y-auto max-h-[calc(100dvh-190px)]">
           <div v-for="group in navGroups" :key="group.title" class="space-y-1">
             <div class="px-3 text-[11px] font-semibold tracking-wide text-slate-500 mb-1.5">
               {{ group.title }}
@@ -105,7 +124,7 @@
         <div class="flex items-center gap-2.5">
           <button
             type="button"
-            @click="switchTab('users')"
+            @click="switchTab('sessions')"
             class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-emerald-500/40 transition-colors tabular-nums"
           >
             <Activity
@@ -119,7 +138,7 @@
 
           <button
             type="button"
-            @click="switchTab('sync')"
+            @click="switchTab('cache')"
             class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-cyan-500/40 transition-colors tabular-nums"
           >
             <HardDrive class="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
@@ -137,6 +156,22 @@
             <RefreshCw class="w-3.5 h-3.5 text-slate-300" :class="{ 'animate-spin': refreshingOverview }" aria-hidden="true" />
             <span>刷新数据</span>
           </button>
+
+          <div class="flex items-center gap-2 pl-2 border-l border-slate-800/80">
+            <span class="px-2.5 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-xs text-emerald-300 font-medium flex items-center gap-1.5">
+              <ShieldCheck class="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+              <span>{{ currentUser.username }}</span>
+            </span>
+            <button
+              type="button"
+              @click="handleLogout"
+              class="cursor-pointer px-2.5 py-1.5 rounded-xl bg-slate-900/90 hover:bg-rose-950/70 border border-slate-800 hover:border-rose-500/40 text-xs font-medium text-slate-300 hover:text-rose-200 transition-colors flex items-center gap-1.5"
+              title="退出登录"
+            >
+              <LogOut class="w-3.5 h-3.5" aria-hidden="true" />
+              <span>退出</span>
+            </button>
+          </div>
         </div>
       </header>
 
@@ -155,8 +190,11 @@
           @open-detail="drawerMediaId = $event"
         />
         <VirtualLibrariesTab v-else-if="activeTab === 'vlib'" />
+        <BaseCoversTab v-else-if="activeTab === 'covers'" />
+        <ActiveSessionsTab v-else-if="activeTab === 'sessions'" />
         <UsersAndSessionsTab v-else-if="activeTab === 'users'" />
-        <SyncAndCacheTab v-else-if="activeTab === 'sync'" />
+        <SyncAndScrapeTab v-else-if="activeTab === 'sync'" @saved="fetchOverview" />
+        <ImageCacheTab v-else-if="activeTab === 'cache'" @saved="fetchOverview" />
         <HotConfigTab v-else-if="activeTab === 'config'" @saved="fetchOverview" />
       </main>
     </div>
@@ -255,18 +293,33 @@ import {
   CheckCircle2,
   XCircle,
   AlertTriangle,
-  Info
+  Info,
+  ShieldCheck,
+  LogOut,
+  Image as ImageIcon
 } from 'lucide-vue-next'
-import { adminApi } from './api/admin'
+import {
+  adminApi,
+  getAdminToken,
+  clearAdminToken,
+  setUnauthorizedHandler
+} from './api/admin'
 import { toastState, confirmState, resolveConfirm } from './composables/useToast'
+import LoginView from './components/LoginView.vue'
 import OverviewDashboard from './components/OverviewDashboard.vue'
 import PosterWallTab from './components/PosterWallTab.vue'
 import MediaDetailDrawer from './components/MediaDetailDrawer.vue'
 import VirtualLibrariesTab from './components/VirtualLibrariesTab.vue'
+import BaseCoversTab from './components/BaseCoversTab.vue'
+import ActiveSessionsTab from './components/ActiveSessionsTab.vue'
 import UsersAndSessionsTab from './components/UsersAndSessionsTab.vue'
-import SyncAndCacheTab from './components/SyncAndCacheTab.vue'
+import SyncAndScrapeTab from './components/SyncAndScrapeTab.vue'
+import ImageCacheTab from './components/ImageCacheTab.vue'
 import HotConfigTab from './components/HotConfigTab.vue'
 
+const authChecking = ref(true)
+const currentUser = ref(null)
+const authNotice = ref('')
 const activeTab = ref('overview')
 const drawerMediaId = ref(null)
 const overview = ref(null)
@@ -276,44 +329,58 @@ const posterInitialStatus = ref('')
 
 const tabMetas = {
   overview: {
-    title: '系统运行总览',
+    title: '数据总览',
     subtitle: '实时查看媒体库规模、TMDB 元数据刮削进度、当前播放会话与缓存占用'
   },
   poster: {
-    title: '媒体库与海报墙',
+    title: '媒体库海报墙',
     subtitle: '浏览海报墙、查看多版本片源、手动修正 TMDB 匹配或屏蔽指定条目'
   },
   vlib: {
     title: '智能视图',
     subtitle: '按评分、地区、平台或流派组合规则，在 VidHub / Infuse 客户端首页生成专属分类栏目'
   },
+  covers: {
+    title: '基础库封面',
+    subtitle: '自定义电影、电视剧、动漫、纪录片与综艺的 16:9 客户端首页封面'
+  },
+  sessions: {
+    title: '实时会话',
+    subtitle: '监控当前活跃播放流、播放进度心跳与下一集直链预热状态'
+  },
   users: {
-    title: '用户权限与实时会话',
-    subtitle: '管理家庭成员账号与分类访问权限，查看实时播放会话与已登录设备'
+    title: '用户与设备',
+    subtitle: '管理家庭成员账号与分类访问权限，管理客户端已登录设备令牌'
   },
   sync: {
-    title: '媒体同步与图片缓存',
-    subtitle: '管理 strm.txt 索引同步任务、查看同步记录并控制本地海报缓存空间'
+    title: '同步与刮削',
+    subtitle: '管理 strm.txt 增量同步任务、TMDB 刮削维护、同步记录与过滤策略'
+  },
+  cache: {
+    title: '图片缓存',
+    subtitle: '监控本地磁盘图片缓存水位，一键清理过期缓存并配置空间配额上限'
   },
   config: {
     title: '系统设置',
-    subtitle: '配置 AList 服务连接、TMDB 刮削代理、同步过滤规则与图片缓存上限，保存后立即生效'
+    subtitle: '配置小雅 / AList 网关连接与 TMDB 刮削代理等全局核心服务，保存后立即生效'
   }
 }
 
 const currentTabMeta = computed(() => tabMetas[activeTab.value] || tabMetas.overview)
 
 watch(
-  currentTabMeta,
-  meta => {
-    document.title = `${meta.title} | RX-Emby 管理后台`
+  [currentTabMeta, currentUser],
+  ([meta, user]) => {
+    document.title = user
+      ? `${meta.title} | RX-Emby 管理后台`
+      : '登录 | RX-Emby 管理后台'
   },
   { immediate: true }
 )
 
 const navGroups = computed(() => [
   {
-    title: '内容与视图运营',
+    title: '媒体内容',
     items: [
       { key: 'overview', label: '数据总览', icon: LayoutDashboard },
       {
@@ -327,20 +394,28 @@ const navGroups = computed(() => [
         label: '智能视图',
         icon: Sparkles,
         badge: overview.value?.system?.vlib_count ?? null
-      }
+      },
+      { key: 'covers', label: '基础库封面', icon: ImageIcon }
     ]
   },
   {
-    title: '系统与会话管控',
+    title: '用户与会话',
     items: [
       {
-        key: 'users',
-        label: '用户与活跃会话',
-        icon: Users,
+        key: 'sessions',
+        label: '实时会话',
+        icon: Activity,
         badge: overview.value?.system?.active_sessions || null,
         badgeActive: (overview.value?.system?.active_sessions || 0) > 0
       },
-      { key: 'sync', label: '同步与图片缓存', icon: RefreshCw },
+      { key: 'users', label: '用户与设备', icon: Users }
+    ]
+  },
+  {
+    title: '运维与设置',
+    items: [
+      { key: 'sync', label: '同步与刮削', icon: RefreshCw },
+      { key: 'cache', label: '图片缓存', icon: HardDrive },
       { key: 'config', label: '系统设置', icon: SlidersHorizontal }
     ]
   }
@@ -382,8 +457,64 @@ function handleGlobalKeydown(e) {
   }
 }
 
-onMounted(() => {
+async function verifySession() {
+  authChecking.value = true
+  const token = getAdminToken()
+  if (!token) {
+    currentUser.value = null
+    authChecking.value = false
+    return
+  }
+
+  try {
+    const res = await adminApi.getMe()
+    if (res?.user?.is_admin) {
+      currentUser.value = res.user
+      authNotice.value = ''
+      fetchOverview()
+    } else {
+      clearAdminToken()
+      currentUser.value = null
+      authNotice.value = '无权访问：仅系统管理员权限角色可登录管理后台'
+    }
+  } catch (err) {
+    clearAdminToken()
+    currentUser.value = null
+    authNotice.value = err?.message || ''
+  } finally {
+    authChecking.value = false
+  }
+}
+
+function handleLoggedIn(user) {
+  currentUser.value = user
+  authNotice.value = ''
+  activeTab.value = 'overview'
   fetchOverview()
+}
+
+async function handleLogout() {
+  try {
+    await adminApi.logout()
+  } catch (_) {
+    // 忽略退出请求异常，本地仍清理凭证
+  } finally {
+    clearAdminToken()
+    currentUser.value = null
+    overview.value = null
+    drawerMediaId.value = null
+    authNotice.value = ''
+  }
+}
+
+onMounted(() => {
+  setUnauthorizedHandler(msg => {
+    currentUser.value = null
+    overview.value = null
+    drawerMediaId.value = null
+    authNotice.value = msg || '登录已失效，请重新登录'
+  })
+  verifySession()
   window.addEventListener('keydown', handleGlobalKeydown)
 })
 
