@@ -85,6 +85,7 @@ services:
       - ${XIAOYA_DIR:-./xiaoya}:/xiaoya-db:ro
     networks:
       - default
+      # 如不使用外部代理容器网络，请注释掉下面这行及底部的 proxy_net 定义
       - proxy_net
 
 networks:

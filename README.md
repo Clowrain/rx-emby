@@ -21,34 +21,41 @@
 ghcr.io/clowrain/rx-emby:latest
 ```
 
+新版采用 **`.env` 单源配置**，无需再手动挂载 `config.toml`。
+
 ### 1. 准备目录与配置文件
 
 ```bash
 mkdir -p rx-emby && cd rx-emby
 
-# 下载编排文件与配置模板
+# 下载编排文件与环境变量模板
 curl -fsSL https://raw.githubusercontent.com/Clowrain/rx-emby/main/deploy/docker-compose.yml -o docker-compose.yml
-curl -fsSL https://raw.githubusercontent.com/Clowrain/rx-emby/main/deploy/config.example.toml -o config.toml
+curl -fsSL https://raw.githubusercontent.com/Clowrain/rx-emby/main/deploy/.env.example -o .env
 ```
 
-> **提示**：请务必先下载或创建 `config.toml` 再执行启动命令，避免 Docker 将其自动创建为空目录导致启动失败。
+### 2. 修改 `.env` 配置
 
-### 2. 修改配置
+编辑 `.env`，重点检查以下参数（其余参数保持默认即可）：
 
-编辑 `config.toml`，重点检查以下配置项（其余参数可保持默认，也可在启动后前往 Web 后台「系统设置」修改并立即生效）：
-
-| 配置项 | 说明 |
+| 环境变量 | 说明 |
 | :--- | :--- |
-| `[sync].strm_txt_source` | `strm.txt` 索引文件地址（支持本地路径或 `http(s)://` 链接） |
-| `[alist].base_url` / `username` / `password` | 小雅或 AList 服务地址及登录凭据（如有两步验证可填写 `otp_secret`） |
-| `[alist].path_prefix` | 若小雅挂载在 AList 子目录下（如 `/xiaoya`），请填写该前缀；根目录留空 |
-| `[tmdb].api_key` | TMDB v3 API Key（用于获取海报、简介、评分与分集信息） |
-| `[tmdb].proxy_url` | 访问 TMDB 所需的 HTTP / SOCKS5 代理地址（直连可留空） |
-| `[scraper].auto_background` | 默认 `false`（打开详情或手动触发时按需刮削）；设为 `true` 则在后台持续刮削全库 |
+| `POSTGRES_PASSWORD` | **必填**。PostgreSQL 数据库密码，Compose 会自动将其拼装为 `DATABASE_URL` |
+| `XIAOYA_DIR` | 宿主机小雅数据目录（只读挂载到容器 `/xiaoya-db`），用于直接读取本地 `strm.txt` |
+| `STRM_TXT_SOURCE` | `strm.txt` 路径或远程 URL（配合 `XIAOYA_DIR` 挂载时默认 `/xiaoya-db/strm.txt`） |
+| `ALIST_BASE_URL` / `ALIST_USERNAME` / `ALIST_PASSWORD` | 小雅或 AList 服务地址及登录凭据（如有两步验证可填写 `ALIST_OTP_SECRET`） |
+| `ALIST_PATH_PREFIX` | 若小雅挂载在 AList 子目录下（如 `/xiaoya`），填写该前缀；根目录留空 |
+| `TMDB_API_KEY` | TMDB v3 API Key（用于获取海报、简介、评分与分集信息） |
+| `TMDB_PROXY_URL` | 访问 TMDB 所需的 HTTP / SOCKS5 代理地址（直连可留空） |
+| `SCRAPER_AUTO_BACKGROUND` | 默认 `false`（打开详情或手动触发时按需刮削）；设为 `true` 则在后台持续刮削全库 |
 
-> **注意**：在 Docker Compose 网络中，`[server].database_url` 需使用数据库服务名 `postgres`（`deploy/config.example.toml` 已默认配置）。
+> **配置优先级说明**：服务首次启动时会将环境变量中的运行参数写入数据库；之后在 Web 后台「系统设置」修改的内容会持久化在数据库中，优先于 `.env` 生效。
 
-### 3. 启动服务
+### 3. 确认外部网络并启动服务
+
+`deploy/docker-compose.yml` 默认附加了外部网络 `proxy_net`（用于与宿主机上的代理容器互通）：
+
+- 如果你已有 `proxy_net` 网络，直接启动即可；
+- 如果不需要外部代理网络，请注释掉 `docker-compose.yml` 中的 `proxy_net` 相关行（或先执行 `docker network create proxy_net`）。
 
 ```bash
 docker compose up -d
@@ -93,7 +100,9 @@ docker compose -f deploy/docker-compose.yml up -d --build
    ```bash
    docker compose up -d
    ```
-2. 确认项目根目录存在 `config.toml`（可从 `deploy/config.example.toml` 复制修改；本地开发时 `[server].database_url` 的主机名应为 `127.0.0.1:5432`）。
+2. 准备本地配置（二选一）：
+   - 复制配置模板到根目录：`cp deploy/config.example.toml config.toml`，并将 `database_url` 中的主机名改为 `127.0.0.1:5432`；
+   - 或直接通过环境变量传入配置（缺失 `config.toml` 时会自动回退到内置默认值并读取环境变量覆盖）。
 3. 编译前端并将静态产物内嵌至 Rust 服务端启动：
    ```bash
    ./run.sh
