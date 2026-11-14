@@ -9,7 +9,7 @@ server_name = "RX-Emby Media Server"
 database_url = "postgres://media_admin:rx_emby_strong_password@postgres:5432/xiaoya_media"
 
 [sync]
-# strm.txt 索引文件路径或远程 HTTP 地址
+# strm.txt 索引文件路径或远程 HTTP 地址（如已通过 compose 挂载小雅目录，可填 /xiaoya-db/strm.txt）
 strm_txt_source = "http://192.168.1.10:5244/d/strm.txt"
 # 后台定时增量同步间隔（秒），默认 21600（6 小时）
 sync_interval_sec = 21600

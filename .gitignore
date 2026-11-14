@@ -4,6 +4,8 @@
 /web_ui/*
 !/web_ui/.gitkeep
 /config.toml
+.env
+**/.env
 /frontend/node_modules/
 /frontend/bun.lock
 .DS_Store

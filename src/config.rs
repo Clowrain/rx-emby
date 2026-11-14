@@ -1,20 +1,25 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
 pub struct BootstrapFileConfig {
     pub server: ServerSection,
     pub sync: SyncSection,
     pub alist: AlistSection,
     pub tmdb: TmdbSection,
-    #[serde(default)]
     pub scraper: ScraperSection,
     pub image_cache: ImageCacheSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ServerSection {
     pub bind_addr: String,
     pub server_id: String,
@@ -22,54 +27,113 @@ pub struct ServerSection {
     pub database_url: String,
 }
 
+impl Default for ServerSection {
+    fn default() -> Self {
+        Self {
+            bind_addr: "0.0.0.0:8096".to_string(),
+            server_id: "rx-emby-nas-01".to_string(),
+            server_name: "RX-Emby Media Server".to_string(),
+            database_url: "postgres://media_admin:rx_emby_strong_password@127.0.0.1:5432/xiaoya_media".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct SyncSection {
     pub strm_txt_source: String,
     pub sync_interval_sec: u64,
     pub parse_concurrency: usize,
     pub db_batch_size: usize,
-    #[serde(default)]
     pub include_prefixes: String,
-    #[serde(default)]
     pub exclude_keywords: String,
-    #[serde(default)]
     pub max_lines_limit: usize,
 }
 
+impl Default for SyncSection {
+    fn default() -> Self {
+        Self {
+            strm_txt_source: "http://192.168.1.10:5244/d/strm.txt".to_string(),
+            sync_interval_sec: 21600,
+            parse_concurrency: 16,
+            db_batch_size: 5000,
+            include_prefixes: String::new(),
+            exclude_keywords: "演唱会,短剧,广播剧".to_string(),
+            max_lines_limit: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
 pub struct ScraperSection {
-    #[serde(default)]
     pub auto_background: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct AlistSection {
     pub base_url: String,
     pub username: String,
     pub password: String,
-    #[serde(default)]
     pub otp_secret: String,
-    #[serde(default)]
     pub path_prefix: String,
     pub direct_url_ttl_sec: u64,
 }
 
+impl Default for AlistSection {
+    fn default() -> Self {
+        Self {
+            base_url: "http://192.168.1.10:5244".to_string(),
+            username: "admin".to_string(),
+            password: String::new(),
+            otp_secret: String::new(),
+            path_prefix: String::new(),
+            direct_url_ttl_sec: 600,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct TmdbSection {
     pub api_key: String,
-    #[serde(default)]
     pub proxy_url: String,
     pub api_base_url: String,
     pub image_base_url: String,
     pub rate_limit_per_sec: u32,
 }
 
+impl Default for TmdbSection {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            proxy_url: String::new(),
+            api_base_url: "https://api.themoviedb.org/3".to_string(),
+            image_base_url: "https://image.tmdb.org/t/p".to_string(),
+            rate_limit_per_sec: 8,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ImageCacheSection {
     pub cache_dir: String,
     pub max_size_mb: u64,
     pub evict_high_watermark: f64,
     pub evict_low_watermark: f64,
+}
+
+impl Default for ImageCacheSection {
+    fn default() -> Self {
+        Self {
+            cache_dir: "./cache/images".to_string(),
+            max_size_mb: 20480,
+            evict_high_watermark: 0.90,
+            evict_low_watermark: 0.75,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,11 +176,70 @@ pub struct DynamicConfig {
 }
 
 impl BootstrapFileConfig {
-    pub fn load_from_file(path: &str) -> Result<Self> {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("读取启动配置文件失败: {}", path))?;
-        let cfg: Self = toml::from_str(&content).context("解析 config.toml 格式失败")?;
+    pub fn load_with_env(path: &str) -> Result<Self> {
+        let mut cfg = if Path::new(path).is_file() {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("读取启动配置文件失败: {}", path))?;
+            toml::from_str(&content).context("解析 config.toml 格式失败")?
+        } else {
+            Self::default()
+        };
+        cfg.apply_env_overrides();
         Ok(cfg)
+    }
+
+    fn apply_env_overrides(&mut self) {
+        // [server]
+        env_str("BIND_ADDR", &mut self.server.bind_addr);
+        env_str("SERVER_ID", &mut self.server.server_id);
+        env_str("SERVER_NAME", &mut self.server.server_name);
+        env_str("DATABASE_URL", &mut self.server.database_url);
+
+        // [sync]
+        env_str("STRM_TXT_SOURCE", &mut self.sync.strm_txt_source);
+        env_parse("SYNC_INTERVAL_SEC", &mut self.sync.sync_interval_sec);
+        env_parse("PARSE_CONCURRENCY", &mut self.sync.parse_concurrency);
+        env_parse("DB_BATCH_SIZE", &mut self.sync.db_batch_size);
+        env_str("SYNC_INCLUDE_PREFIXES", &mut self.sync.include_prefixes);
+        env_str("SYNC_EXCLUDE_KEYWORDS", &mut self.sync.exclude_keywords);
+        env_parse("SYNC_MAX_LINES_LIMIT", &mut self.sync.max_lines_limit);
+
+        // [scraper]
+        if let Ok(v) = env::var("SCRAPER_AUTO_BACKGROUND") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => self.scraper.auto_background = true,
+                "false" | "0" | "no" => self.scraper.auto_background = false,
+                _ => {}
+            }
+        }
+
+        // [alist]
+        env_str("ALIST_BASE_URL", &mut self.alist.base_url);
+        env_str("ALIST_USERNAME", &mut self.alist.username);
+        env_str("ALIST_PASSWORD", &mut self.alist.password);
+        env_str("ALIST_OTP_SECRET", &mut self.alist.otp_secret);
+        env_str("ALIST_PATH_PREFIX", &mut self.alist.path_prefix);
+        env_parse("ALIST_DIRECT_URL_TTL_SEC", &mut self.alist.direct_url_ttl_sec);
+
+        // [tmdb]
+        env_str("TMDB_API_KEY", &mut self.tmdb.api_key);
+        env_str("TMDB_PROXY", &mut self.tmdb.proxy_url);
+        env_str("TMDB_PROXY_URL", &mut self.tmdb.proxy_url);
+        env_str("TMDB_API_BASE_URL", &mut self.tmdb.api_base_url);
+        env_str("TMDB_IMAGE_BASE_URL", &mut self.tmdb.image_base_url);
+        env_parse("TMDB_RATE_LIMIT_PER_SEC", &mut self.tmdb.rate_limit_per_sec);
+
+        // [image_cache]
+        env_str("IMAGE_CACHE_DIR", &mut self.image_cache.cache_dir);
+        env_parse("IMAGE_CACHE_MAX_SIZE_MB", &mut self.image_cache.max_size_mb);
+        env_parse(
+            "IMAGE_CACHE_EVICT_HIGH_WATERMARK",
+            &mut self.image_cache.evict_high_watermark,
+        );
+        env_parse(
+            "IMAGE_CACHE_EVICT_LOW_WATERMARK",
+            &mut self.image_cache.evict_low_watermark,
+        );
     }
 
     pub fn into_dynamic(self) -> DynamicConfig {
@@ -146,6 +269,23 @@ impl BootstrapFileConfig {
             image_max_size_mb: self.image_cache.max_size_mb,
             image_evict_high_watermark: self.image_cache.evict_high_watermark,
             image_evict_low_watermark: self.image_cache.evict_low_watermark,
+        }
+    }
+}
+
+fn env_str(key: &str, target: &mut String) {
+    if let Ok(v) = env::var(key) {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            *target = trimmed.to_string();
+        }
+    }
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str, target: &mut T) {
+    if let Ok(v) = env::var(key) {
+        if let Ok(parsed) = v.trim().parse::<T>() {
+            *target = parsed;
         }
     }
 }

@@ -22,8 +22,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // 1. 加载本地启动配置
-    let file_cfg = BootstrapFileConfig::load_from_file("config.toml")?;
+    // 1. 加载本地启动配置（环境变量优先覆盖 config.toml，缺失 config.toml 时使用默认值）
+    let file_cfg = BootstrapFileConfig::load_with_env("config.toml")?;
     let db_url = file_cfg.server.database_url.clone();
     let bind_addr = file_cfg.server.bind_addr.clone();
 

@@ -4,35 +4,37 @@ services:
     container_name: rx-emby-pg
     restart: unless-stopped
     environment:
-      POSTGRES_USER: media_admin
-      POSTGRES_PASSWORD: rx_emby_strong_password
-      POSTGRES_DB: xiaoya_media
-      TZ: Asia/Shanghai
+      POSTGRES_USER: ${POSTGRES_USER:-media_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-xiaoya_media}
+      TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      - ./pg_data:/var/lib/postgresql/data
+      - ${PG_DATA_DIR:-./pg_data}:/var/lib/postgresql/data
     command:
       - "postgres"
       - "-c"
-      - "shared_buffers=128MB"
+      - "shared_buffers=64MB"
       - "-c"
-      - "work_mem=8MB"
+      - "work_mem=4MB"
       - "-c"
-      - "maintenance_work_mem=64MB"
+      - "maintenance_work_mem=32MB"
       - "-c"
-      - "effective_cache_size=384MB"
+      - "effective_cache_size=128MB"
       - "-c"
       - "synchronous_commit=off"
       - "-c"
       - "max_connections=50"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U media_admin -d xiaoya_media"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-media_admin} -d ${POSTGRES_DB:-xiaoya_media}"]
       interval: 5s
       timeout: 5s
       retries: 10
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 256M
+    networks:
+      - default
 
   rx-emby:
     image: ghcr.io/clowrain/rx-emby:latest
@@ -46,11 +48,46 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "8096:8096"
+      - "${HTTP_PORT:-8096}:8096"
     environment:
-      RUST_LOG: rx_emby=info
-      TZ: Asia/Shanghai
+      RUST_LOG: ${RUST_LOG:-rx_emby=info}
+      TZ: ${TZ:-Asia/Shanghai}
+      BIND_ADDR: ${BIND_ADDR:-0.0.0.0:8096}
+      SERVER_ID: ${SERVER_ID:-rx-emby-nas-01}
+      SERVER_NAME: ${SERVER_NAME:-RX-Emby Media Server}
+      DATABASE_URL: postgres://${POSTGRES_USER:-media_admin}:${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-xiaoya_media}
+      STRM_TXT_SOURCE: ${STRM_TXT_SOURCE:-/xiaoya-db/strm.txt}
+      SYNC_INTERVAL_SEC: ${SYNC_INTERVAL_SEC:-600}
+      PARSE_CONCURRENCY: ${PARSE_CONCURRENCY:-16}
+      DB_BATCH_SIZE: ${DB_BATCH_SIZE:-5000}
+      SYNC_INCLUDE_PREFIXES: ${SYNC_INCLUDE_PREFIXES:-}
+      SYNC_EXCLUDE_KEYWORDS: ${SYNC_EXCLUDE_KEYWORDS:-演唱会,短剧,广播剧}
+      SYNC_MAX_LINES_LIMIT: ${SYNC_MAX_LINES_LIMIT:-0}
+      ALIST_BASE_URL: ${ALIST_BASE_URL:-http://192.168.1.10:5678}
+      ALIST_USERNAME: ${ALIST_USERNAME:-dav}
+      ALIST_PASSWORD: ${ALIST_PASSWORD:-}
+      ALIST_OTP_SECRET: ${ALIST_OTP_SECRET:-}
+      ALIST_PATH_PREFIX: ${ALIST_PATH_PREFIX:-}
+      ALIST_DIRECT_URL_TTL_SEC: ${ALIST_DIRECT_URL_TTL_SEC:-600}
+      SCRAPER_AUTO_BACKGROUND: ${SCRAPER_AUTO_BACKGROUND:-false}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      TMDB_PROXY_URL: ${TMDB_PROXY_URL:-}
+      TMDB_API_BASE_URL: ${TMDB_API_BASE_URL:-https://api.themoviedb.org/3}
+      TMDB_IMAGE_BASE_URL: ${TMDB_IMAGE_BASE_URL:-https://image.tmdb.org/t/p}
+      TMDB_RATE_LIMIT_PER_SEC: ${TMDB_RATE_LIMIT_PER_SEC:-4}
+      IMAGE_CACHE_DIR: ${IMAGE_CACHE_DIR:-./cache/images}
+      IMAGE_CACHE_MAX_SIZE_MB: ${IMAGE_CACHE_MAX_SIZE_MB:-20480}
+      IMAGE_CACHE_EVICT_HIGH_WATERMARK: ${IMAGE_CACHE_EVICT_HIGH_WATERMARK:-0.90}
+      IMAGE_CACHE_EVICT_LOW_WATERMARK: ${IMAGE_CACHE_EVICT_LOW_WATERMARK:-0.75}
     volumes:
-      # 启动前请先在同级目录准备好 config.toml 文件，否则 Docker 会将其创建为空目录
-      - ./config.toml:/app/config.toml
-      - ./cache:/app/cache
+      - ${CACHE_DIR:-./cache}:/app/cache
+      # 挂载小雅目录（只读），用于直接读取 strm.txt
+      - ${XIAOYA_DIR:-./xiaoya}:/xiaoya-db:ro
+    networks:
+      - default
+      - proxy_net
+
+networks:
+  default:
+  proxy_net:
+    external: true

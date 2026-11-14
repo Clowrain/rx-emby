@@ -98,7 +98,7 @@ async fn update_configs(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
-    let base_cfg = BootstrapFileConfig::load_from_file("config.toml")
+    let base_cfg = BootstrapFileConfig::load_with_env("config.toml")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let merged = base_cfg
         .into_dynamic()
