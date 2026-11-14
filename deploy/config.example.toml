@@ -1,38 +1,62 @@
 [server]
+# 服务监听地址与端口
 bind_addr = "0.0.0.0:8096"
+# Emby 协议对外暴露的服务器标识与名称
 server_id = "rx-emby-nas-01"
 server_name = "RX-Emby Media Server"
 # Docker Compose 部署时，主机名请使用 compose 中的服务名 `postgres`
+# 若在宿主机本地开发运行，请改为 `127.0.0.1`
 database_url = "postgres://media_admin:rx_emby_strong_password@postgres:5432/xiaoya_media"
 
 [sync]
+# strm.txt 索引文件路径或远程 HTTP 地址
 strm_txt_source = "http://192.168.1.10:5244/d/strm.txt"
+# 后台定时增量同步间隔（秒），默认 21600（6 小时）
 sync_interval_sec = 21600
+# 索引解析并发工作线程数
 parse_concurrency = 16
+# 数据库单批写入行数
 db_batch_size = 5000
+# 仅同步指定前缀的目录（逗号分隔），留空表示同步全部目录
 include_prefixes = ""
+# 路径中包含这些关键词的条目将被自动跳过（逗号分隔）
 exclude_keywords = "演唱会,短剧,广播剧"
+# 单次最大解析行数限制（0 为不限；调试时可设为较小值如 5000）
 max_lines_limit = 0
 
 [alist]
+# 小雅或 AList 服务地址
 base_url = "http://192.168.1.10:5244"
+# AList 登录用户名与密码
 username = "admin"
 password = "your_alist_password"
+# 若启用两步验证，填写 Base32 TOTP 密钥（可选）
+otp_secret = ""
+# 若小雅挂载在 AList 子目录下（如 /xiaoya），请填写该前缀；根目录留空即可
 path_prefix = ""
+# 302 网盘直链在内存中的缓存有效期（秒）
 direct_url_ttl_sec = 600
 
 [tmdb]
+# TMDB v3 API Key（可在 Web 后台「系统设置」中随时修改并立即生效）
 api_key = "your_tmdb_api_key"
+# 访问 TMDB 使用的网络代理（如 http://127.0.0.1:7890），直连可留空
 proxy_url = ""
+# TMDB API 与图片源地址（可替换为自建反代地址）
 api_base_url = "https://api.themoviedb.org/3"
 image_base_url = "https://image.tmdb.org/t/p"
+# TMDB 每秒请求限流阈值（req/s）
 rate_limit_per_sec = 8
 
 [image_cache]
+# 本地图片缓存目录（Docker 部署时建议保持默认并挂载 ./cache:/app/cache）
 cache_dir = "./cache/images"
+# 图片缓存最大磁盘配额（MB），默认 20480（20 GB）
 max_size_mb = 20480
+# 触发自动清理的高水位比例（如 0.90 即 90%）与清理目标低水位比例
 evict_high_watermark = 0.90
 evict_low_watermark = 0.75
 
 [scraper]
+# 是否开启后台全库自动刮削（false 时仅在打开详情或手动点击时按需刮削）
 auto_background = false

@@ -51,5 +51,6 @@ services:
       RUST_LOG: rx_emby=info
       TZ: Asia/Shanghai
     volumes:
+      # 启动前请先在同级目录准备好 config.toml 文件，否则 Docker 会将其创建为空目录
       - ./config.toml:/app/config.toml
       - ./cache:/app/cache
