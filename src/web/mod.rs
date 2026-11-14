@@ -3,7 +3,7 @@ pub mod emby_api;
 
 use crate::state::AppState;
 use axum::{
-    extract::Path,
+    extract::{Path, Request},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -34,8 +34,24 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/web/*path", get(serve_static))
         .merge(emby_api::router())
         .merge(admin_api::router(state.clone()))
+        .fallback(log_unmatched_404)
         .layer(cors)
         .with_state(state)
+}
+
+async fn log_unmatched_404(req: Request) -> StatusCode {
+    let ua = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    tracing::warn!(
+        "⚠️ [HTTP 404] {} {} | UA={:?}",
+        req.method(),
+        req.uri(),
+        ua
+    );
+    StatusCode::NOT_FOUND
 }
 
 async fn serve_index() -> impl IntoResponse {

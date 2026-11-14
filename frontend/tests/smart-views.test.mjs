@@ -4,16 +4,29 @@ import fs from 'node:fs'
 import vm from 'node:vm'
 import { transformSync } from 'esbuild'
 import { parse } from '@vue/compiler-sfc'
-import { ref, reactive, watch } from 'vue'
+import { ref, reactive, computed, watch } from 'vue'
 import { validateSmartRule } from '../src/api/smartViewRules.js'
+import { useVirtualLibraries } from '../src/composables/useVirtualLibraries.js'
+import { coverImageUrl, dynamicCoverLabel, isDynamicCover, ruleBadges } from '../src/utils/smartViewLabels.js'
 
 function editor(api = {}) {
   const source = fs.readFileSync(new URL('../src/components/VirtualLibrariesTab.vue', import.meta.url),'utf8')
   const { descriptor } = parse(source)
-  const script = descriptor.scriptSetup.content.replace(/^import .*$/mg,'')
-  const ctx = vm.createContext({ref, reactive, watch, onMounted:()=>{},validateSmartRule,
-    useToast:()=>({warn:()=>{},success:()=>{},error:()=>{},info:()=>{}}),useConfirm:()=>async()=>true,
-    adminApi:{listVirtualLibraries:async()=>({libraries:[]}),...api}})
+  const script = descriptor.scriptSetup.content.replace(/^import[\s\S]*?from\s+['"][^'"]+['"]\s*$/mg,'')
+  const stubToast = {warn:()=>{},success:()=>{},error:()=>{},info:()=>{}}
+  const stubConfirm = async()=>true
+  const stubApi = {listVirtualLibraries:async()=>({libraries:[]}),...api}
+  const ctx = vm.createContext({
+    ref, reactive, computed, watch, onMounted:()=>{},
+    coverImageUrl, dynamicCoverLabel, isDynamicCover, ruleBadges,
+    useVirtualLibraries: (deps = {}) => useVirtualLibraries({
+      api: stubApi,
+      toast: stubToast,
+      confirmModal: stubConfirm,
+      validateRule: validateSmartRule,
+      ...deps
+    })
+  })
   vm.runInContext(transformSync(script,{loader:'ts'}).code + '\nglobalThis.editor = {modal,openModal,submitModal,formError,saving,previewRules,previewCount};',ctx)
   return ctx.editor
 }

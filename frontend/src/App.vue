@@ -1,299 +1,14 @@
-<template>
-  <!-- 1. 鉴权检查中：不渲染任何后台管理页面内容 -->
-  <div
-    v-if="authChecking"
-    class="min-h-dvh flex flex-col items-center justify-center bg-[#060911] text-slate-300 gap-3"
-  >
-    <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-500 to-cyan-600 flex items-center justify-center shadow-lg shadow-emerald-950/80 animate-pulse">
-      <Play class="w-4 h-4 text-white fill-current ml-0.5" aria-hidden="true" />
-    </div>
-    <p class="text-xs text-slate-400">正在验证管理员会话…</p>
-  </div>
-
-  <!-- 2. 未登录或非系统管理员：仅渲染登录页，禁止访问后台页面 -->
-  <LoginView
-    v-else-if="!currentUser"
-    :notice="authNotice"
-    @logged-in="handleLoggedIn"
-  />
-
-  <!-- 3. 已登录系统管理员：渲染完整后台管理工作区 -->
-  <div v-else class="min-h-dvh flex bg-[#060911] text-slate-100">
-    <!-- 键盘无障碍跳转链接 -->
-    <a href="#main-workspace" class="skip-link visually-hidden">跳转到主工作区</a>
-
-    <!-- 左侧生产级导航边栏 -->
-    <aside class="w-64 shrink-0 bg-[#080c16]/95 border-r border-slate-800/75 flex flex-col justify-between sticky top-0 h-dvh z-30">
-      <div>
-        <!-- 品牌 Logo 区 -->
-        <div class="px-6 py-5 border-b border-slate-800/70 flex items-center gap-3.5">
-          <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-500 to-cyan-600 flex items-center justify-center shadow-lg shadow-emerald-950/80 ring-1 ring-white/15">
-            <Play class="w-4 h-4 text-white fill-current ml-0.5" aria-hidden="true" />
-          </div>
-          <div>
-            <div class="flex items-center gap-2">
-              <span class="font-bold text-base tracking-tight text-white">RX-Emby</span>
-              <span class="px-1.5 py-0.5 text-[10px] font-semibold font-mono rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
-                PRO
-              </span>
-            </div>
-            <p class="text-[11px] text-slate-400 mt-0.5">零落盘直链流媒体服务</p>
-          </div>
-        </div>
-
-        <!-- 分组菜单 -->
-        <nav aria-label="主导航" class="p-3.5 space-y-4 overflow-y-auto max-h-[calc(100dvh-190px)]">
-          <div v-for="group in navGroups" :key="group.title" class="space-y-1">
-            <div class="px-3 text-[11px] font-semibold tracking-wide text-slate-500 mb-1.5">
-              {{ group.title }}
-            </div>
-            <button
-              v-for="item in group.items"
-              :key="item.key"
-              type="button"
-              @click="switchTab(item.key)"
-              :aria-current="activeTab === item.key ? 'page' : undefined"
-              class="w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-sm font-medium transition-colors duration-150 cursor-pointer"
-              :class="
-                activeTab === item.key
-                  ? 'bg-gradient-to-r from-emerald-500/20 to-cyan-500/5 text-emerald-300 border border-emerald-500/35 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-100 hover:bg-slate-900/75 border border-transparent'
-              "
-            >
-              <div class="flex items-center gap-3">
-                <component
-                  :is="item.icon"
-                  class="w-4 h-4 shrink-0 transition-colors"
-                  :class="activeTab === item.key ? 'text-emerald-400' : 'text-slate-400'"
-                  :stroke-width="1.85"
-                  aria-hidden="true"
-                />
-                <span>{{ item.label }}</span>
-              </div>
-              <span
-                v-if="item.badge !== undefined && item.badge !== null"
-                class="px-2 py-0.5 text-[10px] rounded-full font-mono tabular-nums"
-                :class="
-                  item.badgeActive
-                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                    : 'bg-slate-800/80 text-slate-400'
-                "
-              >
-                {{ item.badge }}
-              </span>
-            </button>
-          </div>
-        </nav>
-      </div>
-
-      <!-- 底部引擎运行态卡片 -->
-      <div class="p-4 border-t border-slate-800/70 space-y-2.5 bg-slate-950/60">
-        <div class="flex items-center justify-between text-xs">
-          <span class="flex items-center gap-2 text-slate-200 font-medium">
-            <Radio class="w-3.5 h-3.5 text-emerald-400 animate-pulse" aria-hidden="true" />
-            <span>302 直链转发引擎</span>
-          </span>
-          <span class="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25">
-            运行中
-          </span>
-        </div>
-        <div class="text-[11px] text-slate-400 space-y-1 font-mono tabular-nums">
-          <div class="truncate flex items-center gap-1.5" :title="overview?.system?.alist_base_url">
-            <Server class="w-3 h-3 text-slate-500 shrink-0" aria-hidden="true" />
-            <span class="truncate">{{ overview?.system?.alist_base_url || '正在连接网关…' }}</span>
-          </div>
-          <div class="flex items-center justify-between text-slate-500 pt-0.5">
-            <span>TMDB 限流: {{ overview?.system?.tmdb_rate_limit || 8 }} req/s</span>
-            <span class="text-slate-400">{{ overview?.system?.auto_background_scraper ? '自动扫描' : '按需刮削' }}</span>
-          </div>
-        </div>
-      </div>
-    </aside>
-
-    <!-- 右侧主工作区 -->
-    <div class="flex-1 flex flex-col min-w-0">
-      <!-- 顶部状态与面包屑头栏 -->
-      <header class="bg-[#080c16]/80 backdrop-blur-md border-b border-slate-800/80 px-8 py-4 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-20">
-        <div>
-          <h1 id="main-workspace" tabindex="-1" class="text-lg font-bold text-white tracking-tight outline-none">
-            {{ currentTabMeta.title }}
-          </h1>
-          <p class="text-xs text-slate-400 mt-0.5">{{ currentTabMeta.subtitle }}</p>
-        </div>
-
-        <div class="flex items-center gap-2.5">
-          <button
-            type="button"
-            @click="switchTab('sessions')"
-            class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-emerald-500/40 transition-colors tabular-nums"
-          >
-            <Activity
-              class="w-3.5 h-3.5"
-              :class="(overview?.system?.active_sessions || 0) > 0 ? 'text-emerald-400 animate-pulse' : 'text-slate-500'"
-              aria-hidden="true"
-            />
-            <span class="text-slate-400">并发播放流</span>
-            <span class="font-semibold font-mono text-white">{{ overview?.system?.active_sessions || 0 }}</span>
-          </button>
-
-          <button
-            type="button"
-            @click="switchTab('cache')"
-            class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-cyan-500/40 transition-colors tabular-nums"
-          >
-            <HardDrive class="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
-            <span class="text-slate-400">图片缓存</span>
-            <span class="font-mono text-emerald-400">
-              {{ overview?.cache?.used_mb || 0 }} / {{ overview?.cache?.max_mb || 20480 }} MB
-            </span>
-          </button>
-
-          <button
-            type="button"
-            @click="fetchOverview"
-            class="cursor-pointer px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-200 transition-colors flex items-center gap-1.5"
-          >
-            <RefreshCw class="w-3.5 h-3.5 text-slate-300" :class="{ 'animate-spin': refreshingOverview }" aria-hidden="true" />
-            <span>刷新数据</span>
-          </button>
-
-          <div class="flex items-center gap-2 pl-2 border-l border-slate-800/80">
-            <span class="px-2.5 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-xs text-emerald-300 font-medium flex items-center gap-1.5">
-              <ShieldCheck class="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
-              <span>{{ currentUser.username }}</span>
-            </span>
-            <button
-              type="button"
-              @click="handleLogout"
-              class="cursor-pointer px-2.5 py-1.5 rounded-xl bg-slate-900/90 hover:bg-rose-950/70 border border-slate-800 hover:border-rose-500/40 text-xs font-medium text-slate-300 hover:text-rose-200 transition-colors flex items-center gap-1.5"
-              title="退出登录"
-            >
-              <LogOut class="w-3.5 h-3.5" aria-hidden="true" />
-              <span>退出</span>
-            </button>
-          </div>
-        </div>
-      </header>
-
-      <!-- 主内容容器 -->
-      <main class="flex-1 p-8 max-w-[1600px] w-full mx-auto">
-        <OverviewDashboard
-          v-if="activeTab === 'overview'"
-          :overview="overview"
-          @navigate="handleDashboardNavigate"
-          @refresh="fetchOverview"
-        />
-        <PosterWallTab
-          v-else-if="activeTab === 'poster'"
-          :initial-category="posterInitialCategory"
-          :initial-status="posterInitialStatus"
-          @open-detail="drawerMediaId = $event"
-        />
-        <VirtualLibrariesTab v-else-if="activeTab === 'vlib'" />
-        <BaseCoversTab v-else-if="activeTab === 'covers'" />
-        <ActiveSessionsTab v-else-if="activeTab === 'sessions'" />
-        <UsersAndSessionsTab v-else-if="activeTab === 'users'" />
-        <SyncAndScrapeTab v-else-if="activeTab === 'sync'" @saved="fetchOverview" />
-        <ImageCacheTab v-else-if="activeTab === 'cache'" @saved="fetchOverview" />
-        <HotConfigTab v-else-if="activeTab === 'config'" @saved="fetchOverview" />
-      </main>
-    </div>
-
-    <!-- 右侧分集与多版本源抽屉 -->
-    <MediaDetailDrawer :media-id="drawerMediaId" @close="drawerMediaId = null" />
-
-    <!-- 全局生产级 Toast 通知 (无障碍 Polite Live Region) -->
-    <div
-      role="status"
-      aria-live="polite"
-      class="fixed top-5 right-5 z-50 space-y-2.5 max-w-sm w-full pointer-events-none"
-    >
-      <div
-        v-for="t in toastState.items"
-        :key="t.id"
-        class="pointer-events-auto flex items-start gap-3 px-4 py-3 rounded-xl shadow-2xl border backdrop-blur-md text-sm transition-colors"
-        :class="{
-          'bg-emerald-950/95 border-emerald-500/40 text-emerald-100': t.type === 'success',
-          'bg-rose-950/95 border-rose-500/40 text-rose-100': t.type === 'error',
-          'bg-amber-950/95 border-amber-500/40 text-amber-100': t.type === 'warn',
-          'bg-slate-900/95 border-slate-700 text-slate-100': t.type === 'info'
-        }"
-      >
-        <CheckCircle2 v-if="t.type === 'success'" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" aria-hidden="true" />
-        <XCircle v-else-if="t.type === 'error'" class="w-4 h-4 text-rose-400 shrink-0 mt-0.5" aria-hidden="true" />
-        <AlertTriangle v-else-if="t.type === 'warn'" class="w-4 h-4 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
-        <Info v-else class="w-4 h-4 text-sky-400 shrink-0 mt-0.5" aria-hidden="true" />
-        <div class="flex-1 leading-snug break-all">{{ t.message }}</div>
-      </div>
-    </div>
-
-    <!-- 全局生产级确认弹窗 -->
-    <div
-      v-if="confirmState.visible"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="confirm-dialog-title"
-      class="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-50 p-4"
-      @click.self="resolveConfirm(false)"
-    >
-      <div class="card p-6 rounded-2xl max-w-md w-full space-y-4">
-        <div class="flex items-start gap-3">
-          <div
-            class="w-9 h-9 rounded-xl flex items-center justify-center shrink-0"
-            :class="confirmState.danger ? 'bg-rose-500/15 text-rose-400 border border-rose-500/30' : 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'"
-          >
-            <AlertTriangle v-if="confirmState.danger" class="w-5 h-5" aria-hidden="true" />
-            <Info v-else class="w-5 h-5" aria-hidden="true" />
-          </div>
-          <div class="space-y-1">
-            <h2 id="confirm-dialog-title" class="text-base font-bold text-white">{{ confirmState.title }}</h2>
-            <p class="text-sm text-slate-300 leading-relaxed">{{ confirmState.message }}</p>
-          </div>
-        </div>
-        <div class="flex justify-end gap-2.5 pt-2">
-          <button
-            type="button"
-            @click="resolveConfirm(false)"
-            class="cursor-pointer px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 transition-colors"
-          >
-            {{ confirmState.cancelText }}
-          </button>
-          <button
-            type="button"
-            @click="resolveConfirm(true)"
-            class="cursor-pointer px-4 py-2 rounded-xl text-xs font-semibold text-white transition-colors"
-            :class="
-              confirmState.danger
-                ? 'bg-rose-600 hover:bg-rose-500'
-                : 'bg-emerald-600 hover:bg-emerald-500'
-            "
-          >
-            {{ confirmState.confirmText }}
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
-</template>
-
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import {
-  Play,
   LayoutDashboard,
   Film,
   Sparkles,
   Users,
   RefreshCw,
   SlidersHorizontal,
-  Radio,
-  Server,
   Activity,
   HardDrive,
-  CheckCircle2,
-  XCircle,
-  AlertTriangle,
-  Info,
   ShieldCheck,
   LogOut,
   Image as ImageIcon
@@ -304,8 +19,11 @@ import {
   clearAdminToken,
   setUnauthorizedHandler
 } from './api/admin'
-import { toastState, confirmState, resolveConfirm } from './composables/useToast'
+import { confirmState, resolveConfirm } from './composables/useToast'
 import LoginView from './components/LoginView.vue'
+import AdminSidebar from './components/layout/AdminSidebar.vue'
+import ToastContainer from './components/layout/ToastContainer.vue'
+import ConfirmModal from './components/layout/ConfirmModal.vue'
 import OverviewDashboard from './components/OverviewDashboard.vue'
 import PosterWallTab from './components/PosterWallTab.vue'
 import MediaDetailDrawer from './components/MediaDetailDrawer.vue'
@@ -522,3 +240,123 @@ onUnmounted(() => {
   window.removeEventListener('keydown', handleGlobalKeydown)
 })
 </script>
+
+<template>
+  <!-- 1. 鉴权检查中 -->
+  <div v-if="authChecking" class="min-h-dvh bg-[#060911] text-slate-300 flex items-center justify-center">
+    <div class="flex flex-col items-center gap-3">
+      <div class="w-9 h-9 rounded-xl border-2 border-emerald-500/30 border-t-emerald-400 animate-spin"></div>
+      <p class="text-xs text-slate-400">正在校验管理后台会话…</p>
+    </div>
+  </div>
+
+  <!-- 2. 未登录或非系统管理员 -->
+  <LoginView
+    v-else-if="!currentUser"
+    :notice="authNotice"
+    @logged-in="handleLoggedIn"
+  />
+
+  <!-- 3. 已登录系统管理员 -->
+  <div v-else class="min-h-dvh flex bg-[#060911] text-slate-100">
+    <a href="#main-workspace" class="skip-link visually-hidden">跳转到主工作区</a>
+
+    <AdminSidebar
+      :nav-groups="navGroups"
+      :active-tab="activeTab"
+      :overview="overview"
+      @switch-tab="switchTab"
+    />
+
+    <!-- 右侧主工作区 -->
+    <div class="flex-1 flex flex-col min-w-0">
+      <header class="bg-[#080c16]/80 backdrop-blur-md border-b border-slate-800/80 px-8 py-4 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-20">
+        <div>
+          <h1 id="main-workspace" tabindex="-1" class="text-lg font-bold text-white tracking-tight outline-none">
+            {{ currentTabMeta.title }}
+          </h1>
+          <p class="text-xs text-slate-400 mt-0.5">{{ currentTabMeta.subtitle }}</p>
+        </div>
+
+        <div class="flex items-center gap-2.5">
+          <button
+            type="button"
+            @click="switchTab('sessions')"
+            class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-emerald-500/40 transition-colors tabular-nums"
+          >
+            <Activity
+              class="w-3.5 h-3.5"
+              :class="(overview?.system?.active_sessions || 0) > 0 ? 'text-emerald-400 animate-pulse' : 'text-slate-500'"
+              aria-hidden="true"
+            />
+            <span class="text-slate-400">并发播放流</span>
+            <span class="font-semibold font-mono text-white">{{ overview?.system?.active_sessions || 0 }}</span>
+          </button>
+
+          <button
+            type="button"
+            @click="switchTab('cache')"
+            class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-cyan-500/40 transition-colors tabular-nums"
+          >
+            <HardDrive class="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
+            <span class="text-slate-400">图片缓存</span>
+            <span class="font-mono text-emerald-400">
+              {{ overview?.cache?.used_mb || 0 }} / {{ overview?.cache?.max_mb || 20480 }} MB
+            </span>
+          </button>
+
+          <button
+            type="button"
+            @click="fetchOverview"
+            class="cursor-pointer px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-200 transition-colors flex items-center gap-1.5"
+          >
+            <RefreshCw class="w-3.5 h-3.5 text-slate-300" :class="{ 'animate-spin': refreshingOverview }" aria-hidden="true" />
+            <span>刷新数据</span>
+          </button>
+
+          <div class="flex items-center gap-2 pl-2 border-l border-slate-800/80">
+            <span class="px-2.5 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-xs text-emerald-300 font-medium flex items-center gap-1.5">
+              <ShieldCheck class="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
+              <span>{{ currentUser.username }}</span>
+            </span>
+            <button
+              type="button"
+              @click="handleLogout"
+              class="cursor-pointer px-2.5 py-1.5 rounded-xl bg-slate-900/90 hover:bg-rose-950/70 border border-slate-800 hover:border-rose-500/40 text-xs font-medium text-slate-300 hover:text-rose-200 transition-colors flex items-center gap-1.5"
+              title="退出登录"
+            >
+              <LogOut class="w-3.5 h-3.5" aria-hidden="true" />
+              <span>退出</span>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main class="flex-1 p-8 max-w-[1600px] w-full mx-auto">
+        <OverviewDashboard
+          v-if="activeTab === 'overview'"
+          :overview="overview"
+          @navigate="handleDashboardNavigate"
+          @refresh="fetchOverview"
+        />
+        <PosterWallTab
+          v-else-if="activeTab === 'poster'"
+          :initial-category="posterInitialCategory"
+          :initial-status="posterInitialStatus"
+          @open-detail="drawerMediaId = $event"
+        />
+        <VirtualLibrariesTab v-else-if="activeTab === 'vlib'" />
+        <BaseCoversTab v-else-if="activeTab === 'covers'" />
+        <ActiveSessionsTab v-else-if="activeTab === 'sessions'" />
+        <UsersAndSessionsTab v-else-if="activeTab === 'users'" />
+        <SyncAndScrapeTab v-else-if="activeTab === 'sync'" @saved="fetchOverview" />
+        <ImageCacheTab v-else-if="activeTab === 'cache'" @saved="fetchOverview" />
+        <HotConfigTab v-else-if="activeTab === 'config'" @saved="fetchOverview" />
+      </main>
+    </div>
+
+    <MediaDetailDrawer :media-id="drawerMediaId" @close="drawerMediaId = null" />
+    <ToastContainer />
+    <ConfirmModal />
+  </div>
+</template>
