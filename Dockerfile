@@ -4,6 +4,12 @@
 # Stage 1: Build Vue 3 + Vite Frontend (native on build host)
 # ==========================================
 FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend-builder
+ARG APP_VERSION=""
+ARG GIT_SHA=""
+ARG GIT_BRANCH=""
+ENV APP_VERSION=${APP_VERSION} \
+    GIT_SHA=${GIT_SHA} \
+    GIT_BRANCH=${GIT_BRANCH}
 WORKDIR /app/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./

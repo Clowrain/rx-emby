@@ -115,6 +115,8 @@
           <span>普通用户仅限客户端播放</span>
         </div>
       </section>
+
+      <BuildVersionBadge variant="login" />
     </main>
   </div>
 </template>
@@ -123,6 +125,7 @@
 import { ref, computed } from 'vue'
 import { Play, ShieldCheck, Eye, EyeOff, AlertCircle, Lock } from 'lucide-vue-next'
 import { adminApi, setAdminToken } from '../api/admin'
+import BuildVersionBadge from './layout/BuildVersionBadge.vue'
 
 const props = defineProps({
   notice: {

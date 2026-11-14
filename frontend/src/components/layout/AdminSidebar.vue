@@ -1,5 +1,6 @@
 <script setup>
 import { Play, Radio, Server } from 'lucide-vue-next'
+import BuildVersionBadge from './BuildVersionBadge.vue'
 
 defineProps({
   navGroups: { type: Array, required: true },
@@ -30,7 +31,7 @@ const emit = defineEmits(['switch-tab'])
       </div>
 
       <!-- 分组菜单 -->
-      <nav aria-label="主导航" class="p-3.5 space-y-4 overflow-y-auto max-h-[calc(100dvh-190px)]">
+      <nav aria-label="主导航" class="p-3.5 space-y-4 overflow-y-auto max-h-[calc(100dvh-230px)]">
         <div v-for="group in navGroups" :key="group.title" class="space-y-1">
           <div class="px-3 text-[11px] font-semibold tracking-wide text-slate-500 mb-1.5">
             {{ group.title }}
@@ -95,6 +96,8 @@ const emit = defineEmits(['switch-tab'])
           <span class="text-slate-400">{{ overview?.system?.auto_background_scraper ? '自动扫描' : '按需刮削' }}</span>
         </div>
       </div>
+
+      <BuildVersionBadge variant="sidebar" />
     </div>
   </aside>
 </template>

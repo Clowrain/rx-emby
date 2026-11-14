@@ -405,3 +405,11 @@ pub(super) async fn stream_by_d_path(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+pub(super) async fn get_media_segments() -> Json<Value> {
+    Json(json!({
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": 0
+    }))
+}
+
