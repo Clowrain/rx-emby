@@ -34,6 +34,7 @@ pub struct AppState {
     pub scraper: ScrapeScheduler,
     pub caches: CacheLayer,
     pub sessions: DashMap<String, PlaybackSession>,
+    pub monitor: crate::monitor::MonitorState,
     pub shutdown_token: CancellationToken,
 }
 
@@ -174,6 +175,7 @@ impl AppState {
                 admin_stats_cache,
             },
             sessions: DashMap::new(),
+            monitor: crate::monitor::MonitorState::default(),
             shutdown_token: CancellationToken::new(),
         }))
     }

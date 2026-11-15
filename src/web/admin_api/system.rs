@@ -358,3 +358,59 @@ pub(super) async fn get_admin_overview(
     Ok(Json(payload))
 }
 
+pub(super) async fn get_resource_metrics(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut recent: Vec<crate::monitor::ResourceSample> = {
+        let guard = state.monitor.recent_samples.read().await;
+        guard.iter().cloned().collect()
+    };
+
+    if recent.is_empty() {
+        if let Ok(sample) = crate::monitor::collect_and_record(&state).await {
+            recent.push(sample);
+        }
+    }
+
+    let current = recent.last().cloned();
+    let daily_stats: Vec<crate::monitor::ResourceDailyRow> = sqlx::query_as(
+        r#"
+        SELECT
+            stat_date, sample_count,
+            app_cpu_avg, app_cpu_max, app_mem_avg_mb, app_mem_max_mb,
+            db_cpu_avg, db_cpu_max, db_mem_avg_mb, db_mem_max_mb,
+            db_size_max_mb, db_conn_avg, db_conn_max,
+            disk_used_max_gb, disk_usage_max_pct,
+            peak_cpu_at, peak_cpu_scenario, peak_mem_at, peak_mem_scenario,
+            updated_at
+        FROM resource_daily_stats
+        ORDER BY stat_date DESC
+        LIMIT 30
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    let uptime_sec = (chrono::Utc::now() - state.monitor.started_at)
+        .num_seconds()
+        .max(0);
+
+    Ok(Json(json!({
+        "started_at": state.monitor.started_at,
+        "uptime_sec": uptime_sec,
+        "current": current,
+        "recent_samples": recent,
+        "daily_stats": daily_stats
+    })))
+}
+
+pub(super) async fn trigger_resource_sample(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    crate::monitor::collect_and_record(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    get_resource_metrics(State(state)).await
+}
+

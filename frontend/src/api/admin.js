@@ -70,6 +70,12 @@ export const adminApi = {
   getOverview() {
     return requestJson('/api/admin/overview')
   },
+  getResourceMetrics() {
+    return requestJson('/api/admin/resources')
+  },
+  sampleResourceMetrics() {
+    return requestJson('/api/admin/resources/sample', { method: 'POST' })
+  },
 
   // 1. 海报墙与刮削纠偏
   listMedia(params) {

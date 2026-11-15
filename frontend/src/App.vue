@@ -13,7 +13,8 @@ import {
   LogOut,
   Image as ImageIcon,
   Radio,
-  Server
+  Server,
+  Cpu
 } from 'lucide-vue-next'
 import {
   adminApi,
@@ -37,6 +38,7 @@ import UsersAndSessionsTab from './components/UsersAndSessionsTab.vue'
 import SyncAndScrapeTab from './components/SyncAndScrapeTab.vue'
 import ImageCacheTab from './components/ImageCacheTab.vue'
 import HotConfigTab from './components/HotConfigTab.vue'
+import ResourceMonitorTab from './components/ResourceMonitorTab.vue'
 
 const authChecking = ref(true)
 const currentUser = ref(null)
@@ -80,6 +82,10 @@ const tabMetas = {
   cache: {
     title: '图片缓存',
     subtitle: '监控本地磁盘图片缓存水位，一键清理过期缓存并配置空间配额上限'
+  },
+  resources: {
+    title: '资源监控与审计',
+    subtitle: '实时观测应用与数据库 CPU、内存、磁盘水位，按日归档峰值场景与日常均值'
   },
   config: {
     title: '系统设置',
@@ -137,6 +143,7 @@ const navGroups = computed(() => [
     items: [
       { key: 'sync', label: '同步与刮削', icon: RefreshCw },
       { key: 'cache', label: '图片缓存', icon: HardDrive },
+      { key: 'resources', label: '资源监控', icon: Cpu },
       { key: 'config', label: '系统设置', icon: SlidersHorizontal }
     ]
   }
@@ -353,6 +360,7 @@ onUnmounted(() => {
         <UsersAndSessionsTab v-else-if="activeTab === 'users'" />
         <SyncAndScrapeTab v-else-if="activeTab === 'sync'" @saved="fetchOverview" />
         <ImageCacheTab v-else-if="activeTab === 'cache'" @saved="fetchOverview" />
+        <ResourceMonitorTab v-else-if="activeTab === 'resources'" />
         <HotConfigTab v-else-if="activeTab === 'config'" @saved="fetchOverview" />
       </main>
 

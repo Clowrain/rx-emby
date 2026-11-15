@@ -20,6 +20,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     let protected = Router::new()
         .route("/api/admin/auth/me", get(auth::admin_me))
         .route("/api/admin/overview", get(system::get_admin_overview))
+        .route("/api/admin/resources", get(system::get_resource_metrics))
+        .route("/api/admin/resources/sample", post(system::trigger_resource_sample))
         .route("/api/admin/configs", get(system::list_configs).post(system::update_configs))
         .route("/api/admin/sync/trigger", post(system::trigger_sync))
         .route("/api/admin/sync/logs", get(system::list_sync_logs))

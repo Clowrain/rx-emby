@@ -1,6 +1,7 @@
 mod alist;
 mod config;
 mod image_cache;
+mod monitor;
 mod scraper;
 mod state;
 mod smart_views;
@@ -54,10 +55,11 @@ async fn main() -> Result<()> {
         Err(e) => warn!("AList 鉴权预热跳过（请在 config.toml 或后台配置真实账号密码）: {}", e),
     }
 
-    // 6. 拉起三大后台异步工作协程
+    // 6. 拉起后台异步工作协程
     sync::spawn_sync_worker(app_state.clone());
     scraper::spawn_scrape_worker(app_state.clone(), priority_rx);
     image_cache::spawn_image_lru_worker(app_state.clone());
+    monitor::spawn_resource_monitor(app_state.clone());
 
     // 7. 启动 Axum Web & Emby 协议服务
     let app = web::build_router(app_state.clone());

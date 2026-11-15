@@ -198,14 +198,38 @@
               <Clock class="w-3.5 h-3.5 text-slate-500 shrink-0" aria-hidden="true" />
               <span>{{ new Date(overview.last_sync.started_at).toLocaleString() }}</span>
             </div>
-            <div class="flex items-center justify-between text-slate-400 pt-2 border-t border-slate-800/80">
-              <span>读取行数: {{ formatNum(overview.last_sync.total_lines) }}</span>
-              <span>耗时: {{ (overview.last_sync.duration_ms || 0).toLocaleString() }} ms</span>
+            <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-slate-400 pt-2 border-t border-slate-800/80">
+              <span>读取行数: <strong class="font-mono font-medium text-slate-300">{{ formatNum(overview.last_sync.total_lines) }}</strong></span>
+              <span>耗时: <strong class="font-mono font-medium text-slate-300">{{ formatNum(overview.last_sync.duration_ms) }} ms</strong></span>
             </div>
-            <div class="flex items-center gap-3 font-mono pt-0.5">
-              <span class="text-emerald-400">新增 {{ overview.last_sync.added_episodes }} 个源</span>
-              <span class="text-amber-400">移除 {{ overview.last_sync.deleted_episodes }} 个源</span>
-              <span class="text-cyan-400">新增 {{ overview.last_sync.new_media_items }} 部影视</span>
+            <div class="grid grid-cols-3 gap-2 pt-1">
+              <div
+                class="rounded-lg bg-slate-900/70 border border-slate-800/80 px-2.5 py-2 min-w-0"
+                :title="`新增 ${formatNum(overview.last_sync.added_episodes)} 个视频源`"
+              >
+                <div class="text-[11px] text-slate-400 truncate">新增源</div>
+                <div class="mt-0.5 font-mono font-semibold text-sm text-emerald-400 tabular-nums truncate">
+                  +{{ formatNum(overview.last_sync.added_episodes) }}
+                </div>
+              </div>
+              <div
+                class="rounded-lg bg-slate-900/70 border border-slate-800/80 px-2.5 py-2 min-w-0"
+                :title="`移除 ${formatNum(overview.last_sync.deleted_episodes)} 个失效源`"
+              >
+                <div class="text-[11px] text-slate-400 truncate">移除源</div>
+                <div class="mt-0.5 font-mono font-semibold text-sm text-amber-400 tabular-nums truncate">
+                  -{{ formatNum(overview.last_sync.deleted_episodes) }}
+                </div>
+              </div>
+              <div
+                class="rounded-lg bg-slate-900/70 border border-slate-800/80 px-2.5 py-2 min-w-0"
+                :title="`新增 ${formatNum(overview.last_sync.new_media_items)} 部影视目录`"
+              >
+                <div class="text-[11px] text-slate-400 truncate">新增目录</div>
+                <div class="mt-0.5 font-mono font-semibold text-sm text-cyan-400 tabular-nums truncate">
+                  +{{ formatNum(overview.last_sync.new_media_items) }}
+                </div>
+              </div>
             </div>
           </div>
           <div v-else class="text-xs text-slate-500 py-4">尚无同步记录</div>
