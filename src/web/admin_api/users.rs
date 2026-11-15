@@ -84,21 +84,29 @@ pub(super) async fn list_users_and_sessions(
     for entry in state.sessions.iter() {
         let s = entry.value().clone();
         let idle_sec = s.last_activity.elapsed().as_secs();
-        let ep_label: Option<String> = if let Some(eid) = s.current_episode_id {
-            sqlx::query_scalar(
-                r#"
-                SELECT m.title || ' · S' || LPAD(e.season_number::text, 2, '0') || 'E' || LPAD(e.episode_number::text, 2, '0')
-                FROM episodes e
-                JOIN media_items m ON m.id = e.media_item_id
-                WHERE e.id = $1
-                "#,
-            )
-            .bind(eid)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None)
-        } else {
-            None
+        let ep_label: Option<String> = match s.current_episode_id {
+            Some(eid) if eid > 0 => {
+                sqlx::query_scalar(
+                    r#"
+                    SELECT m.title || ' · S' || LPAD(e.season_number::text, 2, '0') || 'E' || LPAD(e.episode_number::text, 2, '0')
+                    FROM episodes e
+                    JOIN media_items m ON m.id = e.media_item_id
+                    WHERE e.id = $1
+                    "#,
+                )
+                .bind(eid)
+                .fetch_optional(&state.db)
+                .await
+                .unwrap_or(None)
+            }
+            Some(neg_mid) if neg_mid < 0 => {
+                sqlx::query_scalar("SELECT title FROM media_items WHERE id = $1")
+                    .bind(-neg_mid)
+                    .fetch_optional(&state.db)
+                    .await
+                    .unwrap_or(None)
+            }
+            _ => None,
         };
 
         active_sessions.push(json!({
@@ -219,6 +227,9 @@ pub(super) async fn delete_user(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    state.sessions.retain(|_, s| s.user_id != uid);
+    state.caches.admin_stats_cache.invalidate_all();
+
     Ok(Json(json!({ "status": "ok", "message": "用户已删除" })))
 }
 
@@ -226,11 +237,20 @@ pub(super) async fn revoke_access_token(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    sqlx::query("DELETE FROM access_tokens WHERE token = $1")
-        .bind(&token)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let deleted: Option<(String, String)> = sqlx::query_as(
+        "DELETE FROM access_tokens WHERE token = $1 RETURNING user_id, device_name",
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some((uid, dev)) = deleted {
+        state
+            .sessions
+            .retain(|_, s| !(s.user_id == uid && s.device_name == dev));
+    }
+    state.caches.admin_stats_cache.invalidate_all();
 
     Ok(Json(json!({ "status": "ok", "message": "已注销该客户端设备" })))
 }

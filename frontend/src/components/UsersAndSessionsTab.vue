@@ -285,6 +285,7 @@
                   type="checkbox"
                   :value="opt.value"
                   v-model="modal.allowedCategories"
+                  @change="onCategoryChange(opt.value)"
                 />
                 <component :is="opt.icon" class="w-3.5 h-3.5 text-slate-400 shrink-0" aria-hidden="true" />
                 <span class="text-slate-200">{{ opt.label }}</span>
@@ -383,6 +384,19 @@ function openModal(u = null) {
   modal.isAdmin = u ? u.is_admin : false
   modal.allowedCategories = u ? [...(u.allowed_categories || ['*'])] : ['*']
   modal.visible = true
+}
+
+function onCategoryChange(changedVal) {
+  if (changedVal === '*') {
+    if (modal.allowedCategories.includes('*')) {
+      modal.allowedCategories = ['*']
+    } else if (modal.allowedCategories.length === 0) {
+      modal.allowedCategories = ['*']
+    }
+    return
+  }
+  const filtered = modal.allowedCategories.filter(v => v !== '*')
+  modal.allowedCategories = filtered.length > 0 ? filtered : ['*']
 }
 
 async function submitUser() {

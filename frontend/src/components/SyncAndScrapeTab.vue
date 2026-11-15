@@ -273,6 +273,7 @@ async function handleRetryFailed() {
   try {
     const res = await adminApi.retryFailedScrapes()
     toast.success(res.message)
+    await loadAll()
   } catch (err) {
     toast.error('重试失败：' + err.message)
   } finally {

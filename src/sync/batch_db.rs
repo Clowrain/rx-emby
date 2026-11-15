@@ -90,7 +90,7 @@ pub async fn apply_sync_diff(
 
     let mut tx = db.begin().await.context("开启增量同步事务失败")?;
 
-    // 2. 批量清理已失效的剧集物理源
+    // 2. 批量清理已失效的剧集物理源及孤儿 seasons / media_items
     if !to_delete.is_empty() {
         for chunk in to_delete.chunks(batch_size.max(1000)) {
             sqlx::query("DELETE FROM episodes WHERE path_hash = ANY($1)")
@@ -99,6 +99,32 @@ pub async fn apply_sync_diff(
                 .await
                 .context("批量删除失效 episodes 失败")?;
         }
+
+        // 清理已没有任何分集的空季与空影视主条目，避免残留幽灵卡片与无效刮削
+        sqlx::query(
+            r#"
+            DELETE FROM seasons s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM episodes e
+                WHERE e.media_item_id = s.media_item_id AND e.season_number = s.season_number
+            )
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .context("清理孤儿 seasons 失败")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM media_items m
+            WHERE NOT EXISTS (
+                SELECT 1 FROM episodes e WHERE e.media_item_id = m.id
+            )
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .context("清理孤儿 media_items 失败")?;
     }
 
     // 3. 批量 upsert media_items（按 root_dir 聚合去重）

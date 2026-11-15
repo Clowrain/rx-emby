@@ -187,14 +187,18 @@ impl AppState {
             info!("TMDB 限流速率已热更新: {} req/s", new_cfg.tmdb_rate_limit_per_sec);
         }
 
-        // 3. 若 AList 账号或地址变更，清空旧 Token 触发重新登录
+        // 3. 若 AList 鉴权或路径前缀变更，清空旧 Token 与直链/目录预热缓存
         if old_cfg.alist_base_url != new_cfg.alist_base_url
             || old_cfg.alist_username != new_cfg.alist_username
             || old_cfg.alist_password != new_cfg.alist_password
+            || old_cfg.alist_otp_secret != new_cfg.alist_otp_secret
+            || old_cfg.alist_path_prefix != new_cfg.alist_path_prefix
         {
             let mut token_guard = self.alist_auth.current_token.write().await;
             *token_guard = None;
-            info!("AList 鉴权配置已变更，旧 Token 已失效并等待刷新");
+            self.caches.alist_direct_urls.invalidate_all();
+            self.caches.alist_dir_prewarmed.invalidate_all();
+            info!("AList 配置已变更，旧 Token、直链及目录预热缓存已清空");
         }
 
         let new_arc = Arc::new(new_cfg);

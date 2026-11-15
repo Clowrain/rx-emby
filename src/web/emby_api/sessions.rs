@@ -40,7 +40,7 @@ async fn set_item_played_state(
     let user_id = resolve_valid_user_id(state, Some(path_user_id), headers).await?;
     if let Some((mid, tmdb_id, mtype, snum, epnum)) = resolve_item_target(state, item_id).await {
         let _ = upsert_play_history(
-            state, &user_id, mid, tmdb_id, &mtype, snum, epnum, 0, 0, played,
+            state, &user_id, mid, tmdb_id, &mtype, snum, epnum, 0, 0, played, true,
         )
         .await;
     }
@@ -168,7 +168,13 @@ pub(super) async fn session_playing(
     let ep_id = raw_item_id
         .strip_prefix("ep_")
         .or_else(|| raw_item_id.strip_prefix("src_"))
-        .and_then(|s| s.parse::<i64>().ok());
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| {
+            raw_item_id
+                .strip_prefix("media_")
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|mid| -mid)
+        });
     let sid = body
         .play_session_id
         .unwrap_or_else(|| format!("sess_{}", raw_item_id));
@@ -212,6 +218,7 @@ pub(super) async fn session_playing(
                 body.position_ticks,
                 body.run_time_ticks,
                 false,
+                false,
             )
             .await;
         }
@@ -239,7 +246,13 @@ pub(super) async fn session_progress(
     let ep_id = raw_item_id
         .strip_prefix("ep_")
         .or_else(|| raw_item_id.strip_prefix("src_"))
-        .and_then(|s| s.parse::<i64>().ok());
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| {
+            raw_item_id
+                .strip_prefix("media_")
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|mid| -mid)
+        });
     let sid = body
         .play_session_id
         .unwrap_or_else(|| format!("sess_{}", raw_item_id));
@@ -279,6 +292,7 @@ pub(super) async fn session_progress(
                 saved_pos,
                 body.run_time_ticks,
                 auto_completed,
+                false,
             )
             .await;
         }
@@ -386,6 +400,7 @@ pub(super) async fn session_stopped(
                         saved_pos,
                         body.run_time_ticks,
                         auto_completed,
+                        false,
                     )
                     .await;
                 }
@@ -467,6 +482,7 @@ async fn upsert_play_history(
     position_ticks: i64,
     duration_ticks: i64,
     is_played: bool,
+    overwrite_played: bool,
 ) -> Result<(), sqlx::Error> {
     let updated = sqlx::query(
         r#"
@@ -475,7 +491,7 @@ async fn upsert_play_history(
             tmdb_id = COALESCE($3, tmdb_id),
             position_ticks = $7,
             duration_ticks = CASE WHEN $8 > 0 THEN $8 ELSE duration_ticks END,
-            is_played = $9 OR is_played,
+            is_played = CASE WHEN $10 THEN $9 ELSE ($9 OR is_played) END,
             last_played_at = NOW()
         WHERE user_id = $1
           AND season_number = $5
@@ -495,6 +511,7 @@ async fn upsert_play_history(
     .bind(position_ticks)
     .bind(duration_ticks)
     .bind(is_played)
+    .bind(overwrite_played)
     .execute(&state.db)
     .await?
     .rows_affected();

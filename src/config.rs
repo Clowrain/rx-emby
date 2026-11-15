@@ -358,6 +358,17 @@ impl DynamicConfig {
         merge_field!("alist.base_url", self.alist_base_url, "string", "AList 服务基础地址", |s: &str| Ok::<_, ()>(s.trim_end_matches('/').to_string()));
         merge_field!("alist.username", self.alist_username, "string", "AList 登录账号", |s: &str| Ok::<_, ()>(s.to_string()));
         merge_field!("alist.password", self.alist_password, "secret", "AList 登录密码", |s: &str| Ok::<_, ()>(s.to_string()));
+        if let Some(raw_otp) = db_map.remove("alist.otp_secret") {
+            self.alist_otp_secret = non_empty_opt(&raw_otp);
+        } else {
+            sqlx::query(
+                "INSERT INTO system_configs (config_key, config_value, value_type, description)
+                 VALUES ('alist.otp_secret', $1, 'secret', 'AList TOTP 2FA 密钥') ON CONFLICT DO NOTHING",
+            )
+            .bind(self.alist_otp_secret.clone().unwrap_or_default())
+            .execute(db)
+            .await?;
+        }
         merge_field!("alist.path_prefix", self.alist_path_prefix, "string", "小雅挂载子目录前缀", |s: &str| Ok::<_, ()>(normalize_prefix(s)));
         merge_field!("alist.direct_url_ttl_sec", self.direct_url_ttl_sec, "int", "直链内存缓存有效期(秒)", |s: &str| s.parse::<u64>());
 
@@ -378,6 +389,20 @@ impl DynamicConfig {
             .await?;
         }
 
+        if let Some(raw_dir) = db_map.remove("image_cache.cache_dir") {
+            let trimmed = raw_dir.trim();
+            if !trimmed.is_empty() {
+                self.image_cache_dir = PathBuf::from(trimmed);
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO system_configs (config_key, config_value, value_type, description)
+                 VALUES ('image_cache.cache_dir', $1, 'string', '图片磁盘缓存目录') ON CONFLICT DO NOTHING",
+            )
+            .bind(self.image_cache_dir.to_string_lossy().to_string())
+            .execute(db)
+            .await?;
+        }
         merge_field!("image_cache.disk_cache_enabled", self.image_disk_cache_enabled, "bool", "是否将海报与剧照缓存到本地磁盘", |s: &str| s.parse::<bool>());
         merge_field!("image_cache.max_size_mb", self.image_max_size_mb, "int", "图片磁盘缓存上限(MB)", |s: &str| s.parse::<u64>());
         merge_field!("image_cache.evict_high_watermark", self.image_evict_high_watermark, "float", "图片缓存清理高水位线", |s: &str| s.parse::<f64>());

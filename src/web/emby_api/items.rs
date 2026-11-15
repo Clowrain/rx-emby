@@ -113,6 +113,7 @@ pub(super) async fn get_user_items(
     if let Some(ref pid) = q.parent_id {
         if let Some(raw_id) = pid.strip_prefix("media_") {
             if let Ok(mid) = raw_id.parse::<i64>() {
+                ensure_media_accessible(&state, &user_id, mid).await?;
                 return get_episodes_for_media(&state, &user_id, mid).await;
             }
         }
@@ -293,8 +294,28 @@ pub(super) async fn get_user_items(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
 
-    // 批量加载当前用户的收藏集合，填充 UserData
+    // 批量加载当前用户的收藏集合与播放历史，填充 UserData
     let fav_set = load_user_favorite_keys(&state, &user_id).await;
+    let page_mids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let page_tids: Vec<i32> = rows.iter().filter_map(|r| r.tmdb_id).collect();
+    let hist_rows: Vec<(Option<i64>, Option<i32>, String, i32, i32, i64, bool)> = if page_mids.is_empty() {
+        vec![]
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, is_played
+            FROM play_histories
+            WHERE user_id = $1
+              AND (media_item_id = ANY($2) OR (tmdb_id IS NOT NULL AND tmdb_id = ANY($3)))
+            "#,
+        )
+        .bind(&user_id)
+        .bind(&page_mids)
+        .bind(&page_tids)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default()
+    };
 
     let items: Vec<Value> = rows
         .into_iter()
@@ -310,6 +331,26 @@ pub(super) async fn get_user_items(
             }
 
             let is_fav = only_favorite || is_media_favorited(&fav_set, r.id, r.tmdb_id, &r.media_type);
+            let (pos_ticks, is_played) = if r.media_type == "movie" {
+                hist_rows
+                    .iter()
+                    .find(|(mid, tid, mtype, s, e, _, _)| {
+                        *s == 0 && *e == 1 && (
+                            (r.tmdb_id.is_some() && *tid == r.tmdb_id && mtype == "movie")
+                            || *mid == Some(r.id)
+                        )
+                    })
+                    .map(|(_, _, _, _, _, pos, played)| (*pos, *played))
+                    .unwrap_or((0, false))
+            } else {
+                let any_played = hist_rows.iter().any(|(mid, tid, mtype, _, _, _, played)| {
+                    *played && (
+                        (r.tmdb_id.is_some() && *tid == r.tmdb_id && mtype == "tv")
+                        || *mid == Some(r.id)
+                    )
+                });
+                (0, any_played)
+            };
 
             let mut obj = json!({
                 "Id": format!("media_{}", r.id),
@@ -325,10 +366,10 @@ pub(super) async fn get_user_items(
                 "CommunityRating": r.rating,
                 "ImageTags": image_tags,
                 "UserData": {
-                    "PlaybackPositionTicks": 0,
-                    "PlayCount": 0,
+                    "PlaybackPositionTicks": pos_ticks,
+                    "PlayCount": if is_played { 1 } else { 0 },
                     "IsFavorite": is_fav,
-                    "Played": false
+                    "Played": is_played
                 }
             });
             if let Some(ref pdate) = r.premiered_at {
@@ -472,9 +513,11 @@ pub(super) async fn get_item_detail(
             .parse::<i64>()
             .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 media_id".to_string()))?;
 
+        ensure_media_accessible(&state, &user_id, mid).await?;
+
         let row: Option<(String, Option<i32>, String, Option<i32>, Option<String>, f32, Option<String>, i16)> =
             sqlx::query_as(
-                "SELECT media_type, tmdb_id, title, year, overview, rating, poster_path, scrape_status FROM media_items WHERE id = $1",
+                "SELECT media_type, tmdb_id, title, year, overview, rating, poster_path, scrape_status FROM media_items WHERE id = $1 AND is_ignored = FALSE",
             )
             .bind(mid)
             .fetch_optional(&state.db)
@@ -532,7 +575,7 @@ pub(super) async fn get_item_detail(
             .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 episode_id".to_string()))?;
 
         let ep_meta: Option<(i64, i32, i32, Option<String>, Option<String>, Option<String>, Option<String>, i32)> = sqlx::query_as(
-            "SELECT media_item_id, season_number, episode_number, title, overview, still_path, air_date, runtime FROM episodes WHERE id = $1",
+            "SELECT e.media_item_id, e.season_number, e.episode_number, e.title, e.overview, e.still_path, e.air_date, e.runtime FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.id = $1 AND m.is_ignored = FALSE",
         )
         .bind(eid)
         .fetch_optional(&state.db)
@@ -540,8 +583,9 @@ pub(super) async fn get_item_detail(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let Some((mid, snum, epnum, title, overview, still_path, air_date, runtime)) = ep_meta else {
-            return Err((StatusCode::NOT_FOUND, "剧集不存在".to_string()));
+            return Err((StatusCode::NOT_FOUND, "剧集不存在或已被屏蔽".to_string()));
         };
+        ensure_media_accessible(&state, &user_id, mid).await?;
 
         let media_meta: Option<(Option<i32>, String, String)> =
             sqlx::query_as("SELECT tmdb_id, media_type, title FROM media_items WHERE id = $1")
@@ -615,16 +659,49 @@ struct SeasonListRow {
     air_date: Option<String>,
 }
 
+pub(super) async fn ensure_media_accessible(
+    state: &AppState,
+    user_id: &str,
+    mid: i64,
+) -> Result<(String, Option<i32>, String), (StatusCode, String)> {
+    let row: Option<(String, Option<i32>, String)> = sqlx::query_as(
+        "SELECT media_type, tmdb_id, category FROM media_items WHERE id = $1 AND is_ignored = FALSE",
+    )
+    .bind(mid)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (media_type, tmdb_id, category) =
+        row.ok_or((StatusCode::NOT_FOUND, "媒体不存在或已忽略".to_string()))?;
+
+    if let Some(cats) = get_user_allowed_categories(state, user_id).await {
+        let allowed = cats
+            .iter()
+            .any(|c| c == &category || c.starts_with("lib_vlib_"));
+        if !allowed {
+            return Err((StatusCode::FORBIDDEN, "无权访问该分类下的媒体".to_string()));
+        }
+    }
+
+    Ok((media_type, tmdb_id, category))
+}
+
 pub(super) async fn get_show_seasons(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(series_id): Path<String>,
+    Query(q): Query<ItemsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let user_id = resolve_valid_user_id(&state, q.user_id.as_deref(), &headers).await?;
     let cfg = state.config.load();
     let mid = series_id
         .strip_prefix("media_")
         .unwrap_or(&series_id)
         .parse::<i64>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 series_id".to_string()))?;
+
+    ensure_media_accessible(&state, &user_id, mid).await?;
 
     // 触发 P0 实时检查（若该剧分集尚未刮削或有连载新集待补齐，立即插队执行）
     let _ = state.scraper.priority_tx.try_send(mid);
@@ -715,6 +792,8 @@ pub(super) async fn get_show_episodes(
         .unwrap_or(&series_id)
         .parse::<i64>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 series_id".to_string()))?;
+
+    ensure_media_accessible(&state, &user_id, mid).await?;
 
     // 触发 P0 实时检查（若该季有未刮削分集或连载残缺分集已过 12h 冷却，立即插队刷新）
     let _ = state.scraper.priority_tx.try_send(mid);
@@ -864,9 +943,18 @@ async fn get_resume_items_inner(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let allowed_cats = get_user_allowed_categories(state, user_id).await;
     let mut items = Vec::with_capacity(histories.len());
     for h in histories {
-        if let Some(item_json) = build_emby_item_from_history(state, &cfg.server_id, &h, false).await {
+        if let Some(item_json) = build_emby_item_from_history(
+            state,
+            &cfg.server_id,
+            &h,
+            false,
+            allowed_cats.as_deref(),
+        )
+        .await
+        {
             items.push(item_json);
         }
     }
@@ -879,7 +967,7 @@ async fn get_resume_items_inner(
 }
 
 /// 接下来观看列表 (`GET /Shows/NextUp`)：
-/// 若某部剧最后一集尚未看完，返回该集继续看；若已看完 (>=90%)，自动查找同季下一集返回
+/// 若某部剧最后一集尚未看完，返回该集继续看；若已看完 (>=90%)，自动查找同季下一集或下一季首集返回
 pub(super) async fn get_next_up_items(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -888,15 +976,20 @@ pub(super) async fn get_next_up_items(
     let user_id = resolve_valid_user_id(&state, q.user_id.as_deref(), &headers).await?;
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let cfg = state.config.load();
+    let allowed_cats = get_user_allowed_categories(&state, &user_id).await;
 
-    // 按每部剧聚合取最新播放的一集记录
+    // 按每部剧聚合取最新播放的一集记录，再按 last_played_at 倒序返回
     let latest_tv_histories: Vec<HistoryRecordRow> = sqlx::query_as(
         r#"
-        SELECT DISTINCT ON (COALESCE(tmdb_id::text, media_item_id::text))
-            media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played
-        FROM play_histories
-        WHERE user_id = $1 AND media_type = 'tv'
-        ORDER BY COALESCE(tmdb_id::text, media_item_id::text), last_played_at DESC
+        SELECT media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played
+        FROM (
+            SELECT DISTINCT ON (COALESCE(tmdb_id::text, media_item_id::text))
+                media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played, last_played_at
+            FROM play_histories
+            WHERE user_id = $1 AND media_type = 'tv'
+            ORDER BY COALESCE(tmdb_id::text, media_item_id::text), last_played_at DESC
+        ) t
+        ORDER BY last_played_at DESC
         LIMIT $2
         "#,
     )
@@ -909,8 +1002,14 @@ pub(super) async fn get_next_up_items(
     let mut items = Vec::new();
     for h in latest_tv_histories {
         let advance_to_next = h.is_played;
-        if let Some(item_json) =
-            build_emby_item_from_history(&state, &cfg.server_id, &h, advance_to_next).await
+        if let Some(item_json) = build_emby_item_from_history(
+            &state,
+            &cfg.server_id,
+            &h,
+            advance_to_next,
+            allowed_cats.as_deref(),
+        )
+        .await
         {
             items.push(item_json);
         }
@@ -928,13 +1027,14 @@ async fn build_emby_item_from_history(
     server_id: &str,
     h: &HistoryRecordRow,
     advance_to_next_ep: bool,
+    allowed_cats: Option<&[String]>,
 ) -> Option<Value> {
     // 优先通过 tmdb_id 定位当前有效 media_items（防 /每日更新 目录迁移后失效），其次回退 media_item_id
-    let media_row: Option<(i64, String, String, Option<i32>, Option<String>, Option<String>)> =
+    let media_row: Option<(i64, String, String, Option<i32>, Option<String>, Option<String>, String)> =
         if let Some(tid) = h.tmdb_id {
             sqlx::query_as(
                 r#"
-                SELECT id, media_type, title, year, overview, poster_path
+                SELECT id, media_type, title, year, overview, poster_path, category
                 FROM media_items
                 WHERE is_ignored = FALSE AND ((tmdb_id = $1 AND media_type = $2) OR id = $3)
                 ORDER BY (id = $3) DESC, id DESC
@@ -949,7 +1049,7 @@ async fn build_emby_item_from_history(
             .unwrap_or(None)
         } else if let Some(mid) = h.media_item_id {
             sqlx::query_as(
-                "SELECT id, media_type, title, year, overview, poster_path FROM media_items WHERE id = $1 AND is_ignored = FALSE",
+                "SELECT id, media_type, title, year, overview, poster_path, category FROM media_items WHERE id = $1 AND is_ignored = FALSE",
             )
             .bind(mid)
             .fetch_optional(&state.db)
@@ -959,7 +1059,12 @@ async fn build_emby_item_from_history(
             None
         };
 
-    let (mid, mtype, media_title, year, media_overview, poster) = media_row?;
+    let (mid, mtype, media_title, year, media_overview, poster, category) = media_row?;
+    if let Some(cats) = allowed_cats {
+        if !cats.iter().any(|c| c == &category || c.starts_with("lib_vlib_")) {
+            return None;
+        }
+    }
 
     if mtype == "movie" {
         if advance_to_next_ep {
@@ -996,7 +1101,7 @@ async fn build_emby_item_from_history(
     };
     let sibling_ids = state.resolve_sibling_media_ids(mid).await;
 
-    let ep_row: Option<(i64, i32, i32, Option<String>, Option<String>, Option<String>, Option<String>, i32)> = sqlx::query_as(
+    let mut ep_row: Option<(i64, i32, i32, Option<String>, Option<String>, Option<String>, Option<String>, i32)> = sqlx::query_as(
         r#"
         SELECT id, season_number, episode_number, title, overview, still_path, air_date, runtime
         FROM episodes
@@ -1011,6 +1116,25 @@ async fn build_emby_item_from_history(
     .fetch_optional(&state.db)
     .await
     .unwrap_or(None);
+
+    if ep_row.is_none() && advance_to_next_ep {
+        ep_row = sqlx::query_as(
+            r#"
+            SELECT id, season_number, episode_number, title, overview, still_path, air_date, runtime
+            FROM episodes
+            WHERE media_item_id = ANY($1)
+              AND (season_number > $2 OR (season_number = $2 AND episode_number > $3))
+            ORDER BY season_number ASC, episode_number ASC, (still_path IS NOT NULL) DESC, priority_score DESC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(&sibling_ids)
+        .bind(h.season_number)
+        .bind(h.episode_number)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+    }
 
     let (ep_id, snum, epnum, ep_title, ep_overview, still_path, air_date, runtime) = ep_row?;
     let pos_ticks = if advance_to_next_ep { 0 } else { h.position_ticks };

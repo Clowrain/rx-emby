@@ -175,6 +175,8 @@ impl AppState {
 
         let full_path = self.build_full_alist_path(alist_path);
         let db = self.db.clone();
+        let resolved_size = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let resolved_size_inner = resolved_size.clone();
 
         // Singleflight：当 PlaybackInfo (IsPlayback=true) 预热与播放器 stream.mp4 并发到达时，共享同一个换链请求
         let final_url = self
@@ -193,6 +195,7 @@ impl AppState {
 
                 let file_size = if fs_data.size > 0 { Some(fs_data.size) } else { None };
                 if let Some(sz) = file_size {
+                    resolved_size_inner.store(sz, std::sync::atomic::Ordering::Relaxed);
                     let db_clone = db.clone();
                     tokio::spawn(async move {
                         let _ = sqlx::query(
@@ -225,9 +228,10 @@ impl AppState {
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
+        let sz = resolved_size.load(std::sync::atomic::Ordering::Relaxed);
         Ok(ResolvedStream {
             redirect_url: final_url,
-            file_size: None,
+            file_size: if sz > 0 { Some(sz) } else { None },
         })
     }
 
@@ -338,7 +342,22 @@ impl AppState {
     }
 
     async fn call_alist_fs_list(&self, full_dir: &str) -> Result<Vec<FsListItem>> {
-        let token = self.get_alist_token(false).await?;
+        match self.call_alist_fs_list_inner(full_dir, false).await {
+            Ok(items) => Ok(items),
+            Err(e) if e.to_string().contains("401") => {
+                warn!("AList Token 失效，触发自动重登并重试 /api/fs/list");
+                self.call_alist_fs_list_inner(full_dir, true).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn call_alist_fs_list_inner(
+        &self,
+        full_dir: &str,
+        force_refresh_token: bool,
+    ) -> Result<Vec<FsListItem>> {
+        let token = self.get_alist_token(force_refresh_token).await?;
         let cfg = self.config.load();
         let url = format!("{}/api/fs/list", cfg.alist_base_url);
         let client = self.alist_client.load();
@@ -357,7 +376,18 @@ impl AppState {
             .await
             .context("调用 AList /api/fs/list 失败")?;
 
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err(anyhow!("401 Unauthorized"));
+        }
+        if !status.is_success() {
+            return Err(anyhow!("AList /api/fs/list HTTP 错误: {}", status));
+        }
+
         let body: AlistResp<FsListData> = resp.json().await.context("解析 /api/fs/list 响应失败")?;
+        if body.code == 401 {
+            return Err(anyhow!("401 Unauthorized: {}", body.message));
+        }
         if body.code != 200 {
             return Err(anyhow!("AList fs/list 错误 (code={}): {}", body.code, body.message));
         }
@@ -388,8 +418,12 @@ impl AppState {
             .await
             .context("调用 AList /api/fs/get 失败")?;
 
-        if resp.status().as_u16() == 401 {
+        let status = resp.status();
+        if status.as_u16() == 401 {
             return Err(anyhow!("401 Unauthorized"));
+        }
+        if !status.is_success() {
+            return Err(anyhow!("AList /api/fs/get HTTP 错误: {}", status));
         }
 
         let body: AlistResp<FsGetData> = resp.json().await.context("解析 /api/fs/get 响应失败")?;

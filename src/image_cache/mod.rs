@@ -130,6 +130,9 @@ pub fn spawn_image_lru_worker(state: Arc<AppState>) {
             tokio::select! {
                 _ = state.shutdown_token.cancelled() => break,
                 _ = sleep(Duration::from_secs(600)) => {
+                    if !state.config.load().image_disk_cache_enabled {
+                        continue;
+                    }
                     if let Err(e) = enforce_image_cache_quota(&state).await {
                         error!("执行图片缓存 LRU 淘汰异常: {:#}", e);
                     }
@@ -165,34 +168,66 @@ pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {
     );
 
     let mut freed_bytes: i64 = 0;
+    let mut deleted_count: usize = 0;
     let target_to_free = current_total - low_limit;
+    let mut last_seen_key: Option<String> = None;
 
-    let victims: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT cache_key, local_rel_path, size_bytes FROM image_cache_index ORDER BY last_accessed_at ASC LIMIT 2000",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    while freed_bytes < target_to_free {
+        let victims: Vec<(String, String, i64)> = if let Some(ref cursor) = last_seen_key {
+            sqlx::query_as(
+                "SELECT cache_key, local_rel_path, size_bytes FROM image_cache_index WHERE cache_key > $1 ORDER BY last_accessed_at ASC, cache_key ASC LIMIT 2000",
+            )
+            .bind(cursor)
+            .fetch_all(&state.db)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT cache_key, local_rel_path, size_bytes FROM image_cache_index ORDER BY last_accessed_at ASC, cache_key ASC LIMIT 2000",
+            )
+            .fetch_all(&state.db)
+            .await?
+        };
 
-    let mut deleted_keys = Vec::new();
-    for (key, rel_path, sz) in victims {
-        if freed_bytes >= target_to_free {
+        if victims.is_empty() {
             break;
         }
-        let file_path: PathBuf = cfg.image_cache_dir.join(&rel_path);
-        let _ = fs::remove_file(&file_path).await;
-        freed_bytes += sz;
-        deleted_keys.push(key);
-    }
+        last_seen_key = victims.last().map(|(k, _, _)| k.clone());
 
-    if !deleted_keys.is_empty() {
+        let mut deleted_keys = Vec::new();
+        for (key, rel_path, sz) in victims {
+            if freed_bytes >= target_to_free {
+                break;
+            }
+            let file_path: PathBuf = cfg.image_cache_dir.join(&rel_path);
+            let removed = match fs::remove_file(&file_path).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    tracing::warn!("删除图片缓存文件失败 ({}): {}", file_path.display(), e);
+                    false
+                }
+            };
+            if removed {
+                freed_bytes += sz;
+                deleted_keys.push(key);
+            }
+        }
+
+        if deleted_keys.is_empty() {
+            break;
+        }
+        deleted_count += deleted_keys.len();
         sqlx::query("DELETE FROM image_cache_index WHERE cache_key = ANY($1)")
             .bind(&deleted_keys)
             .execute(&state.db)
             .await?;
+    }
+
+    if deleted_count > 0 {
         debug!(
             "图片缓存 LRU 淘汰完成，释放空间: {} MB (清理 {} 个文件)",
             freed_bytes / 1024 / 1024,
-            deleted_keys.len()
+            deleted_count
         );
     }
 

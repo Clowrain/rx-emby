@@ -202,85 +202,121 @@ fn parse_emby_client_identity(headers: &HeaderMap) -> (String, String, String) {
 
 pub(super) async fn get_user_info(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(user_id): Path<String>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let valid_uid = resolve_valid_user_id(&state, Some(&user_id), &headers).await?;
     let cfg = state.config.load();
     let user_row: Option<(String, bool)> =
         sqlx::query_as("SELECT username, is_admin FROM users WHERE id = $1")
-            .bind(&user_id)
+            .bind(&valid_uid)
             .fetch_optional(&state.db)
             .await
-            .unwrap_or(None);
-    let (username, is_admin) = user_row.unwrap_or_else(|| ("admin".to_string(), true));
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (username, is_admin) = user_row.ok_or_else(|| (StatusCode::NOT_FOUND, "用户不存在".to_string()))?;
 
-    Json(json!({
-        "Id": user_id,
+    Ok(Json(json!({
+        "Id": valid_uid,
         "Name": username,
         "ServerId": cfg.server_id,
         "Policy": { "IsAdministrator": is_admin }
-    }))
+    })))
 }
 
+pub(super) fn extract_emby_token(headers: &HeaderMap, api_key: Option<&str>) -> Option<String> {
+    if let Some(k) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(k.to_string());
+    }
+    for key in ["x-emby-token", "x-mediabrowser-token"] {
+        if let Some(t) = headers
+            .get(key)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(auth) = headers
+        .get("x-emby-authorization")
+        .or_else(|| headers.get(header::AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(tok) = extract_emby_auth_field(auth, "Token") {
+            return Some(tok);
+        }
+        let trimmed = auth.trim();
+        if let Some(tok) = trimmed
+            .strip_prefix("Bearer ")
+            .or_else(|| trimmed.strip_prefix("bearer "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(tok.to_string());
+        }
+    }
+    None
+}
 
-/// 解析请求对应的合法 user_id（优先校验显式 user_id -> 其次校验 Token -> 兜底取首个管理员账号）
+/// 严格校验访问令牌，并校验显式 user_id 是否属于本人或由管理员代查
 pub(super) async fn resolve_valid_user_id(
     state: &AppState,
     explicit_uid: Option<&str>,
     headers: &HeaderMap,
 ) -> Result<String, (StatusCode, String)> {
-    if let Some(uid) = explicit_uid.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
-            .bind(uid)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
-        if let Some(valid_id) = exists {
-            return Ok(valid_id);
-        }
-    }
+    resolve_valid_user_id_with_query(state, explicit_uid, headers, None).await
+}
 
-    if let Some(token) = headers
-        .get("x-emby-token")
-        .or_else(|| headers.get("x-mediabrowser-token"))
-        .and_then(|v| v.to_str().ok())
-    {
-        let uid_from_token: Option<String> =
-            sqlx::query_scalar("SELECT user_id FROM access_tokens WHERE token = $1")
-                .bind(token)
+pub(super) async fn resolve_valid_user_id_with_query(
+    state: &AppState,
+    explicit_uid: Option<&str>,
+    headers: &HeaderMap,
+    api_key: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    let token = extract_emby_token(headers, api_key).ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, "缺少访问令牌，请先登录".to_string())
+    })?;
+
+    let token_user: Option<(String, bool)> = sqlx::query_as(
+        r#"
+        SELECT u.id, u.is_admin
+        FROM access_tokens t
+        JOIN users u ON u.id = t.user_id
+        WHERE t.token = $1
+        "#,
+    )
+    .bind(&token)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let (token_uid, is_admin) = token_user.ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, "访问令牌无效或已注销，请重新登录".to_string())
+    })?;
+
+    let db = state.db.clone();
+    let tok = token.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query("UPDATE access_tokens SET last_used_at = NOW() WHERE token = $1")
+            .bind(tok)
+            .execute(&db)
+            .await;
+    });
+
+    if let Some(uid) = explicit_uid.map(str::trim).filter(|s| !s.is_empty()) {
+        if uid != token_uid {
+            if !is_admin {
+                return Err((StatusCode::FORBIDDEN, "无权访问其他用户数据".to_string()));
+            }
+            let exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+                .bind(uid)
                 .fetch_optional(&state.db)
                 .await
-                .unwrap_or(None);
-        if let Some(valid_id) = uid_from_token {
-            let db = state.db.clone();
-            let tok = token.to_string();
-            tokio::spawn(async move {
-                let _ = sqlx::query("UPDATE access_tokens SET last_used_at = NOW() WHERE token = $1")
-                    .bind(tok)
-                    .execute(&db)
-                    .await;
-            });
-            return Ok(valid_id);
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return exists.ok_or_else(|| (StatusCode::NOT_FOUND, "目标用户不存在".to_string()));
         }
     }
 
-    let fallback: Option<String> =
-        sqlx::query_scalar("SELECT id FROM users ORDER BY is_admin DESC, created_at ASC LIMIT 1")
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
-
-    if let Some(uid) = fallback {
-        return Ok(uid);
-    }
-
-    // 若 users 表完全为空，自动创建默认管理员账号
-    let new_id = Uuid::new_v4().simple().to_string()[..16].to_string();
-    let _ = sqlx::query(
-        "INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, 'admin', '', TRUE) ON CONFLICT DO NOTHING",
-    )
-    .bind(&new_id)
-    .execute(&state.db)
-    .await;
-    Ok(new_id)
+    Ok(token_uid)
 }
 

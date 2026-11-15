@@ -1,3 +1,5 @@
+use super::auth::{extract_emby_token, resolve_valid_user_id_with_query};
+use super::items::ensure_media_accessible;
 use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -36,18 +38,36 @@ pub(super) struct PlaybackQuery {
 pub(super) async fn get_user_playback_info(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
-    Path((_user_id, item_id)): Path<(String, String)>,
+    Path((user_id, item_id)): Path<(String, String)>,
     q: Query<PlaybackQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    get_playback_info(state, headers, Path(item_id), q).await
+    get_playback_info_inner(state, headers, Some(user_id), item_id, q).await
 }
 
 pub(super) async fn get_playback_info(
-    State(state): State<Arc<AppState>>,
+    state: State<Arc<AppState>>,
     headers: HeaderMap,
     Path(item_id): Path<String>,
+    q: Query<PlaybackQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    get_playback_info_inner(state, headers, None, item_id, q).await
+}
+
+async fn get_playback_info_inner(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    explicit_uid: Option<String>,
+    item_id: String,
     Query(q): Query<PlaybackQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let user_id = resolve_valid_user_id_with_query(
+        &state,
+        explicit_uid.as_deref(),
+        &headers,
+        q.api_key.as_deref(),
+    )
+    .await?;
+
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -58,29 +78,41 @@ pub(super) async fn get_playback_info(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let token = q
-        .api_key
-        .clone()
-        .or_else(|| {
-            headers
-                .get("x-emby-token")
-                .or_else(|| headers.get("x-mediabrowser-token"))
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let token = extract_emby_token(&headers, q.api_key.as_deref()).unwrap_or_default();
     let session_id = Uuid::new_v4().simple().to_string();
     let sources = if let Some(raw_mid) = item_id.strip_prefix("media_") {
-        let mid = raw_mid.parse::<i64>().unwrap_or(0);
-        build_media_sources_for_movie(&state, &host, &token, &session_id, mid).await?
+        let mid = raw_mid
+            .parse::<i64>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 media_id".to_string()))?;
+        let (mtype, _, _) = ensure_media_accessible(&state, &user_id, mid).await?;
+        if mtype == "tv" {
+            // 剧集按首集返回播放源，避免把整季全部剧集混为多版本源
+            let first_ep: Option<(i32, i32)> = sqlx::query_as(
+                "SELECT season_number, episode_number FROM episodes WHERE media_item_id = $1 ORDER BY season_number ASC, episode_number ASC LIMIT 1",
+            )
+            .bind(mid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            match first_ep {
+                Some((snum, epnum)) => {
+                    build_media_sources_for_episode(&state, &host, &token, &session_id, mid, snum, epnum).await?
+                }
+                None => return Err((StatusCode::NOT_FOUND, "剧集暂无可播放分集".to_string())),
+            }
+        } else {
+            build_media_sources_for_movie(&state, &host, &token, &session_id, mid).await?
+        }
     } else if let Some(raw_eid) = item_id
         .strip_prefix("ep_")
         .or_else(|| item_id.strip_prefix("src_"))
         .or_else(|| item_id.chars().all(|c| c.is_ascii_digit()).then_some(item_id.as_str()))
     {
-        let eid = raw_eid.parse::<i64>().unwrap_or(0);
+        let eid = raw_eid
+            .parse::<i64>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 episode_id".to_string()))?;
         let ep_meta: Option<(i64, i32, i32)> = sqlx::query_as(
-            "SELECT media_item_id, season_number, episode_number FROM episodes WHERE id = $1",
+            "SELECT e.media_item_id, e.season_number, e.episode_number FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.id = $1 AND m.is_ignored = FALSE",
         )
         .bind(eid)
         .fetch_optional(&state.db)
@@ -89,12 +121,13 @@ pub(super) async fn get_playback_info(
 
         match ep_meta {
             Some((mid, snum, epnum)) => {
+                ensure_media_accessible(&state, &user_id, mid).await?;
                 build_media_sources_for_episode(&state, &host, &token, &session_id, mid, snum, epnum).await?
             }
-            None => vec![],
+            None => return Err((StatusCode::NOT_FOUND, "分集不存在或已屏蔽".to_string())),
         }
     } else {
-        vec![]
+        return Err((StatusCode::NOT_FOUND, "未找到播放条目".to_string()));
     };
 
     // 当客户端明确处于点击播放状态 (IsPlayback=true) 时，立即启动 Singleflight 异步换链，
@@ -297,6 +330,8 @@ pub(super) async fn stream_video(
     Query(q): Query<PlaybackQuery>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
+    let user_id = resolve_valid_user_id_with_query(&state, None, &headers, q.api_key.as_deref()).await?;
+
     let client_ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -316,7 +351,7 @@ pub(super) async fn stream_video(
     } else if let Some(raw_mid) = item_id.strip_prefix("media_") {
         let mid = raw_mid.parse::<i64>().unwrap_or(0);
         sqlx::query_scalar(
-            "SELECT id FROM episodes WHERE media_item_id = $1 ORDER BY priority_score DESC LIMIT 1",
+            "SELECT e.id FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.media_item_id = $1 AND m.is_ignored = FALSE ORDER BY e.priority_score DESC LIMIT 1",
         )
         .bind(mid)
         .fetch_optional(&state.db)
@@ -327,17 +362,19 @@ pub(super) async fn stream_video(
         item_id.parse::<i64>().unwrap_or(0)
     };
 
-    let row: Option<(String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT alist_path, path_hash, file_size_bytes FROM episodes WHERE id = $1",
+    let row: Option<(i64, String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT e.media_item_id, e.alist_path, e.path_hash, e.file_size_bytes FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.id = $1 AND m.is_ignored = FALSE",
     )
     .bind(target_ep_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let Some((alist_path, path_hash, existing_size)) = row else {
-        return Err((StatusCode::NOT_FOUND, "未找到对应的视频播放源".to_string()));
+    let Some((mid, alist_path, path_hash, existing_size)) = row else {
+        return Err((StatusCode::NOT_FOUND, "未找到对应的视频播放源或条目已被屏蔽".to_string()));
     };
+
+    ensure_media_accessible(&state, &user_id, mid).await?;
 
     let resolved = state
         .resolve_playback_url(path_hash, &alist_path, client_ua)
@@ -371,8 +408,10 @@ pub(super) async fn stream_video(
 pub(super) async fn stream_by_d_path(
     State(state): State<Arc<AppState>>,
     Path(raw_path): Path<String>,
+    Query(q): Query<PlaybackQuery>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
+    let user_id = resolve_valid_user_id_with_query(&state, None, &headers, q.api_key.as_deref()).await?;
     let client_ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -381,6 +420,19 @@ pub(super) async fn stream_by_d_path(
     let decoded = crate::sync::parser::lossy_url_decode(&raw_path);
     let alist_path = format!("/{}", decoded.trim_start_matches('/'));
     let path_hash = xxhash_rust::xxh3::xxh3_64(alist_path.as_bytes()) as i64;
+
+    if let Ok(Some((mid, is_ignored))) = sqlx::query_as::<_, (i64, bool)>(
+        "SELECT e.media_item_id, m.is_ignored FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.path_hash = $1 LIMIT 1",
+    )
+    .bind(path_hash)
+    .fetch_optional(&state.db)
+    .await
+    {
+        if is_ignored {
+            return Err((StatusCode::NOT_FOUND, "条目已被屏蔽".to_string()));
+        }
+        ensure_media_accessible(&state, &user_id, mid).await?;
+    }
 
     let resolved = state
         .resolve_playback_url(path_hash, &alist_path, client_ua)

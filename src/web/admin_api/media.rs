@@ -323,7 +323,9 @@ pub(super) async fn bind_tmdb_id(
             tmdb_id = $1,
             media_type = COALESCE($2, media_type),
             is_locked = FALSE,
-            scrape_status = 0
+            scrape_status = 0,
+            retry_count = 0,
+            next_retry_at = NULL
         WHERE id = $3
         "#,
     )
@@ -334,11 +336,37 @@ pub(super) async fn bind_tmdb_id(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
-    let _ = sqlx::query("UPDATE seasons SET scrape_attempts = 0 WHERE media_item_id = ANY($1)")
-        .bind(&sibling_ids)
-        .execute(&state.db)
-        .await;
+    // 清空当前条目旧分集元数据，避免改绑 TMDB ID 或切换 movie/tv 时残留旧剧集标题/简介/季信息
+    let current_type: String = sqlx::query_scalar("SELECT media_type FROM media_items WHERE id = $1")
+        .bind(media_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if current_type == "movie" {
+        let _ = sqlx::query("UPDATE episodes SET season_id = NULL, season_number = 0, title = NULL, overview = NULL, still_path = NULL, air_date = NULL, meta_incomplete = FALSE WHERE media_item_id = $1")
+            .bind(media_id)
+            .execute(&state.db)
+            .await;
+        let _ = sqlx::query("DELETE FROM seasons WHERE media_item_id = $1")
+            .bind(media_id)
+            .execute(&state.db)
+            .await;
+    } else {
+        // 若由 movie 改绑为 tv，将默认 season_number=0 的单集归一至第 1 季并重建 seasons
+        let _ = sqlx::query("UPDATE episodes SET season_number = 1 WHERE media_item_id = $1 AND season_number = 0")
+            .bind(media_id)
+            .execute(&state.db)
+            .await;
+        let _ = sqlx::query("UPDATE episodes SET title = NULL, overview = NULL, still_path = NULL, air_date = NULL, meta_incomplete = TRUE WHERE media_item_id = $1")
+            .bind(media_id)
+            .execute(&state.db)
+            .await;
+        let _ = sqlx::query("DELETE FROM seasons WHERE media_item_id = $1")
+            .bind(media_id)
+            .execute(&state.db)
+            .await;
+    }
 
     scrape_single_media(&state, media_id)
         .await
@@ -361,11 +389,15 @@ pub(super) async fn scrape_one_now(
     Path(media_id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
-    sqlx::query("UPDATE media_items SET is_locked = FALSE, scrape_status = 0 WHERE id = ANY($1)")
-        .bind(&sibling_ids)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // 仅重置当前条目及未锁定的兄弟目录，不强行解锁用户手动锁定的其它兄弟目录
+    sqlx::query(
+        "UPDATE media_items SET is_locked = FALSE, scrape_status = 0, retry_count = 0, next_retry_at = NULL WHERE id = $1 OR (id = ANY($2) AND is_locked = FALSE)",
+    )
+    .bind(media_id)
+    .bind(&sibling_ids)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let _ = sqlx::query("UPDATE seasons SET scrape_attempts = 0 WHERE media_item_id = ANY($1)")
         .bind(&sibling_ids)

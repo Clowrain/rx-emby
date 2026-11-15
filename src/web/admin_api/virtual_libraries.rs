@@ -140,6 +140,8 @@ pub(super) async fn save_virtual_library(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
+    state.caches.admin_stats_cache.invalidate_all();
+
     Ok(Json(json!({ "status": "ok", "message": "智能视图已保存并立即生效" })))
 }
 
@@ -236,6 +238,9 @@ pub(super) async fn seed_preset_virtual_libraries(
         inserted += 1;
     }
     tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    if inserted > 0 {
+        state.caches.admin_stats_cache.invalidate_all();
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -253,6 +258,35 @@ pub(super) async fn delete_virtual_library(
         .execute(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let grant_key = format!("lib_vlib_{}", id);
+    let _ = sqlx::query(
+        r#"
+        UPDATE users
+        SET allowed_categories = CASE
+            WHEN COALESCE(array_length(array_remove(allowed_categories, $1), 1), 0) = 0 THEN ARRAY['*']::text[]
+            ELSE array_remove(allowed_categories, $1)
+        END
+        WHERE $1 = ANY(allowed_categories)
+        "#,
+    )
+    .bind(&grant_key)
+    .execute(&state.db)
+    .await;
+
+    let covers_dir = state.config.load().image_cache_dir.join("covers");
+    let prefix = format!("vlib_{}", id);
+    if let Ok(mut entries) = tokio::fs::read_dir(&covers_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Some(fname) = entry.file_name().to_str() {
+                if fname == prefix || fname.starts_with(&format!("{}.", prefix)) {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+            }
+        }
+    }
+
+    state.caches.admin_stats_cache.invalidate_all();
 
     Ok(Json(json!({ "status": "ok", "message": "智能视图已删除" })))
 }

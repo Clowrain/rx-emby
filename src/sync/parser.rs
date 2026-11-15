@@ -6,8 +6,12 @@ use xxhash_rust::xxh3::xxh3_64;
 
 static TMDB_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\{tmdb-(\d+)\}").unwrap());
 static YEAR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\(\[（](19\d{2}|20\d{2})[\)\]）]|\b(19\d{2}|20\d{2})\b").unwrap());
-static SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(?:S(\d{1,3}))?E(\d{1,4})|第\s*(\d{1,4})\s*[集话期]").unwrap());
-static SEASON_DIR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(?:Season|S)\s*(\d{1,3})|第\s*(\d{1,3})\s*季").unwrap());
+static SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:S(\d{1,3})E(\d{1,4})|(?:^|[^A-Za-z0-9])E(\d{1,4})(?:$|[^0-9])|第\s*(\d{1,4})\s*[集话期])").unwrap()
+});
+static SEASON_DIR_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:(?:^|[\s._\-\[\(])Season\s*(\d{1,3})(?:$|[\s._\-\]\)])|(?:^|[\s._\-\[\(])S0*(\d{1,3})(?:$|[\s._\-\]\)])|第\s*(\d{1,3})\s*季)").unwrap()
+});
 static NOISE_PREFIX_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(?:刮削失败|每日更新|临时目录|未分类|115|阿里云盘|夸克网盘)/+").unwrap());
 
 static VIDEO_EXTS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
@@ -120,28 +124,27 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
         return None;
     }
 
-    let inferred_category = infer_category_from_segments(&segments);
-
     // 定位季集号（优先看左侧文件名，其次看右侧真实文件名）
     let left_file = segments.last().copied().unwrap_or(&file_name);
-    let (mut season_num, ep_num_opt) = extract_season_episode(left_file)
-        .unwrap_or_else(|| extract_season_episode(&file_name).unwrap_or((0, None)));
+    let (mut season_opt, ep_num_opt) = extract_season_episode(left_file)
+        .unwrap_or_else(|| extract_season_episode(&file_name).unwrap_or((None, None)));
 
-    // 若文件名未写明季号（如仅写了 "01.mkv"），从父级目录（如 "Season 1" / "第一季"）回溯季号
-    if season_num == 0 && segments.len() >= 2 {
+    // 若文件名未写明季号（如仅写了 "01.mkv" 或 "E01.mkv"），从父级目录（如 "Season 1" / "Season 0" / "第一季"）回溯季号
+    if season_opt.is_none() && segments.len() >= 2 {
         for seg in segments.iter().rev().skip(1).take(2) {
             if let Some(s) = extract_season_from_dir(seg) {
-                season_num = s;
+                season_opt = Some(s);
                 break;
             }
         }
     }
 
-    let is_tv = ep_num_opt.is_some() || season_num > 0;
+    let is_tv = ep_num_opt.is_some() || season_opt.is_some();
+    let inferred_category = infer_category_from_segments(&segments, is_tv);
     let (inferred_media_type, final_season, final_episode) = if is_tv {
         (
             "tv".to_string(),
-            if season_num == 0 { 1 } else { season_num },
+            season_opt.unwrap_or(1),
             ep_num_opt.unwrap_or(1),
         )
     } else {
@@ -217,7 +220,7 @@ fn extract_tmdb_id(text: &str) -> Option<i32> {
         .and_then(|m| m.as_str().parse::<i32>().ok())
 }
 
-fn infer_category_from_segments(segments: &[&str]) -> String {
+fn infer_category_from_segments(segments: &[&str], is_tv: bool) -> String {
     for seg in segments.iter().take(3) {
         if seg.contains("动漫") || seg.contains("动画") || seg.contains("番剧") {
             return "动漫".to_string();
@@ -235,21 +238,25 @@ fn infer_category_from_segments(segments: &[&str]) -> String {
             return "电视剧".to_string();
         }
     }
-    "电视剧".to_string()
+    if is_tv {
+        "电视剧".to_string()
+    } else {
+        "电影".to_string()
+    }
 }
 
-fn extract_season_episode(name: &str) -> Option<(i32, Option<i32>)> {
+fn extract_season_episode(name: &str) -> Option<(Option<i32>, Option<i32>)> {
     let caps = SEASON_EP_RE.captures(name)?;
-    if let Some(ep_m) = caps.get(2) {
-        let s = caps
-            .get(1)
-            .and_then(|m| m.as_str().parse::<i32>().ok())
-            .unwrap_or(0);
+    if let (Some(s_m), Some(ep_m)) = (caps.get(1), caps.get(2)) {
+        let s = s_m.as_str().parse::<i32>().ok()?;
         let e = ep_m.as_str().parse::<i32>().ok()?;
-        Some((s, Some(e)))
-    } else if let Some(cn_ep) = caps.get(3) {
+        Some((Some(s), Some(e)))
+    } else if let Some(ep_m) = caps.get(3) {
+        let e = ep_m.as_str().parse::<i32>().ok()?;
+        Some((None, Some(e)))
+    } else if let Some(cn_ep) = caps.get(4) {
         let e = cn_ep.as_str().parse::<i32>().ok()?;
-        Some((0, Some(e)))
+        Some((None, Some(e)))
     } else {
         None
     }
@@ -259,6 +266,7 @@ fn extract_season_from_dir(dir_name: &str) -> Option<i32> {
     let caps = SEASON_DIR_RE.captures(dir_name)?;
     caps.get(1)
         .or_else(|| caps.get(2))
+        .or_else(|| caps.get(3))
         .and_then(|m| m.as_str().parse::<i32>().ok())
 }
 
@@ -287,19 +295,51 @@ fn locate_media_root(segments: &[&str], is_tv: bool) -> (String, String) {
 }
 
 fn extract_title_and_year(folder_name: &str) -> (String, Option<i32>) {
+    use chrono::Datelike;
+
     // 先移除 {tmdb-12345} 标签
     let without_tmdb = TMDB_ID_RE.replace_all(folder_name, "").trim().to_string();
+    let max_valid_year = chrono::Utc::now().year() + 2;
 
-    let year = YEAR_RE
-        .captures(&without_tmdb)
-        .and_then(|c| c.get(1).or_else(|| c.get(2)))
-        .and_then(|m| m.as_str().parse::<i32>().ok());
+    // 收集所有位于合理区间 [1900, 当前年+2] 且前面存在有效片名的年份候选，
+    // 优先取括号包裹的年份（如 "2040 (2019)"），其次取最后一个候选年份（避免将片名中的数字如 "2040"/"1917" 当成发行年份）。
+    let mut best_match: Option<(usize, i32, bool)> = None;
+    for caps in YEAR_RE.captures_iter(&without_tmdb) {
+        let full = match caps.get(0) {
+            Some(m) => m,
+            None => continue,
+        };
+        let is_bracketed = caps.get(1).is_some();
+        let yr = match caps
+            .get(1)
+            .or_else(|| caps.get(2))
+            .and_then(|m| m.as_str().parse::<i32>().ok())
+        {
+            Some(y) if (1900..=max_valid_year).contains(&y) => y,
+            _ => continue,
+        };
 
-    // 截取年份之前的有效片名并清理括号、点号与多余空格
-    let title_part = if let Some(m) = YEAR_RE.find(&without_tmdb) {
-        &without_tmdb[..m.start()]
+        let prefix_clean = without_tmdb[..full.start()]
+            .trim_end_matches(|c: char| c == '(' || c == '[' || c == '（' || c == '.' || c == '-' || c.is_whitespace());
+        if prefix_clean.is_empty() {
+            // 年份处于最开头（前面没有任何片名，如目录就叫 "2040" 或 "1917"），这是片名本身，不能当成发行年份
+            continue;
+        }
+
+        match best_match {
+            None => best_match = Some((full.start(), yr, is_bracketed)),
+            Some((_, _, prev_bracketed)) => {
+                if is_bracketed || !prev_bracketed {
+                    best_match = Some((full.start(), yr, is_bracketed));
+                }
+            }
+        }
+    }
+
+    let (title_part, year) = if let Some((pos, yr, _)) = best_match {
+        (&without_tmdb[..pos], Some(yr))
     } else {
-        &without_tmdb
+        (without_tmdb.as_str(), None)
     };
 
     let clean = title_part
@@ -620,5 +660,43 @@ mod tests {
         let audio = "电影/沙丘2 (2024)/theme.mp3#http://127.0.0.1:5678/d/电影/theme.mp3";
         assert!(parse_strm_line(sample).is_none());
         assert!(parse_strm_line(audio).is_none());
+    }
+
+    #[test]
+    fn test_numeric_movie_title_not_mistaken_for_year() {
+        let line1 = "纪录片/科学技术/2040/2040.mp4#http://127.0.0.1:5678/d/纪录片/科学技术/2040/2040.mp4";
+        let rec1 = parse_strm_line(line1).unwrap();
+        assert_eq!(rec1.clean_title, "2040");
+        assert_eq!(rec1.year, None);
+
+        let line2 = "纪录片/科学技术/2040 (2019)/2040.2019.mp4#http://127.0.0.1:5678/d/纪录片/科学技术/2040 (2019)/2040.2019.mp4";
+        let rec2 = parse_strm_line(line2).unwrap();
+        assert_eq!(rec2.clean_title, "2040");
+        assert_eq!(rec2.year, Some(2019));
+
+        let line3 = "电影/1917 (2019)/1917.2019.mkv#http://127.0.0.1:5678/d/电影/1917 (2019)/1917.2019.mkv";
+        let rec3 = parse_strm_line(line3).unwrap();
+        assert_eq!(rec3.clean_title, "1917");
+        assert_eq!(rec3.year, Some(2019));
+    }
+
+    #[test]
+    fn test_specials_season_zero_and_boundary_safety() {
+        // S00 特别篇必须保留为 season_number = 0
+        let sp = "电视剧/某剧 (2024)/Season 0/某剧.S00E01.mkv#http://127.0.0.1:5678/d/电视剧/某剧 (2024)/Season 0/某剧.S00E01.mkv";
+        let rec_sp = parse_strm_line(sp).unwrap();
+        assert_eq!(rec_sp.inferred_media_type, "tv");
+        assert_eq!(rec_sp.season_number, 0);
+        assert_eq!(rec_sp.episode_number, 1);
+
+        // Case39 / PS5 不能误识别为集号或季目录，无“电影”路径的电影默认归类“电影”
+        let case39 = "115/欧美/Case39 (2009)/Case39.2009.mkv#http://127.0.0.1:5678/d/115/欧美/Case39 (2009)/Case39.2009.mkv";
+        let rec_case = parse_strm_line(case39).unwrap();
+        assert_eq!(rec_case.inferred_media_type, "movie");
+        assert_eq!(rec_case.inferred_category, "电影");
+
+        let ps5 = "电视剧/PS5宣传片/01.mp4#http://127.0.0.1:5678/d/电视剧/PS5宣传片/01.mp4";
+        let rec_ps5 = parse_strm_line(ps5).unwrap();
+        assert_eq!(rec_ps5.root_dir, "电视剧/PS5宣传片");
     }
 }

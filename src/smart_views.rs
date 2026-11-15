@@ -118,7 +118,7 @@ impl VirtualLibraryRule {
         if self.premiered_within_days.is_some() { add(format!("NULLIF(m.premiered_at,'') BETWEEN ({today}-(({r}->>'premiered_within_days')::int-1))::text AND {today}::text")); }
         if self.added_within_days.is_some() { add(format!("(m.created_at AT TIME ZONE 'Asia/Shanghai')::date BETWEEN {today}-(({r}->>'added_within_days')::int-1) AND {today}")); }
         if !self.version_tags.is_empty() {
-            add(format!("EXISTS(SELECT 1 FROM episodes e WHERE e.media_item_id=m.id AND regexp_split_to_array(e.version_tag, '\\s*·\\s*') @> smart_texts({r}->'version_tags'))"));
+            add(format!("EXISTS(SELECT 1 FROM episodes e JOIN media_items m2 ON m2.id=e.media_item_id WHERE m2.is_ignored=FALSE AND ((m.tmdb_id IS NOT NULL AND m2.tmdb_id=m.tmdb_id AND m2.media_type=m.media_type) OR e.media_item_id=m.id) AND regexp_split_to_array(e.version_tag, '\\s*·\\s*') @> smart_texts({r}->'version_tags'))"));
         }
         if !self.spoken_languages.is_empty() {
             add(format!("smart_texts(m.tmdb_metadata->'spoken_language_codes') && smart_texts({r}->'spoken_languages')"));
@@ -166,10 +166,12 @@ impl VirtualLibraryRule {
             add(format!("m.media_type='tv' AND NULLIF(m.tmdb_metadata->>'last_air_date','') BETWEEN ({today}-(({r}->>'aired_within_days')::int-1))::text AND {today}::text"));
         }
         if let Some(lc) = self.local_complete.as_deref().filter(|s| !s.is_empty()) {
+            let sibling_ep_count = "(SELECT COUNT(DISTINCT (e.season_number, e.episode_number)) FROM episodes e JOIN media_items m2 ON m2.id=e.media_item_id WHERE m2.is_ignored=FALSE AND ((m.tmdb_id IS NOT NULL AND m2.tmdb_id=m.tmdb_id AND m2.media_type=m.media_type) OR e.media_item_id=m.id) AND e.season_number>0)";
             if lc == "all" {
-                add("m.media_type='tv' AND m.tmdb_metadata->>'status'='Ended' AND COALESCE((m.tmdb_metadata->>'number_of_episodes')::int,0)>0 AND (SELECT COUNT(DISTINCT (e.season_number, e.episode_number)) FROM episodes e WHERE e.media_item_id=m.id AND e.season_number>0)>=(m.tmdb_metadata->>'number_of_episodes')::int".into());
+                add(format!("m.media_type='tv' AND m.tmdb_metadata->>'status'='Ended' AND COALESCE((m.tmdb_metadata->>'number_of_episodes')::int,0)>0 AND {sibling_ep_count}>=(m.tmdb_metadata->>'number_of_episodes')::int"));
             } else if lc == "aired" {
-                add("m.media_type='tv' AND COALESCE((SELECT SUM(s.episode_count) FROM seasons s WHERE s.media_item_id=m.id AND s.season_number>0 AND s.episode_count>0),0)>0 AND (SELECT COUNT(DISTINCT (e.season_number, e.episode_number)) FROM episodes e WHERE e.media_item_id=m.id AND e.season_number>0)>=(SELECT COALESCE(SUM(s.episode_count),0) FROM seasons s WHERE s.media_item_id=m.id AND s.season_number>0 AND s.episode_count>0)".into());
+                let sibling_season_sum = "(SELECT COALESCE(SUM(sc.ep_cnt),0) FROM (SELECT MAX(s.episode_count) AS ep_cnt FROM seasons s JOIN media_items m2 ON m2.id=s.media_item_id WHERE m2.is_ignored=FALSE AND ((m.tmdb_id IS NOT NULL AND m2.tmdb_id=m.tmdb_id AND m2.media_type=m.media_type) OR s.media_item_id=m.id) AND s.season_number>0 AND s.episode_count>0 GROUP BY s.season_number) sc)";
+                add(format!("m.media_type='tv' AND {sibling_season_sum}>0 AND {sibling_ep_count}>={sibling_season_sum}"));
             }
         }
         if !self.any.is_empty() {
