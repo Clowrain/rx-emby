@@ -88,7 +88,7 @@ pub(super) async fn list_users_and_sessions(
             Some(fid) if fid > 0 => {
                 sqlx::query_scalar(
                     r#"
-                    SELECT COALESCE(w.title, f.parsed_title, '未知') || ' · S' || LPAD(sf.season_number::text, 2, '0') || 'E' || LPAD(sf.episode_number::text, 2, '0')
+                    SELECT COALESCE(w.title, f.clean_title, '未知') || ' · S' || LPAD(sf.season_number::text, 2, '0') || 'E' || LPAD(sf.episode_number::text, 2, '0')
                     FROM sync_files sf
                     JOIN sync_folders f ON f.id = sf.folder_id
                     LEFT JOIN media_works w ON w.id = f.work_id

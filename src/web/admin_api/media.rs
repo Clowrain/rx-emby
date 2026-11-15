@@ -196,7 +196,7 @@ pub(super) async fn get_admin_media_detail(
 
     let folders: Vec<AdminLinkedFolderRow> = sqlx::query_as(
         r#"
-        SELECT f.id, f.folder_path, f.parsed_title, f.parsed_year, f.category,
+        SELECT f.id, f.root_dir AS folder_path, f.clean_title AS parsed_title, f.year AS parsed_year, f.category,
                f.scrape_state, f.priority_boost, f.is_locked, f.is_ignored,
                (SELECT COUNT(*) FROM sync_files sf WHERE sf.folder_id = f.id) AS file_count
         FROM sync_folders f
@@ -503,7 +503,7 @@ pub(super) async fn list_staging_folders(
         WHERE f.is_ignored = $1
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
-          AND ($4::text IS NULL OR f.parsed_title ILIKE $4 OR f.folder_path ILIKE $4 OR ($5::int4 IS NOT NULL AND f.hint_tmdb_id = $5))
+          AND ($4::text IS NULL OR f.clean_title ILIKE $4 OR f.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
         "#,
     )
     .bind(ignored_filter)
@@ -518,9 +518,9 @@ pub(super) async fn list_staging_folders(
     let items: Vec<StagingFolderRow> = sqlx::query_as(
         r#"
         SELECT
-            f.id, f.folder_path, f.parsed_title, f.parsed_year, f.hint_tmdb_id,
-            f.media_type, f.category, f.scrape_state, f.conflict_reason,
-            f.retry_count, f.is_locked, f.is_ignored, f.priority_boost,
+            f.id, f.root_dir AS folder_path, f.clean_title AS parsed_title, f.year AS parsed_year, f.parsed_tmdb_id AS hint_tmdb_id,
+            f.inferred_media_type AS media_type, f.category, f.scrape_state, f.conflict_reason,
+            f.retry_count::int4 AS retry_count, f.is_locked, f.is_ignored, f.priority_boost,
             f.work_id, w.title AS work_title,
             (SELECT COUNT(*) FROM sync_files sf WHERE sf.folder_id = f.id) AS file_count,
             f.updated_at
@@ -529,7 +529,7 @@ pub(super) async fn list_staging_folders(
         WHERE f.is_ignored = $1
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
-          AND ($4::text IS NULL OR f.parsed_title ILIKE $4 OR f.folder_path ILIKE $4 OR ($5::int4 IS NOT NULL AND f.hint_tmdb_id = $5))
+          AND ($4::text IS NULL OR f.clean_title ILIKE $4 OR f.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
         ORDER BY f.updated_at DESC, f.id DESC
         LIMIT $6 OFFSET $7
         "#,

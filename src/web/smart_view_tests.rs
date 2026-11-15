@@ -32,12 +32,12 @@ async fn smart_view_end_to_end() {
         (10,'tv',100,'低分剧',5,2020,'/low.jpg','电视剧',ARRAY['中国大陆'],ARRAY['Apple TV'],ARRAY['悬疑'],1,'{"original_language":"zh","vote_count":20,"status":"Returning Series","number_of_episodes":30,"episode_run_time":[45]}','2020-01-01'),
         (20,'tv',200,'高分剧',9,2026,'/high.jpg','电视剧',ARRAY['CN'],ARRAY['Apple TV'],ARRAY['悬疑','犯罪'],1,'{"original_language":"zh","vote_count":1500,"status":"Ended","number_of_episodes":8,"number_of_seasons":1,"episode_run_time":[40],"networks":[{"id":2552,"name":"Apple TV"}]}','2026-01-01'),
         (30,'movie',300,'动画电影',8.5,2025,'/movie.jpg','动漫',ARRAY['JP'],ARRAY[]::text[],ARRAY['动画'],1,'{"original_language":"ja","vote_count":2000,"runtime":88,"popularity":100,"collection":{"id":99,"name":"系列"},"production_companies":[{"id":42,"name":"制作公司"}],"genre_ids":[16]}','2025-01-01');
-        INSERT INTO sync_folders(id,folder_path,parsed_title,media_type,category,scrape_state,work_id)
+        INSERT INTO sync_folders(id,root_dir,raw_folder_name,clean_title,inferred_media_type,category,scrape_state,work_id)
         VALUES
-        (10,'/low','低分剧','tv','电视剧','verified',10),
-        (20,'/high','高分剧','tv','电视剧','verified',20),
-        (30,'/movie','动画电影','movie','动漫','verified',30),
-        (40,'/raw','未刮削','movie','电影','pending',NULL);
+        (10,'/low','low','低分剧','tv','电视剧','verified',10),
+        (20,'/high','high','高分剧','tv','电视剧','verified',20),
+        (30,'/movie','movie','动画电影','movie','动漫','verified',30),
+        (40,'/raw','raw','未刮削','movie','电影','pending',NULL);
         INSERT INTO sync_files(folder_id,version_tag,alist_path,path_hash,file_name,container) VALUES
           (30,'4K · 杜比视界','/test/1',1,'1.mkv','mkv'),
           (20,'4K','/test/2',2,'2.mkv','mkv'),(20,'1080p · 杜比视界','/test/3',3,'3.mkv','mkv');
@@ -142,11 +142,11 @@ async fn verify_metadata_refresh(db: &sqlx::PgPool) {
         (502,'movie',5000,'锁定名称','电影',FALSE,TRUE),
         (600,'tv',600,'剧集','电视剧',FALSE,FALSE),
         (700,'movie',700,'失败保留','电影',TRUE,FALSE);
-      INSERT INTO sync_folders(id,folder_path,parsed_title,hint_tmdb_id,media_type,category,scrape_state,work_id) VALUES
-        (500,'/fixture/500','刷新后的电影',500,'movie','电影','pending',500),
-        (501,'/fixture/501','刷新后的电影',500,'movie','电影','pending',NULL),
-        (600,'/fixture/600','剧集',600,'tv','电视剧','verified',600),
-        (700,'/fixture/700','失败保留',700,'movie','电影','pending',700);
+      INSERT INTO sync_folders(id,root_dir,raw_folder_name,clean_title,parsed_tmdb_id,inferred_media_type,category,scrape_state,work_id) VALUES
+        (500,'/fixture/500','500','刷新后的电影',500,'movie','电影','pending',500),
+        (501,'/fixture/501','501','刷新后的电影',500,'movie','电影','pending',NULL),
+        (600,'/fixture/600','600','剧集',600,'tv','电视剧','verified',600),
+        (700,'/fixture/700','700','失败保留',700,'movie','电影','pending',700);
       INSERT INTO work_seasons(work_id,season_number,name) VALUES(600,1,'第一季');
       INSERT INTO sync_files(folder_id,season_number,episode_number,version_tag,alist_path,path_hash,file_name,container) VALUES
         (600,1,1,'默认版本','/fixture/600/1',6001,'1.mkv','mkv');
