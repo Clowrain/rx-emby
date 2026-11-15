@@ -1,13 +1,13 @@
 <script setup>
 import { ref, onUnmounted } from 'vue'
-import { GitCommitHorizontal, Copy, Check } from 'lucide-vue-next'
+import { GitCommitHorizontal, Copy, Check, ExternalLink } from 'lucide-vue-next'
 import { getBuildInfo } from '../../utils/buildInfo'
 
 defineProps({
   variant: {
     type: String,
     default: 'sidebar',
-    validator: value => ['sidebar', 'login'].includes(value)
+    validator: value => ['sidebar', 'login', 'footer'].includes(value)
   }
 })
 
@@ -107,6 +107,50 @@ onUnmounted(() => {
       </span>
     </div>
   </button>
+
+  <!-- 页面底部 Footer 构建版本信息 -->
+  <div v-else-if="variant === 'footer'" class="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs font-mono tabular-nums text-slate-400">
+    <span class="inline-flex items-center gap-1.5 text-slate-200 font-semibold">
+      <GitCommitHorizontal class="w-3.5 h-3.5 text-emerald-400 shrink-0" aria-hidden="true" />
+      <span>{{ buildInfo.version }}</span>
+    </span>
+
+    <span class="text-slate-600" aria-hidden="true">·</span>
+
+    <a
+      v-if="buildInfo.commitUrl"
+      :href="buildInfo.commitUrl"
+      target="_blank"
+      rel="noopener noreferrer"
+      :aria-label="`在 GitHub 查看提交记录 ${buildInfo.commitLabel}（新窗口打开）`"
+      :title="buildInfo.gitDirty ? '查看对应 GitHub 提交记录（当前工作区含未提交改动）' : '在 GitHub 查看此提交记录'"
+      class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-slate-800/90 bg-slate-900/70 hover:bg-slate-800 hover:border-emerald-500/40 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+      :class="buildInfo.gitDirty ? 'text-amber-300 hover:text-amber-200' : 'text-slate-300 hover:text-emerald-300'"
+    >
+      <span>{{ buildInfo.commitLabel }}</span>
+      <span v-if="buildInfo.gitBranch && buildInfo.gitBranch !== 'HEAD'" class="text-slate-400">
+        ({{ buildInfo.gitBranch }})
+      </span>
+      <ExternalLink class="w-3 h-3 shrink-0 opacity-80" aria-hidden="true" />
+    </a>
+    <span
+      v-else
+      class="inline-flex items-center gap-1"
+      :class="buildInfo.gitDirty ? 'text-amber-300' : 'text-slate-300'"
+    >
+      <span>{{ buildInfo.commitLabel }}</span>
+      <span v-if="buildInfo.gitBranch && buildInfo.gitBranch !== 'HEAD'" class="text-slate-400">
+        ({{ buildInfo.gitBranch }})
+      </span>
+    </span>
+
+    <template v-if="buildInfo.buildTime">
+      <span class="text-slate-600" aria-hidden="true">·</span>
+      <span class="text-slate-400">
+        <span class="text-slate-500 mr-1">构建于</span>{{ buildInfo.buildTime }}
+      </span>
+    </template>
+  </div>
 
   <!-- 登录页底部构建版本信息 -->
   <div v-else class="mt-4 flex justify-center">

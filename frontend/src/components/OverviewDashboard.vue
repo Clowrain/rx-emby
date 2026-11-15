@@ -46,7 +46,7 @@
         <div class="mt-3 flex items-baseline gap-2 tabular-nums">
           <span class="text-3xl font-bold text-white tracking-tight">{{ scrapeRate }}%</span>
           <span class="text-xs text-emerald-400">
-            已完成 {{ formatNum(overview?.media?.scraped_count) }} 部
+            已刮削 {{ formatNum(overview?.media?.verified_folders_count ?? overview?.media?.scraped_count) }} 目录
           </span>
         </div>
         <div class="mt-3">
@@ -287,10 +287,15 @@ const emit = defineEmits(['navigate', 'refresh'])
 const toast = useToast()
 
 const scrapeRate = computed(() => {
-  const total = props.overview?.media?.total_media || 0
-  if (!total) return 0
-  const scraped = props.overview?.media?.scraped_count || 0
-  return Math.min(100, Math.round((scraped / total) * 100))
+  const m = props.overview?.media
+  if (!m) return 0
+  const verified = m.verified_folders_count ?? m.scraped_count ?? 0
+  const pending = m.pending_count || 0
+  const conflict = m.conflict_count || 0
+  const failed = m.failed_count || 0
+  const totalFolders = verified + pending + conflict + failed
+  if (!totalFolders) return 0
+  return Math.min(100, Math.round((verified / totalFolders) * 100))
 })
 
 function formatNum(n) {

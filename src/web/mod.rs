@@ -29,6 +29,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/", get(serve_index))
+        .route("/favicon.ico", get(serve_favicon))
         .route("/assets/*path", get(serve_assets))
         .route("/covers/*path", get(serve_covers))
         .route("/web/*path", get(serve_static))
@@ -59,6 +60,10 @@ async fn serve_index() -> impl IntoResponse {
         Some(content) => Html(String::from_utf8_lossy(content.data.as_ref()).into_owned()).into_response(),
         None => (StatusCode::NOT_FOUND, "index.html 未找到").into_response(),
     }
+}
+
+async fn serve_favicon() -> Response {
+    serve_embedded_file("favicon.ico").await
 }
 
 async fn serve_assets(Path(path): Path<String>) -> Response {

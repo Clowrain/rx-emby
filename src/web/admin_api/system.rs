@@ -252,9 +252,10 @@ pub(super) async fn get_admin_overview(
     .await
     .unwrap_or(0);
 
-    let (pending_count, conflict_count, failed_count, ignored_count): (i64, i64, i64, i64) = sqlx::query_as(
+    let (verified_folders_count, pending_count, conflict_count, failed_count, ignored_count): (i64, i64, i64, i64, i64) = sqlx::query_as(
         r#"
         SELECT
+            COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'verified'),
             COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'pending'),
             COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'conflict'),
             COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'failed'),
@@ -264,7 +265,7 @@ pub(super) async fn get_admin_overview(
     )
     .fetch_one(&state.db)
     .await
-    .unwrap_or((0, 0, 0, 0));
+    .unwrap_or((0, 0, 0, 0, 0));
 
     let total_media = scraped_count;
 
@@ -324,6 +325,7 @@ pub(super) async fn get_admin_overview(
             "total_media": total_media,
             "total_episodes": total_episodes,
             "scraped_count": scraped_count,
+            "verified_folders_count": verified_folders_count,
             "pending_count": pending_count,
             "conflict_count": conflict_count,
             "failed_count": failed_count,

@@ -1,18 +1,16 @@
 <script setup>
-import { Play, Radio, Server } from 'lucide-vue-next'
-import BuildVersionBadge from './BuildVersionBadge.vue'
+import { Play } from 'lucide-vue-next'
 
 defineProps({
   navGroups: { type: Array, required: true },
-  activeTab: { type: String, required: true },
-  overview: { type: Object, default: null }
+  activeTab: { type: String, required: true }
 })
 
 const emit = defineEmits(['switch-tab'])
 </script>
 
 <template>
-  <aside class="w-64 shrink-0 bg-[#080c16]/95 border-r border-slate-800/75 flex flex-col justify-between sticky top-0 h-dvh z-30">
+  <aside class="w-64 shrink-0 bg-[#080c16]/95 border-r border-slate-800/75 flex flex-col sticky top-0 h-dvh z-30">
     <div>
       <!-- 品牌 Logo 区 -->
       <div class="px-6 py-5 border-b border-slate-800/70 flex items-center gap-3.5">
@@ -31,7 +29,7 @@ const emit = defineEmits(['switch-tab'])
       </div>
 
       <!-- 分组菜单 -->
-      <nav aria-label="主导航" class="p-3.5 space-y-4 overflow-y-auto max-h-[calc(100dvh-230px)]">
+      <nav aria-label="主导航" class="p-3.5 space-y-4 overflow-y-auto max-h-[calc(100dvh-88px)]">
         <div v-for="group in navGroups" :key="group.title" class="space-y-1">
           <div class="px-3 text-[11px] font-semibold tracking-wide text-slate-500 mb-1.5">
             {{ group.title }}
@@ -73,31 +71,6 @@ const emit = defineEmits(['switch-tab'])
           </button>
         </div>
       </nav>
-    </div>
-
-    <!-- 底部引擎运行态卡片 -->
-    <div class="p-4 border-t border-slate-800/70 space-y-2.5 bg-slate-950/60">
-      <div class="flex items-center justify-between text-xs">
-        <span class="flex items-center gap-2 text-slate-200 font-medium">
-          <Radio class="w-3.5 h-3.5 text-emerald-400 animate-pulse" aria-hidden="true" />
-          <span>302 直链转发引擎</span>
-        </span>
-        <span class="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25">
-          运行中
-        </span>
-      </div>
-      <div class="text-[11px] text-slate-400 space-y-1 font-mono tabular-nums">
-        <div class="truncate flex items-center gap-1.5" :title="overview?.system?.alist_base_url">
-          <Server class="w-3 h-3 text-slate-500 shrink-0" aria-hidden="true" />
-          <span class="truncate">{{ overview?.system?.alist_base_url || '正在连接网关…' }}</span>
-        </div>
-        <div class="flex items-center justify-between text-slate-500 pt-0.5">
-          <span>TMDB 限流: {{ overview?.system?.tmdb_rate_limit || 8 }} req/s</span>
-          <span class="text-slate-400">{{ overview?.system?.auto_background_scraper ? '自动扫描' : '按需刮削' }}</span>
-        </div>
-      </div>
-
-      <BuildVersionBadge variant="sidebar" />
     </div>
   </aside>
 </template>

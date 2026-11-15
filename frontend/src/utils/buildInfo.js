@@ -15,11 +15,15 @@ export function formatBuildTime(isoString) {
 export function getBuildInfo(raw = typeof __APP_BUILD_INFO__ !== 'undefined' ? __APP_BUILD_INFO__ : {}) {
   const version = raw?.version ? `v${String(raw.version).replace(/^v/, '')}` : 'v0.0.0'
   const gitSha = raw?.gitSha || 'unknown'
+  const gitFullSha = raw?.gitFullSha || ''
   const gitBranch = raw?.gitBranch || ''
   const gitDirty = Boolean(raw?.gitDirty)
   const buildTime = formatBuildTime(raw?.buildTime)
+  const repoUrl = (raw?.repoUrl || 'https://github.com/Clowrain/rx-emby').replace(/\/+$/, '')
 
   const commitLabel = gitDirty ? `${gitSha}-dirty` : gitSha
+  const commitHashForUrl = gitFullSha || (gitSha !== 'unknown' ? gitSha : '')
+  const commitUrl = commitHashForUrl && repoUrl ? `${repoUrl}/commit/${commitHashForUrl}` : ''
   const parts = [`RX-Emby ${version}`, commitLabel]
   if (gitBranch && gitBranch !== 'HEAD') parts.push(gitBranch)
   if (buildTime) parts.push(`built ${buildTime}`)
@@ -27,9 +31,12 @@ export function getBuildInfo(raw = typeof __APP_BUILD_INFO__ !== 'undefined' ? _
   return {
     version,
     gitSha,
+    gitFullSha,
     gitBranch,
     gitDirty,
     commitLabel,
+    commitUrl,
+    repoUrl,
     buildTime,
     diagnosticText: parts.join(' · ')
   }

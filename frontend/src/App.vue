@@ -11,7 +11,9 @@ import {
   HardDrive,
   ShieldCheck,
   LogOut,
-  Image as ImageIcon
+  Image as ImageIcon,
+  Radio,
+  Server
 } from 'lucide-vue-next'
 import {
   adminApi,
@@ -22,6 +24,7 @@ import {
 import { confirmState, resolveConfirm } from './composables/useToast'
 import LoginView from './components/LoginView.vue'
 import AdminSidebar from './components/layout/AdminSidebar.vue'
+import BuildVersionBadge from './components/layout/BuildVersionBadge.vue'
 import ToastContainer from './components/layout/ToastContainer.vue'
 import ConfirmModal from './components/layout/ConfirmModal.vue'
 import OverviewDashboard from './components/OverviewDashboard.vue'
@@ -264,7 +267,6 @@ onUnmounted(() => {
     <AdminSidebar
       :nav-groups="navGroups"
       :active-tab="activeTab"
-      :overview="overview"
       @switch-tab="switchTab"
     />
 
@@ -353,6 +355,46 @@ onUnmounted(() => {
         <ImageCacheTab v-else-if="activeTab === 'cache'" @saved="fetchOverview" />
         <HotConfigTab v-else-if="activeTab === 'config'" @saved="fetchOverview" />
       </main>
+
+      <footer class="border-t border-slate-800/70 bg-[#080c16]/60 backdrop-blur-sm">
+        <div class="max-w-[1600px] w-full mx-auto px-8 py-3.5 flex flex-wrap items-center justify-between gap-x-6 gap-y-2.5">
+          <!-- 左侧：302 直链转发引擎运行态 -->
+          <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs font-mono tabular-nums text-slate-400 min-w-0">
+            <span class="inline-flex items-center gap-2 text-slate-200 font-sans font-medium">
+              <Radio class="w-3.5 h-3.5 text-emerald-400 animate-pulse shrink-0" aria-hidden="true" />
+              <span>302 直链转发引擎</span>
+              <span class="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
+                运行中
+              </span>
+            </span>
+
+            <span class="text-slate-600" aria-hidden="true">·</span>
+
+            <span
+              class="inline-flex items-center gap-1.5 max-w-[260px] truncate text-slate-300"
+              :title="overview?.system?.alist_base_url || '正在连接网关'"
+            >
+              <Server class="w-3.5 h-3.5 text-slate-400 shrink-0" aria-hidden="true" />
+              <span class="truncate">{{ overview?.system?.alist_base_url || '正在连接网关…' }}</span>
+            </span>
+
+            <span class="text-slate-600" aria-hidden="true">·</span>
+
+            <span class="text-slate-400">
+              TMDB {{ overview?.system?.tmdb_rate_limit || 8 }} req/s
+            </span>
+
+            <span class="text-slate-600" aria-hidden="true">·</span>
+
+            <span class="text-slate-300 font-sans">
+              {{ overview?.system?.auto_background_scraper ? '自动刮削' : '按需刮削' }}
+            </span>
+          </div>
+
+          <!-- 右侧：版本号、GitHub Commit 链接与构建时间 -->
+          <BuildVersionBadge variant="footer" />
+        </div>
+      </footer>
     </div>
 
     <MediaDetailDrawer :media-id="drawerMediaId" @close="drawerMediaId = null" />

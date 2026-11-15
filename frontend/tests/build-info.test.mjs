@@ -19,6 +19,7 @@ test('getBuildInfo normalizes version, dirty state, and diagnostic text', () => 
 
   assert.equal(info.version, 'v2.0.0')
   assert.equal(info.commitLabel, 'f7607b5-dirty')
+  assert.equal(info.commitUrl, 'https://github.com/Clowrain/rx-emby/commit/f7607b5')
   assert.ok(info.diagnosticText.startsWith('RX-Emby v2.0.0 · f7607b5-dirty · main · built '))
 })
 
@@ -26,5 +27,6 @@ test('getBuildInfo handles missing fields gracefully', () => {
   const info = getBuildInfo({})
   assert.equal(info.version, 'v0.0.0')
   assert.equal(info.commitLabel, 'unknown')
+  assert.equal(info.commitUrl, '')
   assert.equal(info.diagnosticText, 'RX-Emby v0.0.0 · unknown')
 })
