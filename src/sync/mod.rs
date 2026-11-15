@@ -150,16 +150,40 @@ async fn fetch_source_bytes(
     if source.starts_with("http://") || source.starts_with("https://") {
         let proxy = state.config.load().tmdb_proxy_url.clone();
         let client = build_sync_http_client(proxy.as_deref())?;
-        let mut req = client.get(source);
-        if !force {
-            if let Some(etag) = last_etag {
-                req = req.header("If-None-Match", etag);
+        let mut last_err = None;
+        let mut resp_opt = None;
+        for attempt in 1..=3 {
+            let mut req = client.get(source);
+            if !force {
+                if let Some(etag) = last_etag {
+                    req = req.header("If-None-Match", etag);
+                }
+            }
+            match req.send().await {
+                Ok(r) => {
+                    resp_opt = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let is_last = attempt == 3;
+                    if !is_last {
+                        warn!(
+                            "⚠️ [Sync] 下载索引源第 {} 次失败，1.5s 后重试 ({}): {}",
+                            attempt, source, e
+                        );
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                    last_err = Some(e);
+                }
             }
         }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("下载索引源失败: {}", source))?;
+        let resp = match resp_opt {
+            Some(r) => r,
+            None => {
+                return Err(last_err.unwrap())
+                    .with_context(|| format!("下载索引源失败: {}", source));
+            }
+        };
         if resp.status() == StatusCode::NOT_MODIFIED {
             return Ok(FetchedSource::NotModified);
         }

@@ -4,8 +4,9 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{debug, warn};
 
@@ -61,6 +62,8 @@ pub struct ResourceDailyRow {
 pub struct MonitorState {
     pub started_at: DateTime<Utc>,
     pub recent_samples: RwLock<VecDeque<ResourceSample>>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub prev_cpu_sample: Mutex<Option<(u64, Instant)>>,
 }
 
 impl Default for MonitorState {
@@ -68,6 +71,7 @@ impl Default for MonitorState {
         Self {
             started_at: Utc::now(),
             recent_samples: RwLock::new(VecDeque::with_capacity(MAX_RECENT_SAMPLES)),
+            prev_cpu_sample: Mutex::new(None),
         }
     }
 }
@@ -114,8 +118,8 @@ pub async fn collect_and_record(state: &AppState) -> anyhow::Result<ResourceSamp
     let scenario = detect_current_scenario(state);
     let pid = std::process::id();
 
-    // 1. 当前服务进程 CPU 与 RSS 内存 (macOS / Linux 通用 ps 输出)
-    let (app_cpu_pct, app_mem_mb) = sample_process_ps(pid).await.unwrap_or((0.0, 0.0));
+    // 1. 当前服务进程 CPU 与 RSS 内存 (Linux 优先直读 /proc，不依赖 procps；macOS 回退 ps)
+    let (app_cpu_pct, app_mem_mb) = sample_current_process(state, pid).await;
 
     // 2. 同机 PostgreSQL 进程采样（若为独立容器或同机进程，尽力汇总 postgres 进程）
     let (db_host_available, db_cpu_pct, db_mem_mb) = sample_postgres_processes().await;
@@ -254,6 +258,63 @@ pub async fn collect_and_record(state: &AppState) -> anyhow::Result<ResourceSamp
     Ok(sample)
 }
 
+async fn sample_current_process(state: &AppState, pid: u32) -> (f64, f64) {
+    #[cfg(target_os = "linux")]
+    {
+        let mem_mb = read_proc_rss_mb().await.unwrap_or(0.0);
+        let cpu_pct = read_proc_cpu_pct(state).await.unwrap_or(0.0);
+        return (round2(cpu_pct), round2(mem_mb));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = state;
+        sample_process_ps(pid).await.unwrap_or((0.0, 0.0))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn read_proc_rss_mb() -> Option<f64> {
+    let status = tokio::fs::read_to_string("/proc/self/status").await.ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb = rest.split_whitespace().next()?.parse::<f64>().ok()?;
+            return Some(kb / 1024.0);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+async fn read_proc_cpu_pct(state: &AppState) -> Option<f64> {
+    let stat = tokio::fs::read_to_string("/proc/self/stat").await.ok()?;
+    let rparen = stat.rfind(')')?;
+    let after = stat.get(rparen + 2..)?;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    // 跳过 state(0)..cmajflt(10)，utime=11, stime=12
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    let total_ticks = utime + stime;
+    let now = Instant::now();
+
+    let mut guard = state.monitor.prev_cpu_sample.lock().await;
+    let pct = if let Some((prev_ticks, prev_at)) = *guard {
+        let elapsed = now.duration_since(prev_at).as_secs_f64();
+        if elapsed > 0.05 && total_ticks >= prev_ticks {
+            // Linux USER_HZ 固定为 100
+            let cpu_secs = (total_ticks - prev_ticks) as f64 / 100.0;
+            (cpu_secs / elapsed) * 100.0
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    *guard = Some((total_ticks, now));
+    Some(pct)
+}
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 async fn sample_process_ps(pid: u32) -> Option<(f64, f64)> {
     let out = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "%cpu=,rss="])
