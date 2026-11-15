@@ -15,7 +15,7 @@ fn image_shard_rel_path(size: &str, file_name: &str) -> String {
 }
 
 impl AppState {
-    /// 获取本地缓存的图片字节流（首次访问自动回源 TMDB 并落盘，防并发击穿）
+    /// 获取图片字节流（开启磁盘缓存时自动落盘并防击穿；关闭磁盘缓存时直接通过后台网络拉取返回）
     pub async fn get_or_fetch_tmdb_image(&self, size: &str, file_name: &str) -> Result<Vec<u8>> {
         // 路径安全过滤，防止目录穿越攻击
         if size.contains("..") || file_name.contains("..") || file_name.contains('/') {
@@ -23,8 +23,22 @@ impl AppState {
         }
 
         let cache_key = format!("{}/{}", size, file_name);
-        let rel_path = image_shard_rel_path(size, file_name);
         let cfg = self.config.load();
+
+        // 若未开启磁盘缓存，直接通过后台网络回源 TMDB 并返回字节流（不读写本地磁盘与 LRU 表）
+        if !cfg.image_disk_cache_enabled {
+            let remote_url = format!("{}/{}/{}", cfg.tmdb_image_base, size, file_name);
+            let client = self.tmdb_client.load();
+            let resp = client
+                .get(&remote_url)
+                .send()
+                .await
+                .with_context(|| format!("回源拉取 TMDB 图片失败: {}", remote_url))?
+                .error_for_status()?;
+            return Ok(resp.bytes().await?.to_vec());
+        }
+
+        let rel_path = image_shard_rel_path(size, file_name);
         let full_path = cfg.image_cache_dir.join(&rel_path);
         let legacy_path = cfg.image_cache_dir.join(size).join(file_name);
 

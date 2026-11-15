@@ -171,6 +171,7 @@ pub(super) async fn image_cache_stats(
     };
 
     Ok(Json(json!({
+        "disk_cache_enabled": cfg.image_disk_cache_enabled,
         "file_count": file_count,
         "used_mb": total_bytes / 1024 / 1024,
         "max_mb": cfg.image_max_size_mb,

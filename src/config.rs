@@ -119,6 +119,7 @@ impl Default for TmdbSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ImageCacheSection {
+    pub disk_cache_enabled: bool,
     pub cache_dir: String,
     pub max_size_mb: u64,
     pub evict_high_watermark: f64,
@@ -128,6 +129,7 @@ pub struct ImageCacheSection {
 impl Default for ImageCacheSection {
     fn default() -> Self {
         Self {
+            disk_cache_enabled: true,
             cache_dir: "./cache/images".to_string(),
             max_size_mb: 20480,
             evict_high_watermark: 0.90,
@@ -169,6 +171,7 @@ pub struct DynamicConfig {
     pub tmdb_rate_limit_per_sec: u32,
 
     // 图片缓存 LRU 配置
+    pub image_disk_cache_enabled: bool,
     pub image_cache_dir: PathBuf,
     pub image_max_size_mb: u64,
     pub image_evict_high_watermark: f64,
@@ -230,6 +233,7 @@ impl BootstrapFileConfig {
         env_parse("TMDB_RATE_LIMIT_PER_SEC", &mut self.tmdb.rate_limit_per_sec);
 
         // [image_cache]
+        env_parse("IMAGE_CACHE_DISK_ENABLED", &mut self.image_cache.disk_cache_enabled);
         env_str("IMAGE_CACHE_DIR", &mut self.image_cache.cache_dir);
         env_parse("IMAGE_CACHE_MAX_SIZE_MB", &mut self.image_cache.max_size_mb);
         env_parse(
@@ -265,6 +269,7 @@ impl BootstrapFileConfig {
             tmdb_api_base: self.tmdb.api_base_url.trim_end_matches('/').to_string(),
             tmdb_image_base: self.tmdb.image_base_url.trim_end_matches('/').to_string(),
             tmdb_rate_limit_per_sec: self.tmdb.rate_limit_per_sec.max(1),
+            image_disk_cache_enabled: self.image_cache.disk_cache_enabled,
             image_cache_dir: PathBuf::from(self.image_cache.cache_dir),
             image_max_size_mb: self.image_cache.max_size_mb,
             image_evict_high_watermark: self.image_cache.evict_high_watermark,
@@ -373,6 +378,7 @@ impl DynamicConfig {
             .await?;
         }
 
+        merge_field!("image_cache.disk_cache_enabled", self.image_disk_cache_enabled, "bool", "是否将海报与剧照缓存到本地磁盘", |s: &str| s.parse::<bool>());
         merge_field!("image_cache.max_size_mb", self.image_max_size_mb, "int", "图片磁盘缓存上限(MB)", |s: &str| s.parse::<u64>());
         merge_field!("image_cache.evict_high_watermark", self.image_evict_high_watermark, "float", "图片缓存清理高水位线", |s: &str| s.parse::<f64>());
         merge_field!("image_cache.evict_low_watermark", self.image_evict_low_watermark, "float", "图片缓存清理低水位线", |s: &str| s.parse::<f64>());

@@ -7,6 +7,12 @@
           <h2 class="text-base font-bold text-white flex items-center gap-2">
             <HardDrive class="w-4 h-4 text-amber-400 shrink-0" aria-hidden="true" />
             <span>本地图片缓存水位</span>
+            <span
+              v-if="cacheStats && cacheStats.disk_cache_enabled === false"
+              class="px-2 py-0.5 text-[11px] font-medium rounded-md bg-cyan-950 text-cyan-300 border border-cyan-500/30"
+            >
+              直通模式（不落盘）
+            </span>
           </h2>
           <p class="text-xs text-slate-400 mt-1">
             自动缓存客户端请求的海报与剧照，达到高水位线时自动清理最久未访问的图片。
