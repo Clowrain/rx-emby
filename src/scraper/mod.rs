@@ -11,6 +11,7 @@ use tracing::{debug, error, info};
 #[derive(sqlx::FromRow, Debug)]
 struct PendingFolderRow {
     id: i64,
+    root_dir: String,
     inferred_media_type: String,
     parsed_tmdb_id: Option<i32>,
     clean_title: String,
@@ -364,13 +365,13 @@ pub async fn scrape_single_folder_with_mode(
     is_p0: bool,
 ) -> Result<()> {
     let row: Option<PendingFolderRow> = sqlx::query_as(
-        "SELECT id, inferred_media_type, parsed_tmdb_id, clean_title, year, retry_count, scrape_state, work_id, is_locked FROM sync_folders WHERE id = $1",
+        "SELECT id, root_dir, inferred_media_type, parsed_tmdb_id, clean_title, year, retry_count, scrape_state, work_id, is_locked FROM sync_folders WHERE id = $1",
     )
     .bind(folder_id)
     .fetch_optional(&state.db)
     .await?;
 
-    let Some(folder) = row else {
+    let Some(mut folder) = row else {
         return Ok(());
     };
 
@@ -393,6 +394,41 @@ pub async fn scrape_single_folder_with_mode(
     .bind(folder.id)
     .fetch_one(&state.db)
     .await?;
+
+    let is_tv = folder.inferred_media_type == "tv" || ep_count > 1 || max_season > 0;
+
+    // 若目录末级仅为 {tmdb-xxx}（如历史同步误取上级合集名或 Season X），按统一规则自愈纠正片名与年份
+    if crate::sync::parser::is_pure_tmdb_root_dir(&folder.root_dir) {
+        let fnames: Vec<String> = sqlx::query_scalar(
+            "SELECT file_name FROM sync_files WHERE folder_id = $1 ORDER BY id ASC LIMIT 5",
+        )
+        .bind(folder.id)
+        .fetch_all(&state.db)
+        .await?;
+
+        if let Some((new_title, new_year)) =
+            crate::sync::parser::resolve_pure_tmdb_folder_title_year(
+                &folder.root_dir,
+                is_tv,
+                &fnames,
+            )
+        {
+            if new_title != folder.clean_title || (new_year.is_some() && folder.year.is_none()) {
+                folder.clean_title = new_title;
+                if folder.year.is_none() {
+                    folder.year = new_year;
+                }
+                sqlx::query(
+                    "UPDATE sync_folders SET clean_title = $1, year = $2, conflict_reason = NULL WHERE id = $3",
+                )
+                .bind(&folder.clean_title)
+                .bind(folder.year)
+                .bind(folder.id)
+                .execute(&state.db)
+                .await?;
+            }
+        }
+    }
 
     // 1. 若自带 parsed_tmdb_id 且库中已有新鲜且同类型的正式作品，先本地交叉校验后零开销复用
     if let Some(tid) = folder.parsed_tmdb_id {

@@ -168,6 +168,49 @@ pub async fn apply_sync_diff(
                     $5::text[], $6::text[], $7::int4[]
                 )
                 ON CONFLICT (root_dir) DO UPDATE SET
+                    raw_folder_name = CASE WHEN sync_folders.is_locked THEN sync_folders.raw_folder_name ELSE EXCLUDED.raw_folder_name END,
+                    clean_title = CASE WHEN sync_folders.is_locked THEN sync_folders.clean_title ELSE EXCLUDED.clean_title END,
+                    year = CASE WHEN sync_folders.is_locked THEN sync_folders.year ELSE EXCLUDED.year END,
+                    scrape_state = CASE
+                        WHEN NOT sync_folders.is_locked
+                             AND sync_folders.scrape_state IN ('conflict', 'failed')
+                             AND (
+                                 sync_folders.clean_title IS DISTINCT FROM EXCLUDED.clean_title
+                                 OR sync_folders.year IS DISTINCT FROM EXCLUDED.year
+                             )
+                        THEN 'pending'
+                        ELSE sync_folders.scrape_state
+                    END,
+                    conflict_reason = CASE
+                        WHEN NOT sync_folders.is_locked
+                             AND sync_folders.scrape_state IN ('conflict', 'failed')
+                             AND (
+                                 sync_folders.clean_title IS DISTINCT FROM EXCLUDED.clean_title
+                                 OR sync_folders.year IS DISTINCT FROM EXCLUDED.year
+                             )
+                        THEN NULL
+                        ELSE sync_folders.conflict_reason
+                    END,
+                    retry_count = CASE
+                        WHEN NOT sync_folders.is_locked
+                             AND sync_folders.scrape_state IN ('conflict', 'failed')
+                             AND (
+                                 sync_folders.clean_title IS DISTINCT FROM EXCLUDED.clean_title
+                                 OR sync_folders.year IS DISTINCT FROM EXCLUDED.year
+                             )
+                        THEN 0
+                        ELSE sync_folders.retry_count
+                    END,
+                    next_retry_at = CASE
+                        WHEN NOT sync_folders.is_locked
+                             AND sync_folders.scrape_state IN ('conflict', 'failed')
+                             AND (
+                                 sync_folders.clean_title IS DISTINCT FROM EXCLUDED.clean_title
+                                 OR sync_folders.year IS DISTINCT FROM EXCLUDED.year
+                             )
+                        THEN NULL
+                        ELSE sync_folders.next_retry_at
+                    END,
                     parsed_tmdb_id = COALESCE(sync_folders.parsed_tmdb_id, EXCLUDED.parsed_tmdb_id),
                     updated_at = NOW()
                 RETURNING id, root_dir, (xmax = 0) AS is_inserted

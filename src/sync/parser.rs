@@ -155,7 +155,7 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
     };
 
     // 定位影视根目录（跳过末级文件名以及可能存在的 Season X 子目录）
-    let (root_dir, raw_folder_name) = locate_media_root(&segments, is_tv);
+    let (root_dir, raw_folder_name) = locate_media_root(&segments, is_tv, &file_name);
     let (clean_title, year) = extract_title_and_year(&raw_folder_name);
 
     // 6. 提取版本标签与排序权重（白名单正则 -> 父目录差集 -> 网盘来源/容器兜底）
@@ -274,7 +274,7 @@ fn extract_season_from_dir(dir_name: &str) -> Option<i32> {
         .and_then(|m| m.as_str().parse::<i32>().ok())
 }
 
-fn locate_media_root(segments: &[&str], is_tv: bool) -> (String, String) {
+fn locate_media_root(segments: &[&str], is_tv: bool, file_name: &str) -> (String, String) {
     if segments.len() == 1 {
         let name = segments[0].to_string();
         return (name.clone(), name);
@@ -282,20 +282,152 @@ fn locate_media_root(segments: &[&str], is_tv: bool) -> (String, String) {
 
     // 去掉末级文件名
     let mut dir_end = segments.len() - 1;
-    // 如果是剧集且倒数第二级是 Season X / 第一季，则再往上一级作为剧集根目录
-    if is_tv && dir_end >= 2 && extract_season_from_dir(segments[dir_end - 1]).is_some() {
-        dir_end -= 1;
+    // 如果是剧集：
+    // 1) 倒数第二级是 Season X / 第一季，则再往上一级作为剧集根目录
+    // 2) 若末级目录是纯 {tmdb-xxx} 且再上一级是 Season X，同样跳过 Season X/{tmdb-xxx}，使多季聚合到同一剧集根目录
+    if is_tv {
+        if dir_end >= 3
+            && is_pure_tmdb_segment(segments[dir_end - 1])
+            && extract_season_from_dir(segments[dir_end - 2]).is_some()
+        {
+            dir_end -= 2;
+        } else if dir_end >= 2 && extract_season_from_dir(segments[dir_end - 1]).is_some() {
+            dir_end -= 1;
+        }
     }
 
     let root_dir = segments[..dir_end].join("/");
     let mut raw_folder_name = segments[dir_end - 1].to_string();
 
-    // 若当前目录名去掉 {tmdb-xxx} 后为空（例如目录就叫 "{tmdb-80009}"），向上取父目录作为真实片名
-    let stripped = TMDB_ID_RE.replace_all(&raw_folder_name, "").trim().to_string();
-    if stripped.is_empty() && dir_end >= 2 {
-        raw_folder_name = segments[dir_end - 2].to_string();
+    // 若当前目录名仅为 {tmdb-xxx}（如 "电影/人人影视电影合集/{tmdb-54093}/Killing.Bono.2011.mkv"）：
+    // 仅当上级目录是无年份的合集/系列/分类目录、且非剧集、且文件名不是纯集号/分辨率标签时，才从文件名提取片名；
+    // 否则保留上级真实片名目录（如 "传闻中的陈芊芊 (2020)/{tmdb-103635}/S01E01.mp4" 或 "扎职2/{tmdb-993100}/4K.帧琦映画.mp4"）。
+    if is_pure_tmdb_segment(&raw_folder_name) {
+        let parent_seg = if dir_end >= 2 {
+            segments[dir_end - 2]
+        } else {
+            ""
+        };
+        if should_extract_from_filename_for_pure_tmdb(parent_seg, is_tv) {
+            if let Some(stem_clean) = clean_video_stem(file_name) {
+                raw_folder_name = stem_clean;
+            } else if !parent_seg.is_empty() {
+                raw_folder_name = parent_seg.to_string();
+            }
+        } else if !parent_seg.is_empty() {
+            raw_folder_name = parent_seg.to_string();
+        }
     }
     (root_dir, raw_folder_name)
+}
+
+pub fn is_pure_tmdb_segment(seg: &str) -> bool {
+    TMDB_ID_RE.replace_all(seg, "").trim().is_empty()
+}
+
+pub fn is_pure_tmdb_root_dir(root_dir: &str) -> bool {
+    root_dir
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .is_some_and(is_pure_tmdb_segment)
+}
+
+fn should_extract_from_filename_for_pure_tmdb(parent_seg: &str, is_tv: bool) -> bool {
+    if is_tv {
+        return false;
+    }
+    let trimmed = parent_seg.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let (_, parent_year) = extract_title_and_year(trimmed);
+    parent_year.is_none() && is_collection_or_category_folder(trimmed)
+}
+
+fn is_collection_or_category_folder(seg: &str) -> bool {
+    const COLLECTION_KEYWORDS: &[&str] = &[
+        "合集",
+        "系列",
+        "全集",
+        "宇宙",
+        "电影合集",
+        "系列电影",
+        "国语配音",
+        "演唱会",
+        "纪录片",
+        "动画片",
+        "剧场版合集",
+        "bdrip",
+        "collection",
+        "movies",
+    ];
+    let lower = seg.to_lowercase();
+    if matches!(seg, "电影" | "音乐" | "动画") {
+        return true;
+    }
+    COLLECTION_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+fn clean_video_stem(file_name: &str) -> Option<String> {
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(file_name)
+        .trim();
+    let stem_clean = TMDB_ID_RE.replace_all(stem, "").trim().to_string();
+    if is_bare_or_tech_filename(&stem_clean) {
+        None
+    } else {
+        Some(stem_clean)
+    }
+}
+
+fn is_bare_or_tech_filename(stem_clean: &str) -> bool {
+    static BARE_EP_OR_TECH_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?i)^(?:S\d{1,3}E\d{1,4}|E\d{1,4}|EP\d{1,4}|第\s*\d+\s*[集话期]|CD\d+|DISC\s*\d+|PART\s*\d+|4K|2160P|1080P|720P|REMUX|BDMV)(?:$|[\s._\-\[\(])").unwrap()
+    });
+    stem_clean.is_empty()
+        || stem_clean.chars().all(|c| c.is_ascii_digit())
+        || BARE_EP_OR_TECH_RE.is_match(stem_clean)
+}
+
+pub fn extract_title_and_year_from_filename(file_name: &str) -> Option<(String, Option<i32>)> {
+    let stem_clean = clean_video_stem(file_name)?;
+    Some(extract_title_and_year(&stem_clean))
+}
+
+/// 为历史存量纯 {tmdb-xxx} 目录在刮削阶段提供自愈修正：
+/// 1) 若是剧集且路径为 `.../剧名/Season X/{tmdb-xxx}`，纠正为上级剧名；
+/// 2) 若是电影且上级为无年份合集/系列目录（如 `人人影视电影合集/{tmdb-54093}`），从关联文件名提取真实片名与年份。
+pub fn resolve_pure_tmdb_folder_title_year(
+    root_dir: &str,
+    is_tv: bool,
+    file_names: &[String],
+) -> Option<(String, Option<i32>)> {
+    let mut rev_segs = root_dir.rsplit('/').filter(|s| !s.is_empty());
+    let last_seg = rev_segs.next()?;
+    let parent_seg = rev_segs.next()?;
+    if !is_pure_tmdb_segment(last_seg) {
+        return None;
+    }
+
+    if is_tv {
+        if extract_season_from_dir(parent_seg).is_some() {
+            if let Some(show_seg) = rev_segs.next() {
+                return Some(extract_title_and_year(show_seg));
+            }
+        }
+        return None;
+    }
+
+    if should_extract_from_filename_for_pure_tmdb(parent_seg, false) {
+        for fname in file_names {
+            if let Some(parsed) = extract_title_and_year_from_filename(fname) {
+                return Some(parsed);
+            }
+        }
+    }
+    None
 }
 
 fn extract_title_and_year(folder_name: &str) -> (String, Option<i32>) {
@@ -702,5 +834,151 @@ mod tests {
         let ps5 = "电视剧/PS5宣传片/01.mp4#http://127.0.0.1:5678/d/电视剧/PS5宣传片/01.mp4";
         let rec_ps5 = parse_strm_line(ps5).unwrap();
         assert_eq!(rec_ps5.root_dir, "电视剧/PS5宣传片");
+    }
+
+    #[test]
+    fn test_pure_tmdb_folder_under_collection_uses_filename() {
+        let line = "电影/人人影视电影合集/{tmdb-54093}/Killing.Bono.2011.1080p.BluRay.x264.strm#http://xiaoya.host:5678/d/电影/人人影视电影合集/{tmdb-54093}/Killing.Bono.2011.1080p.BluRay.x264.mkv";
+        let rec = parse_strm_line(line).unwrap();
+        assert_eq!(rec.root_dir, "电影/人人影视电影合集/{tmdb-54093}");
+        assert_eq!(rec.tmdb_id, Some(54093));
+        assert_eq!(rec.clean_title, "Killing Bono");
+        assert_eq!(rec.year, Some(2011));
+    }
+
+    #[test]
+    fn test_strm_real_world_pure_tmdb_specimens() {
+        // 1. 电影合集/系列/分类目录（无年份）-> 必须从视频文件名提取真实片名
+        let collection_cases = [
+            (
+                "电影/4K系列/007系列电影/{tmdb-709}/007之十六.杀人执照..Licence.to.Kill.1989.mkv#http://127.0.0.1:5678/d/电影/4K系列/007系列电影/007之十六.杀人执照..Licence.to.Kill.1989.mkv",
+                "007之十六 杀人执照  Licence to Kill",
+                Some(1989),
+            ),
+            (
+                "电影/韩国/韩国电影（国语配音）/{tmdb-52120}/奶奶强盗团.Twilight.Gangsters.2010.HDTV.1080p.x265.3Audios.mkv#http://127.0.0.1:5678/d/电影/韩国/韩国电影（国语配音）/奶奶强盗团.Twilight.Gangsters.2010.HDTV.1080p.x265.3Audios.mkv",
+                "奶奶强盗团 Twilight Gangsters",
+                Some(2010),
+            ),
+            (
+                "音乐/演唱会/{tmdb-360580}/邓紫棋2013世界巡回演唱会.GEM.XXX.Live.2013.BluRay.1080p.mkv#http://127.0.0.1:5678/d/音乐/演唱会/邓紫棋2013世界巡回演唱会.GEM.XXX.Live.2013.BluRay.1080p.mkv",
+                "邓紫棋2013世界巡回演唱会 GEM XXX Live",
+                Some(2013),
+            ),
+        ];
+        for (line, expected_title, expected_year) in collection_cases {
+            let rec = parse_strm_line(line).unwrap();
+            assert_eq!(rec.clean_title, expected_title, "line={}", line);
+            assert_eq!(rec.year, expected_year, "line={}", line);
+        }
+
+        // 2. 独立电影目录（即使无年份且文件名只有版本号如 4K.帧琦映画），必须保留目录片名
+        let movie_keep_parent = [
+            (
+                "电影/香港/扎职2/{tmdb-993100}/4K.帧琦映画（粤语）.mp4#http://127.0.0.1:5678/d/电影/香港/扎职2/4K.帧琦映画（粤语）.mp4",
+                "扎职2",
+                None,
+            ),
+            (
+                "电影/中国/斗爱/{tmdb-109080}/斗爱.ts#http://127.0.0.1:5678/d/电影/中国/斗爱/斗爱.ts",
+                "斗爱",
+                None,
+            ),
+            (
+                "电影/中国/女军医 (1978)/{tmdb-151024}/女军医.mp4#http://127.0.0.1:5678/d/电影/中国/女军医 (1978)/女军医.mp4",
+                "女军医",
+                Some(1978),
+            ),
+        ];
+        for (line, expected_title, expected_year) in movie_keep_parent {
+            let rec = parse_strm_line(line).unwrap();
+            assert_eq!(rec.clean_title, expected_title, "line={}", line);
+            assert_eq!(rec.year, expected_year, "line={}", line);
+        }
+
+        // 3. 剧集/动漫/纪录片（常见纯集号文件名如 S01E01.mp4 / E01.mkv / 01.avi / 01 4K.mp4）-> 必须保留上级剧名
+        let tv_keep_parent = [
+            (
+                "电视剧/中国/2020s/传闻中的陈芊芊 (2020)/{tmdb-103635}/S01E01 - 2160p.WEB-DL.AAC.H.264.mp4#http://127.0.0.1:5678/d/电视剧/中国/2020s/传闻中的陈芊芊 (2020)/S01E01 - 2160p.WEB-DL.AAC.H.264.mp4",
+                "传闻中的陈芊芊",
+                Some(2020),
+            ),
+            (
+                "电视剧/港台/TVB/冲上云霄 (2003)/{tmdb-6154}/E01.mkv#http://127.0.0.1:5678/d/电视剧/港台/TVB/冲上云霄 (2003)/E01.mkv",
+                "冲上云霄",
+                Some(2003),
+            ),
+            (
+                "电视剧/国产剧/装腔启示录 (2023)/{tmdb-232828}/01 4K.mp4#http://127.0.0.1:5678/d/电视剧/国产剧/装腔启示录 (2023)/01 4K.mp4",
+                "装腔启示录",
+                Some(2023),
+            ),
+            (
+                "电视剧/日本/官僚们的夏天 (2009)/{tmdb-81867}/01.avi#http://127.0.0.1:5678/d/电视剧/日本/官僚们的夏天 (2009)/01.avi",
+                "官僚们的夏天",
+                Some(2009),
+            ),
+            (
+                "纪录片/人物传记/中国近代人物/史良/{tmdb-248382}/01.mp4#http://127.0.0.1:5678/d/纪录片/人物传记/中国近代人物/史良/01.mp4",
+                "史良",
+                None,
+            ),
+        ];
+        for (line, expected_title, expected_year) in tv_keep_parent {
+            let rec = parse_strm_line(line).unwrap();
+            assert_eq!(rec.clean_title, expected_title, "line={}", line);
+            assert_eq!(rec.year, expected_year, "line={}", line);
+        }
+
+        // 4. 剧集 Season X/{tmdb-xxx} 多季目录 -> 跳过 Season X/{tmdb-xxx} 聚合到主剧集目录
+        let season_tmdb_line = "电视剧/英剧/安妮卡 (2021)/Season 2/{tmdb-130273}/Annika.2021.S02E01.1080p.WEB.h264-EDITH.chs.eng.mp4#http://127.0.0.1:5678/d/电视剧/英剧/安妮卡 (2021)/Season 2/Annika.2021.S02E01.1080p.WEB.h264-EDITH.chs.eng.mp4";
+        let rec_season = parse_strm_line(season_tmdb_line).unwrap();
+        assert_eq!(rec_season.root_dir, "电视剧/英剧/安妮卡 (2021)");
+        assert_eq!(rec_season.clean_title, "安妮卡");
+        assert_eq!(rec_season.year, Some(2021));
+        assert_eq!(rec_season.season_number, 2);
+        assert_eq!(rec_season.episode_number, 1);
+
+        // 5. 刮削自愈辅助函数 resolve_pure_tmdb_folder_title_year 校验
+        assert_eq!(
+            resolve_pure_tmdb_folder_title_year(
+                "电视剧/中国/2020s/传闻中的陈芊芊 (2020)/{tmdb-103635}",
+                true,
+                &["S01E01 - 2160p.WEB-DL.AAC.H.264.mp4".to_string()]
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_pure_tmdb_folder_title_year(
+                "电影/香港/扎职2/{tmdb-993100}",
+                false,
+                &["4K.帧琦映画（粤语）.mp4".to_string()]
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_pure_tmdb_folder_title_year(
+                "电影/中国/电影人生/{tmdb-12345}",
+                false,
+                &["4K.mp4".to_string()]
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_pure_tmdb_folder_title_year(
+                "电视剧/英剧/安妮卡 (2021)/Season 2/{tmdb-130273}",
+                true,
+                &["Annika.2021.S02E01.mp4".to_string()]
+            ),
+            Some(("安妮卡".to_string(), Some(2021)))
+        );
+        assert_eq!(
+            resolve_pure_tmdb_folder_title_year(
+                "电影/人人影视电影合集/{tmdb-54093}",
+                false,
+                &["CD1.mkv".to_string(), "Killing.Bono.2011.杀死波诺.mkv".to_string()]
+            ),
+            Some(("Killing Bono".to_string(), Some(2011)))
+        );
     }
 }
