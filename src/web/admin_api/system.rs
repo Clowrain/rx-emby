@@ -79,7 +79,46 @@ pub(super) async fn update_configs(
 }
 
 pub(super) async fn trigger_sync(State(state): State<Arc<AppState>>) -> Json<Value> {
+    if state
+        .sync_ctrl
+        .is_syncing
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Json(json!({
+            "status": "already_running",
+            "message": "同步任务已在运行中，正在展示实时进度"
+        }));
+    }
+
+    *state.sync_ctrl.progress.write().await = Some(crate::state::SyncProgress {
+        log_id: None,
+        stage: "starting".to_string(),
+        step: 1,
+        total_steps: 5,
+        percent: 5,
+        message: "正在初始化同步任务…".to_string(),
+        scanned_lines: 0,
+        valid_records: 0,
+        started_at: chrono::Utc::now(),
+    });
     state.sync_ctrl.manual_trigger.notify_one();
+
+    // 短暂等待后台任务写入 running 日志行，确保前端立即查询即可看到对应批次
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        if state
+            .sync_ctrl
+            .progress
+            .read()
+            .await
+            .as_ref()
+            .and_then(|p| p.log_id)
+            .is_some()
+        {
+            break;
+        }
+    }
+
     Json(json!({ "status": "triggered", "message": "已启动后台媒体库同步任务" }))
 }
 
@@ -140,7 +179,12 @@ pub(super) async fn list_sync_logs(
         val
     };
 
-    Ok(Json(json!({ "logs": logs, "metadata": metadata })))
+    let active_progress = state.sync_ctrl.progress.read().await.clone();
+    Ok(Json(json!({
+        "logs": logs,
+        "metadata": metadata,
+        "active_progress": active_progress
+    })))
 }
 
 pub(super) async fn image_cache_stats(

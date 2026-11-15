@@ -51,10 +51,24 @@ impl Default for AlistAuthManager {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SyncProgress {
+    pub log_id: Option<i64>,
+    pub stage: String,
+    pub step: u8,
+    pub total_steps: u8,
+    pub percent: u8,
+    pub message: String,
+    pub scanned_lines: i32,
+    pub valid_records: i32,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub struct SyncControl {
     pub is_syncing: AtomicBool,
     pub last_file_hash: RwLock<Option<u64>>,
     pub last_sync_time: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+    pub progress: RwLock<Option<SyncProgress>>,
     pub manual_trigger: Notify,
 }
 
@@ -64,6 +78,7 @@ impl Default for SyncControl {
             is_syncing: AtomicBool::new(false),
             last_file_hash: RwLock::new(None),
             last_sync_time: RwLock::new(None),
+            progress: RwLock::new(None),
             manual_trigger: Notify::new(),
         }
     }

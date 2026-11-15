@@ -73,8 +73,33 @@ pub async fn run_sync_once(state: &AppState, force: bool) -> Result<()> {
     }
 
     let res = execute_sync_pipeline(state, force).await;
+    *state.sync_ctrl.progress.write().await = None;
     state.sync_ctrl.is_syncing.store(false, Ordering::SeqCst);
     res
+}
+
+async fn set_sync_progress(
+    state: &AppState,
+    log_id: i64,
+    started_at: chrono::DateTime<chrono::Utc>,
+    stage: &str,
+    step: u8,
+    percent: u8,
+    message: impl Into<String>,
+    scanned_lines: i32,
+    valid_records: i32,
+) {
+    *state.sync_ctrl.progress.write().await = Some(crate::state::SyncProgress {
+        log_id: Some(log_id),
+        stage: stage.to_string(),
+        step,
+        total_steps: 5,
+        percent: percent.min(100),
+        message: message.into(),
+        scanned_lines,
+        valid_records,
+        started_at,
+    });
 }
 
 async fn load_persisted_cursor(state: &AppState, key: &str) -> Option<String> {
@@ -243,21 +268,45 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         }
     }
 
+    let log_id: i64 = sqlx::query_scalar(
+        "INSERT INTO sync_logs (started_at, status) VALUES ($1, 'running') RETURNING id",
+    )
+    .bind(started_at)
+    .fetch_one(&state.db)
+    .await?;
+
+    set_sync_progress(
+        state,
+        log_id,
+        started_at,
+        "downloading",
+        1,
+        10,
+        "正在下载/读取索引源…",
+        0,
+        0,
+    )
+    .await;
+
     let fetched = match fetch_source_bytes(state, &source, persisted_etag.as_deref(), force).await {
         Ok(FetchedSource::NotModified) => {
             info!("远程索引源 ETag 未变更 (304 Not Modified)，跳过本次同步");
+            let _ = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
+                .bind(log_id)
+                .execute(&state.db)
+                .await;
             return Ok(());
         }
         Ok(FetchedSource::Bytes { data, etag }) => (data, etag),
         Err(e) => {
             let err_msg = format!("{:#}", e);
             let _ = sqlx::query(
-                "INSERT INTO sync_logs (started_at, finished_at, duration_ms, status, error_message) VALUES ($1, $2, $3, 'failed', $4)",
+                "UPDATE sync_logs SET finished_at = $1, duration_ms = $2, status = 'failed', error_message = $3 WHERE id = $4",
             )
-            .bind(started_at)
             .bind(Utc::now())
             .bind(start_instant.elapsed().as_millis() as i64)
             .bind(&err_msg)
+            .bind(log_id)
             .execute(&state.db)
             .await;
             return Err(e);
@@ -271,23 +320,45 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         if let Some(ref etag) = new_etag {
             save_persisted_cursor(state, "sync.last_etag", etag, "最近一次同步远程索引 ETag").await;
         }
+        let _ = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
+            .bind(log_id)
+            .execute(&state.db)
+            .await;
         return Ok(());
     }
 
-    let log_id: i64 = sqlx::query_scalar(
-        "INSERT INTO sync_logs (started_at, status) VALUES ($1, 'running') RETURNING id",
-    )
-    .bind(started_at)
-    .fetch_one(&state.db)
-    .await?;
-
     let pipeline_res: Result<(i32, i32, i32, i32, Vec<i64>)> = async {
         let txt_bytes = if is_zip_payload(&source, &raw_bytes) {
+            set_sync_progress(
+                state,
+                log_id,
+                started_at,
+                "extracting",
+                2,
+                25,
+                "正在解压 .zip 压缩索引…",
+                0,
+                0,
+            )
+            .await;
             info!("检测到 .zip 压缩索引源，正在内存中解压...");
             extract_txt_from_zip(raw_bytes).await?
         } else {
             raw_bytes
         };
+
+        set_sync_progress(
+            state,
+            log_id,
+            started_at,
+            "parsing",
+            3,
+            35,
+            "正在逐行解析索引内容…",
+            0,
+            0,
+        )
+        .await;
 
         let mut lines = tokio::io::BufReader::new(txt_bytes.as_slice()).lines();
         let mut total_lines = 0_i32;
@@ -313,6 +384,22 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
                 }
                 parsed_records.push(rec);
             }
+
+            if total_lines % 20_000 == 0 {
+                let pct = (35 + ((total_lines / 20_000).min(25) as u8)).min(60);
+                set_sync_progress(
+                    state,
+                    log_id,
+                    started_at,
+                    "parsing",
+                    3,
+                    pct,
+                    format!("正在解析索引行（已扫描 {} 行，命中 {} 条视频）…", total_lines, parsed_records.len()),
+                    total_lines,
+                    parsed_records.len() as i32,
+                )
+                .await;
+            }
         }
 
         info!(
@@ -321,7 +408,34 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             parsed_records.len()
         );
 
+        set_sync_progress(
+            state,
+            log_id,
+            started_at,
+            "deduplicating",
+            4,
+            68,
+            format!("正在对 {} 条视频源择优去重…", parsed_records.len()),
+            total_lines,
+            parsed_records.len() as i32,
+        )
+        .await;
+
         let deduped = deduplicate_records(parsed_records);
+
+        set_sync_progress(
+            state,
+            log_id,
+            started_at,
+            "writing_db",
+            5,
+            82,
+            format!("正在增量比对并写入数据库（去重后 {} 条）…", deduped.len()),
+            total_lines,
+            deduped.len() as i32,
+        )
+        .await;
+
         let stats = apply_sync_diff(&state.db, deduped, total_lines, batch_size, force).await?;
 
         *state.sync_ctrl.last_file_hash.write().await = Some(file_hash);
