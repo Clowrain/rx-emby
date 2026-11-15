@@ -189,7 +189,9 @@ function isBooleanConfig(c) {
 }
 
 async function loadConfigs() {
-  loading.value = true
+  if (configs.value.length === 0) {
+    loading.value = true
+  }
   try {
     const data = await adminApi.listConfigs()
     configs.value = data.configs || []

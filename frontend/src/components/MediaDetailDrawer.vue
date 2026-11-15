@@ -112,29 +112,67 @@
               <div
                 v-for="d in siblingDirs"
                 :key="d.id"
-                class="flex flex-wrap items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2 text-xs tabular-nums"
+                class="flex flex-wrap items-center justify-between gap-2 rounded-xl px-3.5 py-2 text-xs tabular-nums transition-colors duration-200 border"
+                :class="
+                  selectedFolderId === d.id
+                    ? 'bg-sky-950/35 border-sky-400/70 ring-1 ring-sky-400/50'
+                    : lastEditedFolderId === d.id
+                    ? 'bg-emerald-950/30 border-emerald-500/60 ring-1 ring-emerald-500/40'
+                    : 'bg-slate-950/70 border-slate-800'
+                "
               >
-                <div class="truncate flex-1 min-w-0 pr-2">
-                  <span class="text-slate-500 mr-2 font-mono">#{{ d.id }}</span>
-                  <span class="font-mono text-slate-200">{{ d.folder_path }}</span>
+                <div class="truncate flex-1 min-w-0 pr-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    @click="toggleFolderHighlight(d.id)"
+                    :title="selectedFolderId === d.id ? '点击取消定位高亮' : '点击在下方视频源明细中定位该目录'"
+                    class="cursor-pointer shrink-0 px-2 py-0.5 rounded-md font-mono text-[11px] font-semibold border transition-colors"
+                    :class="
+                      selectedFolderId === d.id || lastEditedFolderId === d.id
+                        ? 'bg-sky-500/20 text-sky-300 border-sky-400/40'
+                        : 'bg-slate-800 text-slate-300 border-slate-700 hover:border-slate-500'
+                    "
+                  >
+                    目录 #{{ d.id }}
+                  </button>
+                  <span class="font-mono text-slate-200 truncate" :title="d.folder_path">{{ d.folder_path }}</span>
+                  <span
+                    v-if="lastEditedFolderId === d.id"
+                    class="shrink-0 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-medium"
+                  >
+                    已调整
+                  </span>
                 </div>
                 <div class="flex items-center gap-2 shrink-0">
                   <div class="flex items-center gap-1 bg-slate-900 border border-slate-700/80 rounded-lg px-2 py-0.5">
                     <span class="text-[11px] text-slate-400">目录加权</span>
                     <button
                       type="button"
+                      :disabled="busyFolderId === d.id"
                       @click="adjustFolderPriority(d, (d.priority_boost || 0) - 20)"
-                      class="cursor-pointer px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                      class="cursor-pointer disabled:opacity-50 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] transition-colors"
                     >
                       -20
                     </button>
-                    <span class="font-mono text-emerald-300 w-10 text-center">{{ d.priority_boost || 0 }}</span>
+                    <span class="font-mono text-emerald-300 w-11 text-center font-semibold">
+                      {{ (d.priority_boost || 0) > 0 ? `+${d.priority_boost}` : (d.priority_boost || 0) }}
+                    </span>
                     <button
                       type="button"
+                      :disabled="busyFolderId === d.id"
                       @click="adjustFolderPriority(d, (d.priority_boost || 0) + 20)"
-                      class="cursor-pointer px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                      class="cursor-pointer disabled:opacity-50 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] transition-colors"
                     >
                       +20
+                    </button>
+                    <button
+                      v-if="d.priority_boost"
+                      type="button"
+                      :disabled="busyFolderId === d.id"
+                      @click="adjustFolderPriority(d, 0)"
+                      class="cursor-pointer disabled:opacity-50 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 text-[10px] transition-colors"
+                    >
+                      归零
                     </button>
                   </div>
                   <span class="px-2 py-0.5 rounded-md bg-slate-800 text-emerald-400 font-mono">
@@ -204,12 +242,38 @@
               </div>
               <div class="space-y-2">
                 <div
-                  v-for="src in grp.list"
+                  v-for="(src, srcIdx) in grp.list"
                   :key="src.id"
-                  class="bg-slate-950/80 border border-slate-800/80 rounded-xl p-3 space-y-1.5 text-xs tabular-nums"
+                  class="rounded-xl p-3 space-y-1.5 text-xs tabular-nums transition-colors duration-200 border"
+                  :class="
+                    lastEditedFileId === src.id
+                      ? 'bg-emerald-950/25 border-emerald-500/60 ring-1 ring-emerald-500/40'
+                      : activeFolderHighlightId === src.folder_id
+                      ? 'bg-sky-950/25 border-sky-400/60 ring-1 ring-sky-400/35'
+                      : 'bg-slate-950/80 border-slate-800/80'
+                  "
                 >
                   <div class="flex items-center justify-between gap-2">
                     <div class="flex items-center gap-2 flex-wrap">
+                      <span
+                        v-if="srcIdx === 0"
+                        class="px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-400/30 text-[10px] font-semibold"
+                      >
+                        默认首播
+                      </span>
+                      <button
+                        type="button"
+                        @click="toggleFolderHighlight(src.folder_id)"
+                        :title="folderPathById[src.folder_id] || `目录 #${src.folder_id}`"
+                        class="cursor-pointer px-1.5 py-0.5 rounded font-mono text-[10px] border transition-colors"
+                        :class="
+                          activeFolderHighlightId === src.folder_id
+                            ? 'bg-sky-500/25 text-sky-200 border-sky-400/50 font-semibold'
+                            : 'bg-slate-800/90 text-slate-300 border-slate-700 hover:border-slate-500'
+                        "
+                      >
+                        目录 #{{ src.folder_id }}
+                      </button>
                       <span class="px-2 py-0.5 rounded-md bg-emerald-950 text-emerald-300 border border-emerald-500/30 font-medium">
                         {{ src.version_tag }}
                       </span>
@@ -218,20 +282,25 @@
                       </span>
                       <span class="text-slate-400 text-[11px] font-mono">
                         有效权重: <strong class="text-emerald-300">{{ src.effective_priority }}</strong>
+                        <span v-if="src.folder_priority_boost" class="text-sky-300 ml-1">
+                          (目录 {{ src.folder_priority_boost > 0 ? `+${src.folder_priority_boost}` : src.folder_priority_boost }})
+                        </span>
                         <span v-if="src.priority_override !== null && src.priority_override !== undefined" class="text-amber-300 ml-1">(已锁定 {{ src.priority_override }})</span>
                       </span>
                       <button
                         type="button"
+                        :disabled="busyFileId === src.id"
                         @click="setFilePriority(src, (src.effective_priority || 0) + 100)"
-                        class="cursor-pointer px-1.5 py-0.5 rounded bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 border border-indigo-500/30 text-[10px]"
+                        class="cursor-pointer disabled:opacity-50 px-1.5 py-0.5 rounded bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 border border-indigo-500/30 text-[10px]"
                       >
                         置顶(+100)
                       </button>
                       <button
                         v-if="src.priority_override !== null && src.priority_override !== undefined"
                         type="button"
+                        :disabled="busyFileId === src.id"
                         @click="setFilePriority(src, null)"
-                        class="cursor-pointer px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
+                        class="cursor-pointer disabled:opacity-50 px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
                       >
                         恢复默认
                       </button>
@@ -279,6 +348,25 @@ const prewarming = ref(false)
 const media = ref(null)
 const siblingDirs = ref([])
 const episodes = ref([])
+const busyFolderId = ref(null)
+const busyFileId = ref(null)
+const lastEditedFolderId = ref(null)
+const lastEditedFileId = ref(null)
+const selectedFolderId = ref(null)
+
+const activeFolderHighlightId = computed(() => selectedFolderId.value ?? lastEditedFolderId.value)
+
+const folderPathById = computed(() => {
+  const map = {}
+  for (const d of siblingDirs.value) {
+    map[d.id] = d.folder_path
+  }
+  return map
+})
+
+function toggleFolderHighlight(folderId) {
+  selectedFolderId.value = selectedFolderId.value === folderId ? null : folderId
+}
 
 const groupedEpisodes = computed(() => {
   if (!media.value) return []
@@ -305,9 +393,11 @@ function formatFileSize(bytes) {
   return `${(bytes / 1048576).toFixed(1)} MB`
 }
 
-async function fetchDetail(id) {
+async function fetchDetail(id, { silent = false } = {}) {
   if (!id) return
-  loading.value = true
+  if (!silent && (!media.value || media.value.id !== id)) {
+    loading.value = true
+  }
   try {
     const data = await adminApi.getMediaDetail(id)
     media.value = data.media
@@ -321,22 +411,35 @@ async function fetchDetail(id) {
 }
 
 async function adjustFolderPriority(folder, nextVal) {
+  if (busyFolderId.value === folder.id) return
+  const prevBoost = folder.priority_boost || 0
+  busyFolderId.value = folder.id
+  lastEditedFolderId.value = folder.id
+  folder.priority_boost = nextVal
   try {
     const res = await adminApi.updateFolderPriority(folder.id, nextVal)
     toast.success(res.message)
-    if (props.mediaId) await fetchDetail(props.mediaId)
+    if (props.mediaId) await fetchDetail(props.mediaId, { silent: true })
   } catch (err) {
+    folder.priority_boost = prevBoost
     toast.error('调整目录权重失败：' + err.message)
+  } finally {
+    busyFolderId.value = null
   }
 }
 
 async function setFilePriority(file, overrideVal) {
+  if (busyFileId.value === file.id) return
+  busyFileId.value = file.id
+  lastEditedFileId.value = file.id
   try {
     const res = await adminApi.updateFilePriority(file.id, overrideVal)
     toast.success(res.message)
-    if (props.mediaId) await fetchDetail(props.mediaId)
+    if (props.mediaId) await fetchDetail(props.mediaId, { silent: true })
   } catch (err) {
     toast.error('调整文件权重失败：' + err.message)
+  } finally {
+    busyFileId.value = null
   }
 }
 
@@ -348,7 +451,7 @@ async function handlePrewarmDirs() {
     toast.info(res.message)
     setTimeout(async () => {
       prewarming.value = false
-      if (props.mediaId) await fetchDetail(props.mediaId)
+      if (props.mediaId) await fetchDetail(props.mediaId, { silent: true })
     }, 1500)
   } catch (err) {
     prewarming.value = false
@@ -359,6 +462,9 @@ async function handlePrewarmDirs() {
 watch(
   () => props.mediaId,
   newId => {
+    lastEditedFolderId.value = null
+    lastEditedFileId.value = null
+    selectedFolderId.value = null
     if (newId) {
       fetchDetail(newId)
     } else {

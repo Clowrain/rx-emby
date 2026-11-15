@@ -201,7 +201,7 @@ pub(super) async fn get_admin_media_detail(
                (SELECT COUNT(*) FROM sync_files sf WHERE sf.folder_id = f.id) AS file_count
         FROM sync_folders f
         WHERE f.work_id = $1
-        ORDER BY f.is_ignored ASC, f.priority_boost DESC, f.id ASC
+        ORDER BY f.is_ignored ASC, f.id ASC
         "#,
     )
     .bind(work_id)

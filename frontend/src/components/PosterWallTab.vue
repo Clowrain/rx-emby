@@ -126,8 +126,12 @@ function toggleSortOrder() {
   resetAndLoad()
 }
 
-async function loadData() {
-  loading.value = true
+async function loadData({ silent = false } = {}) {
+  const hasExisting =
+    filters.viewMode === 'works' ? items.value.length > 0 : stagingFolders.value.length > 0
+  if (!silent && !hasExisting) {
+    loading.value = true
+  }
   try {
     if (filters.viewMode === 'works') {
       const params = {
@@ -187,7 +191,7 @@ async function handleScrapeWork(item) {
   try {
     await adminApi.scrapeOne(item.id)
     toast.success(`《${displayTitle(item)}》分集元数据刷新成功`)
-    await loadData()
+    await loadData({ silent: true })
   } catch (err) {
     toast.error('刷新失败：' + err.message)
   } finally {
@@ -199,7 +203,7 @@ async function handleToggleIgnoreWork(item) {
   try {
     const res = await adminApi.toggleIgnore(item.id, true)
     toast.info(res.message)
-    await loadData()
+    await loadData({ silent: true })
   } catch (err) {
     toast.error('操作失败：' + err.message)
   }
@@ -214,7 +218,7 @@ async function handleScrapeStagingFolder(folder) {
     } else {
       toast.warn(res.message)
     }
-    await loadData()
+    await loadData({ silent: true })
   } catch (err) {
     toast.error('刮削失败：' + err.message)
   } finally {
@@ -230,7 +234,7 @@ async function handlePublishWithoutTmdb(folder) {
       media_type: folder.media_type
     })
     toast.success(res.message)
-    await loadData()
+    await loadData({ silent: true })
   } catch (err) {
     toast.error('发布失败：' + err.message)
   } finally {
@@ -242,7 +246,7 @@ async function handleToggleIgnoreStaging(folder) {
   try {
     const res = await adminApi.toggleIgnoreStagingFolder(folder.id, !folder.is_ignored)
     toast.info(res.message)
-    await loadData()
+    await loadData({ silent: true })
   } catch (err) {
     toast.error('操作失败：' + err.message)
   }
@@ -263,7 +267,7 @@ async function handleRetryFailed() {
   try {
     const data = await adminApi.retryFailedScrapes()
     toast.success(data.message)
-    await loadData()
+    await loadData({ silent: true })
   } catch (err) {
     toast.error('重置失败：' + err.message)
   }
@@ -304,7 +308,7 @@ async function submitBindTmdb() {
         : await adminApi.bindTmdb(bindModal.targetId, payload)
     toast.success(res.message)
     bindModal.visible = false
-    await loadData()
+    await loadData({ silent: true })
   } catch (err) {
     toast.error('绑定失败：' + err.message)
   } finally {

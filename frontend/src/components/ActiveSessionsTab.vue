@@ -78,7 +78,9 @@ const loading = ref(false)
 const activeSessions = ref([])
 
 async function loadSessions() {
-  loading.value = true
+  if (activeSessions.value.length === 0) {
+    loading.value = true
+  }
   try {
     const data = await adminApi.listUsersAndSessions()
     activeSessions.value = data.active_sessions || []
