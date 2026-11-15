@@ -127,9 +127,12 @@ pub(super) async fn get_user_allowed_categories(state: &AppState, user_id: &str)
 }
 
 
-/// 统计某个虚拟媒体库规则当前在库内命中的影视条目数（同 TMDB 自动去重）
+/// 统计某个虚拟媒体库规则当前在库内命中的影视作品数
 pub async fn count_virtual_library_matches(state: &AppState, rule: &VirtualLibraryRule) -> Result<i64, sqlx::Error> {
-    let sql = format!("SELECT COUNT(DISTINCT COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text)) FROM media_items m WHERE NOT m.is_ignored AND $1::jsonb IS NOT NULL AND {}",rule.sql_predicate("$1::jsonb"));
+    let sql = format!(
+        "SELECT COUNT(*) FROM media_works m WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE) AND $1::jsonb IS NOT NULL AND {}",
+        rule.sql_predicate("$1::jsonb")
+    );
     sqlx::query_scalar(&sql)
         .bind(serde_json::to_value(rule).expect("已校验的规则"))
         .fetch_one(&state.db).await

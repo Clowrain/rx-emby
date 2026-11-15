@@ -79,19 +79,18 @@ async fn set_item_favorite_state(
     is_fav: bool,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let user_id = resolve_valid_user_id(state, Some(path_user_id), headers).await?;
-    if let Some((mid, tmdb_id, mtype, _, _)) = resolve_item_target(state, item_id).await {
+    if let Some((wid, tmdb_id, mtype, _, _)) = resolve_item_target(state, item_id).await {
         if is_fav {
-            // 先尝试更新已有同 tmdb_id 或 media_item_id 的收藏记录，避免重复插入
             let updated = sqlx::query(
                 r#"
                 UPDATE user_favorites
-                SET media_item_id = $2, tmdb_id = COALESCE($3, tmdb_id)
+                SET work_id = $2, tmdb_id = COALESCE($3, tmdb_id)
                 WHERE user_id = $1
-                  AND (($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4) OR media_item_id = $2)
+                  AND (($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4) OR work_id = $2)
                 "#,
             )
             .bind(&user_id)
-            .bind(mid)
+            .bind(wid)
             .bind(tmdb_id)
             .bind(&mtype)
             .execute(&state.db)
@@ -101,10 +100,10 @@ async fn set_item_favorite_state(
 
             if updated == 0 {
                 let _ = sqlx::query(
-                    "INSERT INTO user_favorites (user_id, media_item_id, tmdb_id, media_type) VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO user_favorites (user_id, work_id, tmdb_id, media_type) VALUES ($1, $2, $3, $4)",
                 )
                 .bind(&user_id)
-                .bind(mid)
+                .bind(wid)
                 .bind(tmdb_id)
                 .bind(&mtype)
                 .execute(&state.db)
@@ -115,11 +114,11 @@ async fn set_item_favorite_state(
                 r#"
                 DELETE FROM user_favorites
                 WHERE user_id = $1
-                  AND (($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4) OR media_item_id = $2)
+                  AND (($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4) OR work_id = $2)
                 "#,
             )
             .bind(&user_id)
-            .bind(mid)
+            .bind(wid)
             .bind(tmdb_id)
             .bind(&mtype)
             .execute(&state.db)
@@ -166,14 +165,14 @@ pub(super) async fn session_playing(
     };
 
     let ep_id = raw_item_id
-        .strip_prefix("ep_")
-        .or_else(|| raw_item_id.strip_prefix("src_"))
+        .strip_prefix("src_")
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| {
             raw_item_id
-                .strip_prefix("media_")
+                .strip_prefix("work_")
+                .or_else(|| raw_item_id.strip_prefix("media_"))
                 .and_then(|s| s.parse::<i64>().ok())
-                .map(|mid| -mid)
+                .map(|wid| -wid)
         });
     let sid = body
         .play_session_id
@@ -244,14 +243,14 @@ pub(super) async fn session_progress(
     };
 
     let ep_id = raw_item_id
-        .strip_prefix("ep_")
-        .or_else(|| raw_item_id.strip_prefix("src_"))
+        .strip_prefix("src_")
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| {
             raw_item_id
-                .strip_prefix("media_")
+                .strip_prefix("work_")
+                .or_else(|| raw_item_id.strip_prefix("media_"))
                 .and_then(|s| s.parse::<i64>().ok())
-                .map(|mid| -mid)
+                .map(|wid| -wid)
         });
     let sid = body
         .play_session_id
@@ -322,50 +321,46 @@ pub(super) async fn session_progress(
     }
 
     if should_prewarm_next {
-        if let Some(eid) = ep_id {
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                let cur: Option<(i64, i32, i32)> = sqlx::query_as(
-                    "SELECT media_item_id, season_number, episode_number FROM episodes WHERE id = $1",
-                )
-                .bind(eid)
-                .fetch_optional(&state_clone.db)
-                .await
-                .unwrap_or(None);
-
-                if let Some((mid, snum, epnum)) = cur {
-                    let sibling_ids = state_clone.resolve_sibling_media_ids(mid).await;
+        let state_clone = state.clone();
+        let raw_item_clone = raw_item_id.clone();
+        tokio::spawn(async move {
+            if let Some((wid, _, mtype, snum, epnum)) =
+                resolve_item_target(&state_clone, &raw_item_clone).await
+            {
+                if mtype == "tv" {
                     let next_ep: Option<(i64, String, i64)> = sqlx::query_as(
                         r#"
-                        SELECT id, alist_path, path_hash
-                        FROM episodes
-                        WHERE media_item_id = ANY($1) AND season_number = $2 AND episode_number = $3
-                        ORDER BY priority_score DESC, id ASC
+                        SELECT sf.id, sf.alist_path, sf.path_hash
+                        FROM sync_files sf
+                        JOIN sync_folders f ON f.id = sf.folder_id
+                        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+                          AND sf.season_number = $2 AND sf.episode_number = $3
+                        ORDER BY COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
                         LIMIT 1
                         "#,
                     )
-                    .bind(&sibling_ids)
+                    .bind(wid)
                     .bind(snum)
                     .bind(epnum + 1)
                     .fetch_optional(&state_clone.db)
                     .await
                     .unwrap_or(None);
 
-                    if let Some((next_id, next_path, next_hash)) = next_ep {
+                    if let Some((next_src_id, next_path, next_hash)) = next_ep {
                         tracing::info!(
-                            "⏭️ [NextEpPrewarm] 当前集 ep_{} 进度已达 85%+，后台提前预热下一集 S{:02}E{:02} (ep_{})",
-                            eid,
+                            "⏭️ [NextEpPrewarm] 当前集 {} 进度已达 85%+，后台提前预热下一集 S{:02}E{:02} (src_{})",
+                            raw_item_clone,
                             snum,
                             epnum + 1,
-                            next_id
+                            next_src_id
                         );
                         let _ = state_clone
                             .resolve_playback_url(next_hash, &next_path, &client_ua)
                             .await;
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     StatusCode::NO_CONTENT
@@ -429,52 +424,68 @@ pub(super) async fn session_stopped(
 }
 
 
-/// 将 `media_123` 或 `ep_456` 解析为 `(media_item_id, tmdb_id, media_type, season_number, episode_number)`
+/// 将 `work_123` / `ep_123_1_2` / `src_456` 解析为 `(work_id, tmdb_id, media_type, season_number, episode_number)`
 async fn resolve_item_target(
     state: &AppState,
     item_id: &str,
 ) -> Option<(i64, Option<i32>, String, i32, i32)> {
-    if let Some(raw_mid) = item_id.strip_prefix("media_") {
-        let mid = raw_mid.parse::<i64>().ok()?;
+    if let Some(raw_wid) = item_id
+        .strip_prefix("work_")
+        .or_else(|| item_id.strip_prefix("media_"))
+    {
+        let wid = raw_wid.parse::<i64>().ok()?;
         let (tmdb_id, mtype): (Option<i32>, String) =
-            sqlx::query_as("SELECT tmdb_id, media_type FROM media_items WHERE id = $1")
-                .bind(mid)
+            sqlx::query_as("SELECT tmdb_id, media_type FROM media_works WHERE id = $1")
+                .bind(wid)
                 .fetch_optional(&state.db)
                 .await
                 .ok()??;
-        return Some((mid, tmdb_id, mtype, 0, 1));
+        return Some((wid, tmdb_id, mtype, 0, 1));
     }
 
-    let eid = item_id
-        .strip_prefix("ep_")
-        .or_else(|| item_id.strip_prefix("src_"))
+    if let Some(rest) = item_id.strip_prefix("ep_") {
+        let mut parts = rest.rsplitn(3, '_');
+        let epnum = parts.next()?.parse::<i32>().ok()?;
+        let snum = parts.next()?.parse::<i32>().ok()?;
+        let wid = parts.next()?.parse::<i64>().ok()?;
+        let (tmdb_id, mtype): (Option<i32>, String) =
+            sqlx::query_as("SELECT tmdb_id, media_type FROM media_works WHERE id = $1")
+                .bind(wid)
+                .fetch_optional(&state.db)
+                .await
+                .ok()??;
+        return Some((wid, tmdb_id, mtype, snum, epnum));
+    }
+
+    let sid = item_id
+        .strip_prefix("src_")
         .unwrap_or(item_id)
         .parse::<i64>()
         .ok()?;
 
-    let (mid, snum, epnum): (i64, i32, i32) = sqlx::query_as(
-        "SELECT media_item_id, season_number, episode_number FROM episodes WHERE id = $1",
+    let (wid, snum, epnum): (i64, i32, i32) = sqlx::query_as(
+        "SELECT f.work_id, sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.id = $1 AND f.work_id IS NOT NULL",
     )
-    .bind(eid)
+    .bind(sid)
     .fetch_optional(&state.db)
     .await
     .ok()??;
 
     let (tmdb_id, mtype): (Option<i32>, String) =
-        sqlx::query_as("SELECT tmdb_id, media_type FROM media_items WHERE id = $1")
-            .bind(mid)
+        sqlx::query_as("SELECT tmdb_id, media_type FROM media_works WHERE id = $1")
+            .bind(wid)
             .fetch_optional(&state.db)
             .await
             .ok()??;
 
-    Some((mid, tmdb_id, mtype, snum, epnum))
+    Some((wid, tmdb_id, mtype, snum, epnum))
 }
 
-/// 写入或更新播放进度（同时兼容有/无 tmdb_id 的条目，支持目录迁移后按 tmdb_id 自动继承进度）
+/// 写入或更新播放进度（同时兼容有/无 tmdb_id 的条目）
 async fn upsert_play_history(
     state: &AppState,
     user_id: &str,
-    media_item_id: i64,
+    work_id: i64,
     tmdb_id: Option<i32>,
     media_type: &str,
     season_number: i32,
@@ -487,7 +498,7 @@ async fn upsert_play_history(
     let updated = sqlx::query(
         r#"
         UPDATE play_histories
-        SET media_item_id = $2,
+        SET work_id = $2,
             tmdb_id = COALESCE($3, tmdb_id),
             position_ticks = $7,
             duration_ticks = CASE WHEN $8 > 0 THEN $8 ELSE duration_ticks END,
@@ -498,12 +509,12 @@ async fn upsert_play_history(
           AND episode_number = $6
           AND (
               ($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4)
-              OR media_item_id = $2
+              OR work_id = $2
           )
         "#,
     )
     .bind(user_id)
-    .bind(media_item_id)
+    .bind(work_id)
     .bind(tmdb_id)
     .bind(media_type)
     .bind(season_number)
@@ -520,14 +531,14 @@ async fn upsert_play_history(
         sqlx::query(
             r#"
             INSERT INTO play_histories (
-                user_id, media_item_id, tmdb_id, media_type,
+                user_id, work_id, tmdb_id, media_type,
                 season_number, episode_number, position_ticks, duration_ticks, is_played, last_played_at
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
             "#,
         )
         .bind(user_id)
-        .bind(media_item_id)
+        .bind(work_id)
         .bind(tmdb_id)
         .bind(media_type)
         .bind(season_number)
@@ -544,33 +555,33 @@ async fn upsert_play_history(
 
 pub(super) async fn load_user_favorite_keys(state: &AppState, user_id: &str) -> (HashSet<i64>, HashSet<(i32, String)>) {
     let rows: Vec<(Option<i64>, Option<i32>, String)> = sqlx::query_as(
-        "SELECT media_item_id, tmdb_id, media_type FROM user_favorites WHERE user_id = $1",
+        "SELECT work_id, tmdb_id, media_type FROM user_favorites WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
 
-    let mut mids = HashSet::new();
+    let mut wids = HashSet::new();
     let mut tmdbs = HashSet::new();
-    for (mid, tid, mtype) in rows {
-        if let Some(m) = mid {
-            mids.insert(m);
+    for (wid, tid, mtype) in rows {
+        if let Some(w) = wid {
+            wids.insert(w);
         }
         if let Some(t) = tid {
             tmdbs.insert((t, mtype));
         }
     }
-    (mids, tmdbs)
+    (wids, tmdbs)
 }
 
 pub(super) fn is_media_favorited(
     fav_keys: &(HashSet<i64>, HashSet<(i32, String)>),
-    media_id: i64,
+    work_id: i64,
     tmdb_id: Option<i32>,
     media_type: &str,
 ) -> bool {
-    if fav_keys.0.contains(&media_id) {
+    if fav_keys.0.contains(&work_id) {
         return true;
     }
     if let Some(tid) = tmdb_id {
@@ -585,7 +596,7 @@ pub(super) fn is_media_favorited(
 pub(super) async fn load_media_episode_histories(
     state: &AppState,
     user_id: &str,
-    media_id: i64,
+    work_id: i64,
     tmdb_id: Option<i32>,
     media_type: &str,
 ) -> HashMap<(i32, i32), (i64, i64, bool)> {
@@ -596,12 +607,12 @@ pub(super) async fn load_media_episode_histories(
         WHERE user_id = $1
           AND (
               ($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4)
-              OR media_item_id = $2
+              OR work_id = $2
           )
         "#,
     )
     .bind(user_id)
-    .bind(media_id)
+    .bind(work_id)
     .bind(tmdb_id)
     .bind(media_type)
     .fetch_all(&state.db)

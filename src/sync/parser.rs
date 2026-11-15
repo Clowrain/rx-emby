@@ -56,6 +56,8 @@ pub struct ParsedStrmRecord {
     pub version_tag: String,
     /// 多版本排序权重 (4K/DV > 1080p > 未知)
     pub priority_score: i32,
+    /// 左侧逻辑路径是否带有 刮削失败/ 等噪声前缀（用于同 path_hash 去重择优）
+    pub has_noise_prefix: bool,
 }
 
 /// 解析单行 strm.txt 文本，返回 None 表示非视频杂项/样片/非法行需拦截过滤
@@ -111,6 +113,7 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
     let mut left_clean = lossy_url_decode(left_raw)
         .trim_start_matches('/')
         .to_string();
+    let has_noise_prefix = left_clean.starts_with("刮削失败/");
     while NOISE_PREFIX_RE.is_match(&left_clean) {
         left_clean = NOISE_PREFIX_RE.replace(&left_clean, "").to_string();
     }
@@ -124,10 +127,10 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
         return None;
     }
 
-    // 定位季集号（优先看左侧文件名，其次看右侧真实文件名）
+    // 定位季集号（优先看右侧真实文件名，防止上游左侧误标如 S20E19，其次回退左侧文件名）
     let left_file = segments.last().copied().unwrap_or(&file_name);
-    let (mut season_opt, ep_num_opt) = extract_season_episode(left_file)
-        .unwrap_or_else(|| extract_season_episode(&file_name).unwrap_or((None, None)));
+    let (mut season_opt, ep_num_opt) = extract_season_episode(&file_name)
+        .unwrap_or_else(|| extract_season_episode(left_file).unwrap_or((None, None)));
 
     // 若文件名未写明季号（如仅写了 "01.mkv" 或 "E01.mkv"），从父级目录（如 "Season 1" / "Season 0" / "第一季"）回溯季号
     if season_opt.is_none() && segments.len() >= 2 {
@@ -178,6 +181,7 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
         container,
         version_tag,
         priority_score,
+        has_noise_prefix,
     })
 }
 

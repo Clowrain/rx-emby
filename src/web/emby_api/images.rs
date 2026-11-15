@@ -83,20 +83,33 @@ pub(super) async fn get_item_image(
         return serve_embedded_cover(cover_key);
     }
 
-    let (size, raw_file): (&str, Option<String>) = if let Some(raw_eid) = item_id.strip_prefix("ep_") {
-        let eid = raw_eid
-            .parse::<i64>()
-            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的单集 ID".to_string()))?;
+    let (size, raw_file): (&str, Option<String>) = if let Some(rest) = item_id.strip_prefix("ep_") {
+        let mut parts = rest.rsplitn(3, '_');
+        let ep_num = parts
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的单集集号".to_string()))?;
+        let s_num = parts
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的单集季号".to_string()))?;
+        let wid = parts
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的单集所属作品 ID".to_string()))?;
 
         let ep_paths: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             r#"
-            SELECT e.still_path, m.backdrop_path, m.poster_path
-            FROM episodes e
-            JOIN media_items m ON m.id = e.media_item_id
-            WHERE e.id = $1
+            SELECT e.still_path, w.backdrop_path, w.poster_path
+            FROM media_works w
+            LEFT JOIN work_episodes e
+              ON e.work_id = w.id AND e.season_number = $2 AND e.episode_number = $3
+            WHERE w.id = $1
             "#,
         )
-        .bind(eid)
+        .bind(wid)
+        .bind(s_num)
+        .bind(ep_num)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -112,21 +125,15 @@ pub(super) async fn get_item_image(
             .next()
             .and_then(|s| s.parse::<i32>().ok())
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的季 ID".to_string()))?;
-        let mid = parts
+        let wid = parts
             .next()
             .and_then(|s| s.parse::<i64>().ok())
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的季所属剧集 ID".to_string()))?;
 
-        let sibling_ids = state.resolve_sibling_media_ids(mid).await;
         let season_poster: Option<String> = sqlx::query_scalar(
-            r#"
-            SELECT poster_path FROM seasons
-            WHERE media_item_id = ANY($1) AND season_number = $2 AND poster_path IS NOT NULL
-            ORDER BY episode_count DESC, id ASC
-            LIMIT 1
-            "#,
+            "SELECT poster_path FROM work_seasons WHERE work_id = $1 AND season_number = $2 AND poster_path IS NOT NULL",
         )
-        .bind(&sibling_ids)
+        .bind(wid)
         .bind(snum)
         .fetch_optional(&state.db)
         .await
@@ -134,8 +141,8 @@ pub(super) async fn get_item_image(
 
         let final_poster = match season_poster {
             Some(p) => Some(p),
-            None => sqlx::query_scalar("SELECT poster_path FROM media_items WHERE id = $1")
-                .bind(mid)
+            None => sqlx::query_scalar("SELECT poster_path FROM media_works WHERE id = $1")
+                .bind(wid)
                 .fetch_optional(&state.db)
                 .await
                 .unwrap_or(None)
@@ -144,15 +151,18 @@ pub(super) async fn get_item_image(
 
         ("w500", final_poster)
     } else {
-        let raw_mid = item_id.strip_prefix("media_").unwrap_or(&item_id);
-        let mid = raw_mid
+        let raw_wid = item_id
+            .strip_prefix("work_")
+            .or_else(|| item_id.strip_prefix("media_"))
+            .unwrap_or(&item_id);
+        let wid = raw_wid
             .parse::<i64>()
             .map_err(|_| (StatusCode::BAD_REQUEST, "无效的资源 ID".to_string()))?;
 
         let paths: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT poster_path, backdrop_path FROM media_items WHERE id = $1",
+            "SELECT poster_path, backdrop_path FROM media_works WHERE id = $1",
         )
-        .bind(mid)
+        .bind(wid)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -318,20 +328,26 @@ pub(super) async fn fetch_virtual_library_top_media_images(
     rule: &VirtualLibraryRule,
     limit: i64,
 ) -> Vec<(Option<String>, Option<String>)> {
-    sqlx::query_as(&format!(r#"
-        SELECT backdrop_path, poster_path FROM (
-            SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-                m.id, m.rating, m.year, m.backdrop_path, m.poster_path
-            FROM media_items m
-            WHERE NOT m.is_ignored AND (m.backdrop_path IS NOT NULL OR m.poster_path IS NOT NULL)
-                AND $1::jsonb IS NOT NULL AND {}
-            ORDER BY COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
-                m.rating DESC, m.year DESC NULLS LAST, m.id DESC
-        ) deduped ORDER BY rating DESC, year DESC NULLS LAST, id DESC LIMIT $2
-    "#,rule.sql_predicate("$1::jsonb")))
+    sqlx::query_as(&format!(
+        r#"
+        SELECT m.backdrop_path, m.poster_path
+        FROM media_works m
+        WHERE EXISTS (
+            SELECT 1 FROM sync_folders f
+            WHERE f.work_id = m.id AND f.is_ignored = FALSE
+        )
+          AND (m.backdrop_path IS NOT NULL OR m.poster_path IS NOT NULL)
+          AND $1::jsonb IS NOT NULL AND {}
+        ORDER BY m.rating DESC, m.year DESC NULLS LAST, m.id DESC
+        LIMIT $2
+        "#,
+        rule.sql_predicate("$1::jsonb")
+    ))
     .bind(serde_json::to_value(rule).ok())
     .bind(limit)
-    .fetch_all(&state.db).await.unwrap_or_default()
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default()
 }
 
 async fn fetch_virtual_library_auto_image(

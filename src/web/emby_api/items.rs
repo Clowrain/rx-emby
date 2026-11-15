@@ -5,7 +5,7 @@ use super::playback::{
 use super::sessions::{is_media_favorited, load_media_episode_histories, load_user_favorite_keys};
 use super::views::get_user_allowed_categories;
 use crate::smart_views::{can_access_view, VirtualLibraryRule};
-use crate::state::AppState;
+use crate::state::{AppState, ScrapeTask};
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -109,9 +109,9 @@ pub(super) async fn get_user_items(
         }
     }
 
-    // 3. 如果是展开某部电视剧的季或单集列表（ParentId 为 "media_123"）
+    // 3. 如果是展开某部电视剧的季或单集列表（ParentId 为 "work_123" 或兼容旧 "media_123"）
     if let Some(ref pid) = q.parent_id {
-        if let Some(raw_id) = pid.strip_prefix("media_") {
+        if let Some(raw_id) = pid.strip_prefix("work_").or_else(|| pid.strip_prefix("media_")) {
             if let Ok(mid) = raw_id.parse::<i64>() {
                 ensure_media_accessible(&state, &user_id, mid).await?;
                 return get_episodes_for_media(&state, &user_id, mid).await;
@@ -171,19 +171,20 @@ pub(super) async fn get_user_items(
         .filter(|s| !s.is_empty())
         .map(|s| format!("%{}%", s));
 
-    // 解析指定 Ids 批量查询（如 Ids=media_10,media_20）
+    // 解析指定 Ids 批量查询（如 Ids=work_10,work_20）
     let explicit_ids: Option<Vec<i64>> = q.ids.as_deref().map(|raw| {
         raw.split(',')
             .filter_map(|s| {
-                s.trim()
-                    .strip_prefix("media_")
-                    .or(Some(s.trim()))
+                let t = s.trim();
+                t.strip_prefix("work_")
+                    .or_else(|| t.strip_prefix("media_"))
+                    .or(Some(t))
                     .and_then(|v| v.parse::<i64>().ok())
             })
             .collect()
     });
 
-    // 4. 组装排序规则（完整支持逗号分隔多字段 SortBy 与 SortOrder），并在同 (tmdb_id, media_type) 多目录间自动折叠去重
+    // 4. 组装排序规则（完整支持逗号分隔多字段 SortBy 与 SortOrder）
     let sort_key = q
         .sort_by
         .as_deref()
@@ -197,10 +198,12 @@ pub(super) async fn get_user_items(
         r#"
         SELECT id, media_type, tmdb_id, title, original_title, year, premiered_at, overview, rating, poster_path, backdrop_path, created_at
         FROM (
-            SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-                m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.premiered_at, m.overview, m.rating, m.poster_path, m.backdrop_path, m.created_at, m.updated_at, (m.tmdb_metadata->>'popularity')::float8 AS popularity
-            FROM media_items m
-            WHERE m.is_ignored = FALSE
+            SELECT m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.premiered_at, m.overview, m.rating, m.poster_path, m.backdrop_path, m.created_at, m.updated_at, (m.tmdb_metadata->>'popularity')::float8 AS popularity
+            FROM media_works m
+            WHERE EXISTS (
+                SELECT 1 FROM sync_folders f
+                WHERE f.work_id = m.id AND f.is_ignored = FALSE
+            )
               AND ($1::text IS NULL OR m.category = $1)
               AND ($2::text IS NULL OR m.title ILIKE $2 OR m.original_title ILIKE $2)
               AND ($3::text IS NULL OR m.media_type = $3)
@@ -208,26 +211,21 @@ pub(super) async fn get_user_items(
               AND (NOT $5 OR EXISTS (
                   SELECT 1 FROM user_favorites uf
                   WHERE uf.user_id = $6
-                    AND ((uf.tmdb_id IS NOT NULL AND uf.tmdb_id = m.tmdb_id AND uf.media_type = m.media_type) OR uf.media_item_id = m.id)
+                    AND ((uf.tmdb_id IS NOT NULL AND uf.tmdb_id = m.tmdb_id AND uf.media_type = m.media_type) OR uf.work_id = m.id)
               ))
               AND (NOT $7 OR EXISTS (
                   SELECT 1 FROM play_histories ph
                   WHERE ph.user_id = $6 AND ph.is_played = TRUE
-                    AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.media_item_id = m.id)
+                    AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)
               ))
               AND (NOT $8 OR NOT EXISTS (
                   SELECT 1 FROM play_histories ph
                   WHERE ph.user_id = $6 AND ph.is_played = TRUE
-                    AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.media_item_id = m.id)
+                    AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)
               ))
               AND ($11::text[] IS NULL OR m.category = ANY($11))
               AND ($12::jsonb IS NULL OR {view_predicate})
-            ORDER BY
-                COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
-                (m.scrape_status IN (1, 3)) DESC,
-                (m.poster_path IS NOT NULL) DESC,
-                m.id ASC
-        ) AS deduped
+        ) AS m
         ORDER BY {}
         LIMIT $9 OFFSET $10
         "#,
@@ -254,9 +252,12 @@ pub(super) async fn get_user_items(
 
     let total: i64 = sqlx::query_scalar(
         &format!(r#"
-        SELECT COUNT(DISTINCT COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-        FROM media_items m
-        WHERE m.is_ignored = FALSE
+        SELECT COUNT(*)
+        FROM media_works m
+        WHERE EXISTS (
+            SELECT 1 FROM sync_folders f
+            WHERE f.work_id = m.id AND f.is_ignored = FALSE
+        )
           AND ($1::text IS NULL OR m.category = $1)
           AND ($2::text IS NULL OR m.title ILIKE $2 OR m.original_title ILIKE $2)
           AND ($3::text IS NULL OR m.media_type = $3)
@@ -264,17 +265,17 @@ pub(super) async fn get_user_items(
           AND (NOT $5 OR EXISTS (
               SELECT 1 FROM user_favorites uf
               WHERE uf.user_id = $6
-                AND ((uf.tmdb_id IS NOT NULL AND uf.tmdb_id = m.tmdb_id AND uf.media_type = m.media_type) OR uf.media_item_id = m.id)
+                AND ((uf.tmdb_id IS NOT NULL AND uf.tmdb_id = m.tmdb_id AND uf.media_type = m.media_type) OR uf.work_id = m.id)
           ))
           AND (NOT $7 OR EXISTS (
               SELECT 1 FROM play_histories ph
               WHERE ph.user_id = $6 AND ph.is_played = TRUE
-                AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.media_item_id = m.id)
+                AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)
           ))
           AND (NOT $8 OR NOT EXISTS (
               SELECT 1 FROM play_histories ph
               WHERE ph.user_id = $6 AND ph.is_played = TRUE
-                AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.media_item_id = m.id)
+                AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)
           ))
           AND ($9::text[] IS NULL OR m.category = ANY($9))
           AND ($10::jsonb IS NULL OR {})
@@ -303,10 +304,10 @@ pub(super) async fn get_user_items(
     } else {
         sqlx::query_as(
             r#"
-            SELECT media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, is_played
+            SELECT work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, is_played
             FROM play_histories
             WHERE user_id = $1
-              AND (media_item_id = ANY($2) OR (tmdb_id IS NOT NULL AND tmdb_id = ANY($3)))
+              AND (work_id = ANY($2) OR (tmdb_id IS NOT NULL AND tmdb_id = ANY($3)))
             "#,
         )
         .bind(&user_id)
@@ -353,7 +354,7 @@ pub(super) async fn get_user_items(
             };
 
             let mut obj = json!({
-                "Id": format!("media_{}", r.id),
+                "Id": format!("work_{}", r.id),
                 "Name": r.title,
                 "SortName": r.title,
                 "OriginalTitle": r.original_title,
@@ -391,7 +392,6 @@ pub(super) async fn get_user_items(
 struct EpisodeGroupRow {
     season_number: i32,
     episode_number: i32,
-    rep_id: i64,
     title: Option<String>,
     overview: Option<String>,
     still_path: Option<String>,
@@ -402,33 +402,42 @@ struct EpisodeGroupRow {
 async fn get_episodes_for_media(
     state: &AppState,
     user_id: &str,
-    media_id: i64,
+    work_id: i64,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let cfg = state.config.load();
-    // 触发 P0 实时检查（若该剧未刮削，或有新同步集/未完结残缺集已过冷却期，立即异步刮削补齐）
-    let _ = state.scraper.priority_tx.try_send(media_id);
+    let _ = state.scraper.priority_tx.try_send(ScrapeTask::WorkSeasons(work_id));
 
     let media_meta: Option<(Option<i32>, String)> =
-        sqlx::query_as("SELECT tmdb_id, media_type FROM media_items WHERE id = $1")
-            .bind(media_id)
+        sqlx::query_as("SELECT tmdb_id, media_type FROM media_works WHERE id = $1")
+            .bind(work_id)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None);
     let (tmdb_id, mtype) = media_meta.unwrap_or((None, "tv".to_string()));
-    let history_map = load_media_episode_histories(state, user_id, media_id, tmdb_id, &mtype).await;
-    let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
+    let history_map = load_media_episode_histories(state, user_id, work_id, tmdb_id, &mtype).await;
 
-    // 跨所有同 tmdb_id 兄弟目录，按 (season_number, episode_number) 聚合多版本，取权重最高的一条作为代表单集
     let eps: Vec<EpisodeGroupRow> = sqlx::query_as(
         r#"
-        SELECT DISTINCT ON (season_number, episode_number)
-            season_number, episode_number, id AS rep_id, title, overview, still_path, air_date, runtime
-        FROM episodes
-        WHERE media_item_id = ANY($1)
-        ORDER BY season_number ASC, episode_number ASC, (still_path IS NOT NULL) DESC, priority_score DESC, id ASC
+        SELECT DISTINCT ON (sf.season_number, sf.episode_number)
+            sf.season_number,
+            sf.episode_number,
+            we.title,
+            we.overview,
+            we.still_path,
+            we.air_date,
+            COALESCE(we.runtime, 0) AS runtime
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        LEFT JOIN work_episodes we
+          ON we.work_id = $1
+         AND we.season_number = sf.season_number
+         AND we.episode_number = sf.episode_number
+        WHERE f.work_id = $1
+          AND f.is_ignored = FALSE
+        ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(work_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -449,11 +458,11 @@ async fn get_episodes_for_media(
             };
 
             let mut obj = json!({
-                "Id": format!("ep_{}", ep.rep_id),
+                "Id": format!("ep_{}_{}_{}", work_id, ep.season_number, ep.episode_number),
                 "Name": ep.title.unwrap_or_else(|| format!("第 {} 集", ep.episode_number)),
                 "ServerId": cfg.server_id,
-                "SeriesId": format!("media_{}", media_id),
-                "SeasonId": format!("season_{}_{}", media_id, ep.season_number),
+                "SeriesId": format!("work_{}", work_id),
+                "SeasonId": format!("season_{}_{}", work_id, ep.season_number),
                 "Type": "Episode",
                 "IsFolder": false,
                 "IndexNumber": ep.episode_number,
@@ -508,46 +517,45 @@ pub(super) async fn get_item_detail(
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let session_id = Uuid::new_v4().simple().to_string();
 
-    if let Some(raw_mid) = item_id.strip_prefix("media_") {
-        let mid = raw_mid
+    if let Some(raw_wid) = item_id.strip_prefix("work_").or_else(|| item_id.strip_prefix("media_")) {
+        let wid = raw_wid
             .parse::<i64>()
-            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 media_id".to_string()))?;
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 work_id".to_string()))?;
 
-        ensure_media_accessible(&state, &user_id, mid).await?;
+        ensure_media_accessible(&state, &user_id, wid).await?;
 
-        let row: Option<(String, Option<i32>, String, Option<i32>, Option<String>, f32, Option<String>, i16)> =
+        let row: Option<(String, Option<i32>, String, Option<i32>, Option<String>, f32, Option<String>)> =
             sqlx::query_as(
-                "SELECT media_type, tmdb_id, title, year, overview, rating, poster_path, scrape_status FROM media_items WHERE id = $1 AND is_ignored = FALSE",
+                "SELECT media_type, tmdb_id, title, year, overview, rating, poster_path FROM media_works WHERE id = $1",
             )
-            .bind(mid)
+            .bind(wid)
             .fetch_optional(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let Some((mtype, tmdb_id, title, year, overview, rating, poster, scrape_status)) = row else {
+        let Some((mtype, tmdb_id, title, year, overview, rating, poster)) = row else {
             return Err((StatusCode::NOT_FOUND, "条目不存在".to_string()));
         };
 
-        // 若尚未刮削完成，或为电视剧（需检查是否存在未刮削新季/新集/待补齐连载集），发送 P0 实时插队信号
-        if scrape_status != 1 || mtype == "tv" {
-            let _ = state.scraper.priority_tx.try_send(mid);
+        if mtype == "tv" {
+            let _ = state.scraper.priority_tx.try_send(ScrapeTask::WorkSeasons(wid));
         }
 
         // 零转存浪费：后台对小雅父目录执行只读 fs/list 寻址预热并回填文件大小
-        state.spawn_prewarm_media_dirs(mid, None);
+        state.spawn_prewarm_media_dirs(wid, None);
 
         let fav_set = load_user_favorite_keys(&state, &user_id).await;
-        let is_fav = is_media_favorited(&fav_set, mid, tmdb_id, &mtype);
-        let history_map = load_media_episode_histories(&state, &user_id, mid, tmdb_id, &mtype).await;
+        let is_fav = is_media_favorited(&fav_set, wid, tmdb_id, &mtype);
+        let history_map = load_media_episode_histories(&state, &user_id, wid, tmdb_id, &mtype).await;
         let (pos_ticks, dur_ticks, is_played) = history_map.get(&(0, 1)).copied().unwrap_or((0, 0, false));
 
         let mut media_sources = vec![];
         if mtype == "movie" {
-            media_sources = build_media_sources_for_movie(&state, &host, &token, &session_id, mid).await?;
+            media_sources = build_media_sources_for_movie(&state, &host, &token, &session_id, wid).await?;
         }
 
         let mut resp_obj = json!({
-            "Id": item_id,
+            "Id": format!("work_{}", wid),
             "Name": title,
             "ServerId": cfg.server_id,
             "Type": if mtype == "movie" { "Movie" } else { "Series" },
@@ -569,33 +577,66 @@ pub(super) async fn get_item_detail(
         return Ok(Json(resp_obj));
     }
 
-    if let Some(raw_eid) = item_id.strip_prefix("ep_") {
-        let eid = raw_eid
-            .parse::<i64>()
-            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 episode_id".to_string()))?;
+    if let Some(raw_ep) = item_id.strip_prefix("ep_") {
+        let parts: Vec<&str> = raw_ep.rsplitn(3, '_').collect();
+        let (wid, snum, epnum) = if parts.len() == 3 {
+            let e = parts[0].parse::<i32>().unwrap_or(0);
+            let s = parts[1].parse::<i32>().unwrap_or(0);
+            let w = parts[2].parse::<i64>().unwrap_or(0);
+            if w <= 0 || e <= 0 {
+                return Err((StatusCode::BAD_REQUEST, "无效的 episode_id".to_string()));
+            }
+            (w, s, e)
+        } else {
+            return Err((StatusCode::BAD_REQUEST, "无效的 episode_id".to_string()));
+        };
 
-        let ep_meta: Option<(i64, i32, i32, Option<String>, Option<String>, Option<String>, Option<String>, i32)> = sqlx::query_as(
-            "SELECT e.media_item_id, e.season_number, e.episode_number, e.title, e.overview, e.still_path, e.air_date, e.runtime FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.id = $1 AND m.is_ignored = FALSE",
+        ensure_media_accessible(&state, &user_id, wid).await?;
+
+        let has_file: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM sync_files sf
+                JOIN sync_folders f ON f.id = sf.folder_id
+                WHERE f.work_id = $1 AND f.is_ignored = FALSE
+                  AND sf.season_number = $2 AND sf.episode_number = $3
+            )
+            "#,
         )
-        .bind(eid)
+        .bind(wid)
+        .bind(snum)
+        .bind(epnum)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(false);
+
+        if !has_file {
+            return Err((StatusCode::NOT_FOUND, "剧集不存在或已被屏蔽".to_string()));
+        }
+
+        let ep_meta: Option<(Option<String>, Option<String>, Option<String>, Option<String>, i32)> = sqlx::query_as(
+            "SELECT title, overview, still_path, air_date, runtime FROM work_episodes WHERE work_id = $1 AND season_number = $2 AND episode_number = $3",
+        )
+        .bind(wid)
+        .bind(snum)
+        .bind(epnum)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .unwrap_or(None);
 
-        let Some((mid, snum, epnum, title, overview, still_path, air_date, runtime)) = ep_meta else {
-            return Err((StatusCode::NOT_FOUND, "剧集不存在或已被屏蔽".to_string()));
-        };
-        ensure_media_accessible(&state, &user_id, mid).await?;
+        let (title, overview, still_path, air_date, runtime) =
+            ep_meta.unwrap_or((None, None, None, None, 0));
 
         let media_meta: Option<(Option<i32>, String, String)> =
-            sqlx::query_as("SELECT tmdb_id, media_type, title FROM media_items WHERE id = $1")
-                .bind(mid)
+            sqlx::query_as("SELECT tmdb_id, media_type, title FROM media_works WHERE id = $1")
+                .bind(wid)
                 .fetch_optional(&state.db)
                 .await
                 .unwrap_or(None);
         let (tmdb_id, mtype, series_title) =
             media_meta.unwrap_or((None, "tv".to_string(), String::new()));
-        let history_map = load_media_episode_histories(&state, &user_id, mid, tmdb_id, &mtype).await;
+        let history_map = load_media_episode_histories(&state, &user_id, wid, tmdb_id, &mtype).await;
         let (pos_ticks, dur_ticks, is_played) = history_map
             .get(&(snum, epnum))
             .copied()
@@ -608,14 +649,14 @@ pub(super) async fn get_item_detail(
             0
         };
 
-        let sources = build_media_sources_for_episode(&state, &host, &token, &session_id, mid, snum, epnum).await?;
+        let sources = build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum).await?;
         let mut resp_obj = json!({
             "Id": item_id,
             "Name": title.unwrap_or_else(|| format!("第 {} 集", epnum)),
             "ServerId": cfg.server_id,
-            "SeriesId": format!("media_{}", mid),
+            "SeriesId": format!("work_{}", wid),
             "SeriesName": series_title,
-            "SeasonId": format!("season_{}_{}", mid, snum),
+            "SeasonId": format!("season_{}_{}", wid, snum),
             "Type": "Episode",
             "IndexNumber": epnum,
             "ParentIndexNumber": snum,
@@ -662,12 +703,17 @@ struct SeasonListRow {
 pub(super) async fn ensure_media_accessible(
     state: &AppState,
     user_id: &str,
-    mid: i64,
+    work_id: i64,
 ) -> Result<(String, Option<i32>, String), (StatusCode, String)> {
     let row: Option<(String, Option<i32>, String)> = sqlx::query_as(
-        "SELECT media_type, tmdb_id, category FROM media_items WHERE id = $1 AND is_ignored = FALSE",
+        r#"
+        SELECT w.media_type, w.tmdb_id, w.category
+        FROM media_works w
+        WHERE w.id = $1
+          AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
+        "#,
     )
-    .bind(mid)
+    .bind(work_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -695,24 +741,24 @@ pub(super) async fn get_show_seasons(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let user_id = resolve_valid_user_id(&state, q.user_id.as_deref(), &headers).await?;
     let cfg = state.config.load();
-    let mid = series_id
-        .strip_prefix("media_")
+    let wid = series_id
+        .strip_prefix("work_")
+        .or_else(|| series_id.strip_prefix("media_"))
         .unwrap_or(&series_id)
         .parse::<i64>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 series_id".to_string()))?;
 
-    ensure_media_accessible(&state, &user_id, mid).await?;
+    ensure_media_accessible(&state, &user_id, wid).await?;
 
     // 触发 P0 实时检查（若该剧分集尚未刮削或有连载新集待补齐，立即插队执行）
-    let _ = state.scraper.priority_tx.try_send(mid);
+    let _ = state.scraper.priority_tx.try_send(ScrapeTask::WorkSeasons(wid));
 
     // 零转存浪费：进入剧集季列表时，后台执行只读 fs/list 预热小雅目录树缓存并回填体积
-    state.spawn_prewarm_media_dirs(mid, None);
-    let sibling_ids = state.resolve_sibling_media_ids(mid).await;
+    state.spawn_prewarm_media_dirs(wid, None);
 
     let series_poster: Option<String> =
-        sqlx::query_scalar("SELECT poster_path FROM media_items WHERE id = $1")
-            .bind(mid)
+        sqlx::query_scalar("SELECT poster_path FROM media_works WHERE id = $1")
+            .bind(wid)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None)
@@ -722,26 +768,22 @@ pub(super) async fn get_show_seasons(
         r#"
         SELECT
             ep_s.season_number,
-            s_meta.name,
-            s_meta.overview,
-            s_meta.poster_path,
-            s_meta.air_date
+            ws.name,
+            ws.overview,
+            ws.poster_path,
+            ws.air_date
         FROM (
-            SELECT DISTINCT season_number
-            FROM episodes
-            WHERE media_item_id = ANY($1)
+            SELECT DISTINCT sf.season_number
+            FROM sync_files sf
+            JOIN sync_folders f ON f.id = sf.folder_id
+            WHERE f.work_id = $1 AND f.is_ignored = FALSE
         ) ep_s
-        LEFT JOIN LATERAL (
-            SELECT name, overview, poster_path, air_date
-            FROM seasons s
-            WHERE s.media_item_id = ANY($1) AND s.season_number = ep_s.season_number
-            ORDER BY (s.poster_path IS NOT NULL) DESC, (s.overview IS NOT NULL) DESC, s.episode_count DESC, s.id ASC
-            LIMIT 1
-        ) s_meta ON TRUE
+        LEFT JOIN work_seasons ws
+          ON ws.work_id = $1 AND ws.season_number = ep_s.season_number
         ORDER BY ep_s.season_number ASC
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(wid)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -759,10 +801,10 @@ pub(super) async fn get_show_seasons(
             });
             let has_poster = row.poster_path.is_some() || series_poster.is_some();
             json!({
-                "Id": format!("season_{}_{}", mid, snum),
+                "Id": format!("season_{}_{}", wid, snum),
                 "Name": name,
                 "ServerId": cfg.server_id,
-                "SeriesId": format!("media_{}", mid),
+                "SeriesId": format!("work_{}", wid),
                 "Type": "Season",
                 "IsFolder": true,
                 "IndexNumber": snum,
@@ -787,16 +829,17 @@ pub(super) async fn get_show_episodes(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let user_id = resolve_valid_user_id(&state, q.user_id.as_deref(), &headers).await?;
     let cfg = state.config.load();
-    let mid = series_id
-        .strip_prefix("media_")
+    let wid = series_id
+        .strip_prefix("work_")
+        .or_else(|| series_id.strip_prefix("media_"))
         .unwrap_or(&series_id)
         .parse::<i64>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 series_id".to_string()))?;
 
-    ensure_media_accessible(&state, &user_id, mid).await?;
+    ensure_media_accessible(&state, &user_id, wid).await?;
 
     // 触发 P0 实时检查（若该季有未刮削分集或连载残缺分集已过 12h 冷却，立即插队刷新）
-    let _ = state.scraper.priority_tx.try_send(mid);
+    let _ = state.scraper.priority_tx.try_send(ScrapeTask::WorkSeasons(wid));
 
     // 兼容 VidHub 传入 SeasonId="season_123_1" 或 Season=1
     let target_season: Option<i32> = q.season.or_else(|| {
@@ -807,30 +850,41 @@ pub(super) async fn get_show_episodes(
     });
 
     // 零转存浪费：展开某季分集列表时，确保该季小雅父目录寻址与文件体积已预热
-    state.spawn_prewarm_media_dirs(mid, target_season);
+    state.spawn_prewarm_media_dirs(wid, target_season);
 
     let media_meta: Option<(Option<i32>, String, String)> =
-        sqlx::query_as("SELECT tmdb_id, media_type, title FROM media_items WHERE id = $1")
-            .bind(mid)
+        sqlx::query_as("SELECT tmdb_id, media_type, title FROM media_works WHERE id = $1")
+            .bind(wid)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None);
     let (tmdb_id, mtype, series_title) =
         media_meta.unwrap_or((None, "tv".to_string(), String::new()));
-    let history_map = load_media_episode_histories(&state, &user_id, mid, tmdb_id, &mtype).await;
-    let sibling_ids = state.resolve_sibling_media_ids(mid).await;
+    let history_map = load_media_episode_histories(&state, &user_id, wid, tmdb_id, &mtype).await;
 
     let eps: Vec<EpisodeGroupRow> = sqlx::query_as(
         r#"
-        SELECT DISTINCT ON (season_number, episode_number)
-            season_number, episode_number, id AS rep_id, title, overview, still_path, air_date, runtime
-        FROM episodes
-        WHERE media_item_id = ANY($1)
-          AND ($2::int4 IS NULL OR season_number = $2)
-        ORDER BY season_number ASC, episode_number ASC, (still_path IS NOT NULL) DESC, priority_score DESC, id ASC
+        SELECT DISTINCT ON (sf.season_number, sf.episode_number)
+            sf.season_number,
+            sf.episode_number,
+            we.title,
+            we.overview,
+            we.still_path,
+            we.air_date,
+            COALESCE(we.runtime, 0) AS runtime
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        LEFT JOIN work_episodes we
+          ON we.work_id = $1
+         AND we.season_number = sf.season_number
+         AND we.episode_number = sf.episode_number
+        WHERE f.work_id = $1
+          AND f.is_ignored = FALSE
+          AND ($2::int4 IS NULL OR sf.season_number = $2)
+        ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(wid)
     .bind(target_season)
     .fetch_all(&state.db)
     .await
@@ -852,12 +906,12 @@ pub(super) async fn get_show_episodes(
             };
 
             let mut obj = json!({
-                "Id": format!("ep_{}", ep.rep_id),
+                "Id": format!("ep_{}_{}_{}", wid, ep.season_number, ep.episode_number),
                 "Name": ep.title.unwrap_or_else(|| format!("第 {} 集", ep.episode_number)),
                 "ServerId": cfg.server_id,
-                "SeriesId": format!("media_{}", mid),
+                "SeriesId": format!("work_{}", wid),
                 "SeriesName": series_title,
-                "SeasonId": format!("season_{}_{}", mid, ep.season_number),
+                "SeasonId": format!("season_{}_{}", wid, ep.season_number),
                 "Type": "Episode",
                 "IsFolder": false,
                 "IndexNumber": ep.episode_number,
@@ -912,7 +966,7 @@ pub(super) async fn get_resume_items(
 
 #[derive(sqlx::FromRow)]
 struct HistoryRecordRow {
-    media_item_id: Option<i64>,
+    work_id: Option<i64>,
     tmdb_id: Option<i32>,
     media_type: String,
     season_number: i32,
@@ -930,7 +984,7 @@ async fn get_resume_items_inner(
     let cfg = state.config.load();
     let histories: Vec<HistoryRecordRow> = sqlx::query_as(
         r#"
-        SELECT media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played
+        SELECT work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played
         FROM play_histories
         WHERE user_id = $1 AND is_played = FALSE AND position_ticks > 0
         ORDER BY last_played_at DESC
@@ -981,13 +1035,13 @@ pub(super) async fn get_next_up_items(
     // 按每部剧聚合取最新播放的一集记录，再按 last_played_at 倒序返回
     let latest_tv_histories: Vec<HistoryRecordRow> = sqlx::query_as(
         r#"
-        SELECT media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played
+        SELECT work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played
         FROM (
-            SELECT DISTINCT ON (COALESCE(tmdb_id::text, media_item_id::text))
-                media_item_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played, last_played_at
+            SELECT DISTINCT ON (COALESCE(tmdb_id::text, work_id::text))
+                work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played, last_played_at
             FROM play_histories
             WHERE user_id = $1 AND media_type = 'tv'
-            ORDER BY COALESCE(tmdb_id::text, media_item_id::text), last_played_at DESC
+            ORDER BY COALESCE(tmdb_id::text, work_id::text), last_played_at DESC
         ) t
         ORDER BY last_played_at DESC
         LIMIT $2
@@ -1029,29 +1083,34 @@ async fn build_emby_item_from_history(
     advance_to_next_ep: bool,
     allowed_cats: Option<&[String]>,
 ) -> Option<Value> {
-    // 优先通过 tmdb_id 定位当前有效 media_items（防 /每日更新 目录迁移后失效），其次回退 media_item_id
     let media_row: Option<(i64, String, String, Option<i32>, Option<String>, Option<String>, String)> =
         if let Some(tid) = h.tmdb_id {
             sqlx::query_as(
                 r#"
-                SELECT id, media_type, title, year, overview, poster_path, category
-                FROM media_items
-                WHERE is_ignored = FALSE AND ((tmdb_id = $1 AND media_type = $2) OR id = $3)
-                ORDER BY (id = $3) DESC, id DESC
+                SELECT w.id, w.media_type, w.title, w.year, w.overview, w.poster_path, w.category
+                FROM media_works w
+                WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
+                  AND ((w.tmdb_id = $1 AND w.media_type = $2) OR w.id = $3)
+                ORDER BY (w.id = $3) DESC, w.id DESC
                 LIMIT 1
                 "#,
             )
             .bind(tid)
             .bind(&h.media_type)
-            .bind(h.media_item_id.unwrap_or(0))
+            .bind(h.work_id.unwrap_or(0))
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None)
-        } else if let Some(mid) = h.media_item_id {
+        } else if let Some(wid) = h.work_id {
             sqlx::query_as(
-                "SELECT id, media_type, title, year, overview, poster_path, category FROM media_items WHERE id = $1 AND is_ignored = FALSE",
+                r#"
+                SELECT w.id, w.media_type, w.title, w.year, w.overview, w.poster_path, w.category
+                FROM media_works w
+                WHERE w.id = $1
+                  AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
+                "#,
             )
-            .bind(mid)
+            .bind(wid)
             .fetch_optional(&state.db)
             .await
             .unwrap_or(None)
@@ -1059,7 +1118,7 @@ async fn build_emby_item_from_history(
             None
         };
 
-    let (mid, mtype, media_title, year, media_overview, poster, category) = media_row?;
+    let (wid, mtype, media_title, year, media_overview, poster, category) = media_row?;
     if let Some(cats) = allowed_cats {
         if !cats.iter().any(|c| c == &category || c.starts_with("lib_vlib_")) {
             return None;
@@ -1071,7 +1130,7 @@ async fn build_emby_item_from_history(
             return None;
         }
         let mut obj = json!({
-            "Id": format!("media_{}", mid),
+            "Id": format!("work_{}", wid),
             "Name": media_title,
             "ServerId": server_id,
             "Type": "Movie",
@@ -1093,24 +1152,35 @@ async fn build_emby_item_from_history(
         return Some(obj);
     }
 
-    // 电视剧：跨所有同 tmdb_id 兄弟目录定位当前集或下一集
     let target_ep_num = if advance_to_next_ep {
         h.episode_number + 1
     } else {
         h.episode_number
     };
-    let sibling_ids = state.resolve_sibling_media_ids(mid).await;
 
-    let mut ep_row: Option<(i64, i32, i32, Option<String>, Option<String>, Option<String>, Option<String>, i32)> = sqlx::query_as(
+    let mut ep_row: Option<(i32, i32, Option<String>, Option<String>, Option<String>, Option<String>, i32)> = sqlx::query_as(
         r#"
-        SELECT id, season_number, episode_number, title, overview, still_path, air_date, runtime
-        FROM episodes
-        WHERE media_item_id = ANY($1) AND season_number = $2 AND episode_number = $3
-        ORDER BY (still_path IS NOT NULL) DESC, priority_score DESC, id ASC
+        SELECT
+            sf.season_number,
+            sf.episode_number,
+            we.title,
+            we.overview,
+            we.still_path,
+            we.air_date,
+            COALESCE(we.runtime, 0) AS runtime
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        LEFT JOIN work_episodes we
+          ON we.work_id = $1
+         AND we.season_number = sf.season_number
+         AND we.episode_number = sf.episode_number
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+          AND sf.season_number = $2 AND sf.episode_number = $3
+        ORDER BY COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
         LIMIT 1
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(wid)
     .bind(h.season_number)
     .bind(target_ep_num)
     .fetch_optional(&state.db)
@@ -1120,15 +1190,27 @@ async fn build_emby_item_from_history(
     if ep_row.is_none() && advance_to_next_ep {
         ep_row = sqlx::query_as(
             r#"
-            SELECT id, season_number, episode_number, title, overview, still_path, air_date, runtime
-            FROM episodes
-            WHERE media_item_id = ANY($1)
-              AND (season_number > $2 OR (season_number = $2 AND episode_number > $3))
-            ORDER BY season_number ASC, episode_number ASC, (still_path IS NOT NULL) DESC, priority_score DESC, id ASC
+            SELECT
+                sf.season_number,
+                sf.episode_number,
+                we.title,
+                we.overview,
+                we.still_path,
+                we.air_date,
+                COALESCE(we.runtime, 0) AS runtime
+            FROM sync_files sf
+            JOIN sync_folders f ON f.id = sf.folder_id
+            LEFT JOIN work_episodes we
+              ON we.work_id = $1
+             AND we.season_number = sf.season_number
+             AND we.episode_number = sf.episode_number
+            WHERE f.work_id = $1 AND f.is_ignored = FALSE
+              AND (sf.season_number > $2 OR (sf.season_number = $2 AND sf.episode_number > $3))
+            ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
             LIMIT 1
             "#,
         )
-        .bind(&sibling_ids)
+        .bind(wid)
         .bind(h.season_number)
         .bind(h.episode_number)
         .fetch_optional(&state.db)
@@ -1136,7 +1218,7 @@ async fn build_emby_item_from_history(
         .unwrap_or(None);
     }
 
-    let (ep_id, snum, epnum, ep_title, ep_overview, still_path, air_date, runtime) = ep_row?;
+    let (snum, epnum, ep_title, ep_overview, still_path, air_date, runtime) = ep_row?;
     let pos_ticks = if advance_to_next_ep { 0 } else { h.position_ticks };
     let played = if advance_to_next_ep { false } else { h.is_played };
     let effective_dur = if !advance_to_next_ep && h.duration_ticks > 0 {
@@ -1148,12 +1230,12 @@ async fn build_emby_item_from_history(
     };
 
     let mut obj = json!({
-        "Id": format!("ep_{}", ep_id),
+        "Id": format!("ep_{}_{}_{}", wid, snum, epnum),
         "Name": ep_title.unwrap_or_else(|| format!("第 {} 集", epnum)),
         "ServerId": server_id,
-        "SeriesId": format!("media_{}", mid),
+        "SeriesId": format!("work_{}", wid),
         "SeriesName": media_title,
-        "SeasonId": format!("season_{}_{}", mid, snum),
+        "SeasonId": format!("season_{}_{}", wid, snum),
         "Type": "Episode",
         "IsFolder": false,
         "IndexNumber": epnum,
@@ -1221,11 +1303,11 @@ fn build_emby_order_clause(sort_by: &str, sort_order: Option<&str>) -> String {
             "CommunityRating" | "CriticRating" => format!("rating {}", dir),
             "SortName" | "Name" | "OriginalTitle" => format!("title {}", dir),
             "DatePlayed" => format!(
-                "(SELECT MAX(ph.last_played_at) FROM play_histories ph WHERE ph.user_id = $6 AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = deduped.tmdb_id AND ph.media_type = deduped.media_type) OR ph.media_item_id = deduped.id)) {} NULLS LAST",
+                "(SELECT MAX(ph.last_played_at) FROM play_histories ph WHERE ph.user_id = $6 AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)) {} NULLS LAST",
                 dir
             ),
             "PlayCount" => format!(
-                "(SELECT COUNT(*) FROM play_histories ph WHERE ph.user_id = $6 AND ph.is_played = TRUE AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = deduped.tmdb_id AND ph.media_type = deduped.media_type) OR ph.media_item_id = deduped.id)) {}",
+                "(SELECT COUNT(*) FROM play_histories ph WHERE ph.user_id = $6 AND ph.is_played = TRUE AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)) {}",
                 dir
             ),
             "Random" => "RANDOM()".to_string(),

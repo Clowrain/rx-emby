@@ -9,22 +9,17 @@ const props = defineProps({
 const emit = defineEmits(['open-detail', 'open-bind', 'scrape', 'toggle-ignore'])
 
 function displayTitle(item) {
-  return item.title || item.root_dir.split('/').pop()
+  return item.title || `作品 #${item.id}`
 }
 
-function statusBadgeText(status) {
-  return { 0: '待刮削', 1: '已刮削', 2: '未匹配', 3: '已锁定' }[status] || '未知'
+function statusBadgeText(item) {
+  return item.is_locked ? '已锁定' : '已入库'
 }
 
-function statusBadgeClass(status) {
-  return (
-    {
-      0: 'bg-slate-800/90 text-slate-300 border border-slate-600/40',
-      1: 'bg-emerald-950/90 text-emerald-300 border border-emerald-500/40',
-      2: 'bg-rose-950/90 text-rose-300 border border-rose-500/40',
-      3: 'bg-amber-950/90 text-amber-300 border border-amber-500/40'
-    }[status] || 'bg-slate-800 text-slate-300'
-  )
+function statusBadgeClass(item) {
+  return item.is_locked
+    ? 'bg-amber-950/90 text-amber-300 border border-amber-500/40'
+    : 'bg-emerald-950/90 text-emerald-300 border border-emerald-500/40'
 }
 </script>
 
@@ -39,7 +34,7 @@ function statusBadgeClass(status) {
       <div class="aspect-[2/3] bg-slate-950 relative overflow-hidden flex items-center justify-center">
         <img
           v-if="item.poster_path"
-          :src="`/emby/Items/media_${item.id}/Images/Primary`"
+          :src="`/emby/Items/work_${item.id}/Images/Primary`"
           :alt="`${displayTitle(item)} 海报`"
           width="300"
           height="450"
@@ -55,15 +50,15 @@ function statusBadgeClass(status) {
           <div class="flex items-center gap-1 min-w-0">
             <span
               class="px-2 py-0.5 text-[10px] font-medium rounded-md backdrop-blur-md shadow whitespace-nowrap shrink-0"
-              :class="statusBadgeClass(item.scrape_status)"
+              :class="statusBadgeClass(item)"
             >
-              {{ statusBadgeText(item.scrape_status) }}
+              {{ statusBadgeText(item) }}
             </span>
             <span
-              v-if="item.sibling_count > 1"
+              v-if="item.folder_count > 1"
               class="px-1.5 py-0.5 text-[10px] font-medium font-mono rounded-md bg-purple-950/90 text-purple-200 border border-purple-500/40 backdrop-blur-md whitespace-nowrap tabular-nums shrink-0"
             >
-              ×{{ item.sibling_count }} 目录
+              ×{{ item.folder_count }} 目录
             </span>
           </div>
 
@@ -106,7 +101,7 @@ function statusBadgeClass(status) {
           </span>
         </div>
         <div class="single-line-reveal text-[11px] text-slate-500 font-mono">
-          <span>{{ item.root_dir }}</span>
+          <span>{{ item.media_type === 'movie' ? '电影' : '剧集' }} · {{ item.folder_count || 1 }} 个物理目录</span>
         </div>
       </div>
     </button>

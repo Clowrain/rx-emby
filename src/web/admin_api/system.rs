@@ -113,22 +113,13 @@ pub(super) async fn list_sync_logs(
     } else {
         let stats: (i64, i64, i64, i64) = sqlx::query_as(
             r#"
-            WITH active AS (
-                SELECT COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text) AS dedup_key,
-                       metadata_version, metadata_refresh_requested, metadata_retry_count
-                FROM media_items
-                WHERE is_ignored = FALSE
-            ),
-            grouped AS (
-                SELECT dedup_key, MAX(metadata_version) AS max_ver
-                FROM active
-                GROUP BY dedup_key
-            )
             SELECT
-                (SELECT COUNT(*) FROM grouped),
-                (SELECT COUNT(*) FROM grouped WHERE max_ver >= 2),
-                (SELECT COUNT(*) FROM active WHERE metadata_refresh_requested),
-                (SELECT COUNT(*) FROM active WHERE metadata_refresh_requested AND metadata_retry_count >= 3)
+                COUNT(*),
+                COUNT(*) FILTER (WHERE m.metadata_version >= 2),
+                COUNT(*) FILTER (WHERE m.metadata_refresh_requested),
+                COUNT(*) FILTER (WHERE m.metadata_refresh_requested AND m.metadata_retry_count >= 3)
+            FROM media_works m
+            WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)
             "#,
         )
         .fetch_one(&state.db)
@@ -210,30 +201,31 @@ pub(super) async fn get_admin_overview(
     }
 
     // 1. 统计去重后在库影视总数及各刮削状态占比（单次扫描 + 分组去重）
-    let (total_media, scraped_count, pending_count, failed_count, ignored_count): (i64, i64, i64, i64, i64) =
-        sqlx::query_as(
-            r#"
-            WITH dedup AS (
-                SELECT DISTINCT ON (is_ignored, COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text))
-                    is_ignored, scrape_status
-                FROM media_items
-                ORDER BY is_ignored, COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text), id ASC
-            )
-            SELECT
-                COUNT(*) FILTER (WHERE NOT is_ignored),
-                COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_status IN (1, 3)),
-                COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_status = 0),
-                COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_status = 2),
-                COUNT(*) FILTER (WHERE is_ignored)
-            FROM dedup
-            "#,
-        )
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or((0, 0, 0, 0, 0));
+    let scraped_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_works w WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+
+    let (pending_count, conflict_count, failed_count, ignored_count): (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'pending'),
+            COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'conflict'),
+            COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'failed'),
+            COUNT(*) FILTER (WHERE is_ignored)
+        FROM sync_folders
+        "#,
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or((0, 0, 0, 0));
+
+    let total_media = scraped_count;
 
     let total_episodes: i64 = sqlx::query_scalar(
-        "SELECT GREATEST(0, (SELECT COUNT(*) FROM episodes) - (SELECT COUNT(*) FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE m.is_ignored = TRUE))",
+        "SELECT COUNT(*) FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.is_ignored = FALSE",
     )
     .fetch_one(&state.db)
     .await
@@ -242,10 +234,10 @@ pub(super) async fn get_admin_overview(
     // 2. 五大分类统计
     let cat_rows: Vec<(String, i64)> = sqlx::query_as(
         r#"
-        SELECT category, COUNT(DISTINCT COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text))
-        FROM media_items
-        WHERE is_ignored = FALSE
-        GROUP BY category
+        SELECT w.category, COUNT(*)
+        FROM media_works w
+        WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
+        GROUP BY w.category
         ORDER BY 2 DESC
         "#,
     )
@@ -289,6 +281,7 @@ pub(super) async fn get_admin_overview(
             "total_episodes": total_episodes,
             "scraped_count": scraped_count,
             "pending_count": pending_count,
+            "conflict_count": conflict_count,
             "failed_count": failed_count,
             "ignored_count": ignored_count,
             "categories": categories

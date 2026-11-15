@@ -58,6 +58,7 @@
           </div>
           <div class="mt-2 flex items-center justify-between text-[11px] text-slate-400 tabular-nums">
             <span>待刮削: {{ formatNum(overview?.media?.pending_count) }}</span>
+            <span class="text-amber-400">存疑: {{ formatNum(overview?.media?.conflict_count) }}</span>
             <span class="text-rose-400">未匹配: {{ formatNum(overview?.media?.failed_count) }}</span>
           </div>
         </div>

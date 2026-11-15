@@ -20,20 +20,25 @@ async fn smart_view_end_to_end() {
     let url = std::env::var("TEST_DATABASE_URL").expect("使用隔离测试库");
     let db = sqlx::PgPool::connect(&url).await.unwrap();
     sqlx::migrate!("./migrations").run(&db).await.unwrap();
-    sqlx::raw_sql("TRUNCATE users, media_items, virtual_libraries CASCADE").execute(&db).await.unwrap();
+    sqlx::raw_sql("TRUNCATE users, media_works, sync_folders, virtual_libraries CASCADE").execute(&db).await.unwrap();
     sqlx::raw_sql(r#"
         INSERT INTO users(id,username,password_hash,is_admin,allowed_categories) VALUES
         ('admin','smart-admin','',TRUE,ARRAY['*']),('viewer','smart-viewer','',FALSE,ARRAY['vlib_*']),
         ('denied','smart-denied','',FALSE,ARRAY['电视剧']);
         INSERT INTO access_tokens(token,user_id,device_id,device_name,client_name) VALUES
         ('smart-test-admin-token','admin','test','test','test');
-        INSERT INTO media_items(id,media_type,tmdb_id,title,rating,year,poster_path,root_dir,raw_folder_name,category,countries,networks,genres,metadata_version,tmdb_metadata,premiered_at,scrape_status)
+        INSERT INTO media_works(id,media_type,tmdb_id,title,rating,year,poster_path,category,countries,networks,genres,metadata_version,tmdb_metadata,premiered_at)
         VALUES
-        (10,'tv',100,'低分剧',5,2020,'/low.jpg','/low','low','电视剧',ARRAY['中国大陆'],ARRAY['Apple TV'],ARRAY['悬疑'],1,'{"original_language":"zh","vote_count":20,"status":"Returning Series","number_of_episodes":30,"episode_run_time":[45]}','2020-01-01',1),
-        (20,'tv',200,'高分剧',9,2026,'/high.jpg','/high','high','电视剧',ARRAY['CN'],ARRAY['Apple TV'],ARRAY['悬疑','犯罪'],1,'{"original_language":"zh","vote_count":1500,"status":"Ended","number_of_episodes":8,"number_of_seasons":1,"episode_run_time":[40],"networks":[{"id":2552,"name":"Apple TV"}]}','2026-01-01',1),
-        (30,'movie',300,'动画电影',8.5,2025,'/movie.jpg','/movie','movie','动漫',ARRAY['JP'],ARRAY[]::text[],ARRAY['动画'],1,'{"original_language":"ja","vote_count":2000,"runtime":88,"popularity":100,"collection":{"id":99,"name":"系列"},"production_companies":[{"id":42,"name":"制作公司"}],"genre_ids":[16]}','2025-01-01',1),
-        (40,'movie',400,'未刮削',0,NULL,NULL,'/raw','raw','电影',ARRAY[]::text[],ARRAY[]::text[],ARRAY[]::text[],0,'{}',NULL,0);
-        INSERT INTO episodes(media_item_id,version_tag,alist_path,path_hash,file_name,container) VALUES
+        (10,'tv',100,'低分剧',5,2020,'/low.jpg','电视剧',ARRAY['中国大陆'],ARRAY['Apple TV'],ARRAY['悬疑'],1,'{"original_language":"zh","vote_count":20,"status":"Returning Series","number_of_episodes":30,"episode_run_time":[45]}','2020-01-01'),
+        (20,'tv',200,'高分剧',9,2026,'/high.jpg','电视剧',ARRAY['CN'],ARRAY['Apple TV'],ARRAY['悬疑','犯罪'],1,'{"original_language":"zh","vote_count":1500,"status":"Ended","number_of_episodes":8,"number_of_seasons":1,"episode_run_time":[40],"networks":[{"id":2552,"name":"Apple TV"}]}','2026-01-01'),
+        (30,'movie',300,'动画电影',8.5,2025,'/movie.jpg','动漫',ARRAY['JP'],ARRAY[]::text[],ARRAY['动画'],1,'{"original_language":"ja","vote_count":2000,"runtime":88,"popularity":100,"collection":{"id":99,"name":"系列"},"production_companies":[{"id":42,"name":"制作公司"}],"genre_ids":[16]}','2025-01-01');
+        INSERT INTO sync_folders(id,folder_path,parsed_title,media_type,category,scrape_state,work_id)
+        VALUES
+        (10,'/low','低分剧','tv','电视剧','verified',10),
+        (20,'/high','高分剧','tv','电视剧','verified',20),
+        (30,'/movie','动画电影','movie','动漫','verified',30),
+        (40,'/raw','未刮削','movie','电影','pending',NULL);
+        INSERT INTO sync_files(folder_id,version_tag,alist_path,path_hash,file_name,container) VALUES
           (30,'4K · 杜比视界','/test/1',1,'1.mkv','mkv'),
           (20,'4K','/test/2',2,'2.mkv','mkv'),(20,'1080p · 杜比视界','/test/3',3,'3.mkv','mkv');
     "#).execute(&db).await.unwrap();
@@ -91,10 +96,10 @@ async fn smart_view_end_to_end() {
     verify_metadata_refresh(&db).await;
     // 接近当前库规模的回归数据，检查参数化条件仍走普通 SQL 过滤。
     let mut transaction=db.begin().await.unwrap();
-    sqlx::raw_sql("INSERT INTO media_items(id,media_type,title,root_dir,raw_folder_name,category,rating,countries) SELECT 10000+g,'movie','规模测试','/perf/'||g,'perf','电影',8,ARRAY['CN'] FROM generate_series(1,70000) g")
+    sqlx::raw_sql("INSERT INTO media_works(id,media_type,title,category,rating,countries) SELECT 10000+g,'movie','规模测试','电影',8,ARRAY['CN'] FROM generate_series(1,70000) g")
         .execute(&mut *transaction).await.unwrap();
     let rule=VirtualLibraryRule{countries:vec!["CN".into()],min_rating:Some(8.0),..Default::default()};
-    let sql=format!("SELECT COUNT(*) FROM media_items m WHERE NOT m.is_ignored AND {}",rule.sql_predicate("$1::jsonb"));
+    let sql=format!("SELECT COUNT(*) FROM media_works m WHERE {}",rule.sql_predicate("$1::jsonb"));
     let started=std::time::Instant::now();
     let count:i64=sqlx::query_scalar(&sql).bind(serde_json::to_value(rule).unwrap()).fetch_one(&mut *transaction).await.unwrap();
     assert!(count>=70000);
@@ -132,31 +137,30 @@ async fn verify_metadata_refresh(db: &sqlx::PgPool) {
     let (tx,_rx)=tokio::sync::mpsc::channel(16);
     let state=AppState::new(cfg,db.clone(),tx).unwrap();
     sqlx::raw_sql(r#"
-      INSERT INTO media_items(id,media_type,tmdb_id,title,root_dir,raw_folder_name,category,scrape_status,metadata_refresh_requested,is_locked) VALUES
-        (500,'movie',500,'旧名称','/fixture/500','500','电影',1,TRUE,FALSE),
-        (501,'movie',500,'旧名称','/fixture/501','501','电影',1,TRUE,FALSE),
-        (502,'movie',500,'锁定名称','/fixture/502','502','电影',1,FALSE,TRUE),
-        (600,'tv',600,'剧集','/fixture/600','600','电视剧',1,FALSE,FALSE),
-        (700,'movie',700,'失败保留','/fixture/700','700','电影',1,TRUE,FALSE);
-      INSERT INTO seasons(media_item_id,season_number,name) VALUES(600,1,'第一季');
-      INSERT INTO episodes(media_item_id,season_number,episode_number,version_tag,alist_path,path_hash,file_name,container) VALUES
+      INSERT INTO media_works(id,media_type,tmdb_id,title,category,metadata_refresh_requested,is_locked) VALUES
+        (500,'movie',500,'旧名称','电影',TRUE,FALSE),
+        (502,'movie',5000,'锁定名称','电影',FALSE,TRUE),
+        (600,'tv',600,'剧集','电视剧',FALSE,FALSE),
+        (700,'movie',700,'失败保留','电影',TRUE,FALSE);
+      INSERT INTO sync_folders(id,folder_path,parsed_title,hint_tmdb_id,media_type,category,scrape_state,work_id) VALUES
+        (500,'/fixture/500','刷新后的电影',500,'movie','电影','pending',500),
+        (501,'/fixture/501','刷新后的电影',500,'movie','电影','pending',NULL),
+        (600,'/fixture/600','剧集',600,'tv','电视剧','verified',600),
+        (700,'/fixture/700','失败保留',700,'movie','电影','pending',700);
+      INSERT INTO work_seasons(work_id,season_number,name) VALUES(600,1,'第一季');
+      INSERT INTO sync_files(folder_id,season_number,episode_number,version_tag,alist_path,path_hash,file_name,container) VALUES
         (600,1,1,'默认版本','/fixture/600/1',6001,'1.mkv','mkv');
     "#).execute(db).await.unwrap();
-    crate::scraper::scrape_single_media(&state,500).await.unwrap();
-    crate::scraper::scrape_single_media(&state,501).await.unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst),1,"同作品多个目录共用一次详情请求");
-    let rows:Vec<(i64,i16,bool,Value)>=sqlx::query_as("SELECT id,metadata_version,metadata_refresh_requested,tmdb_metadata FROM media_items WHERE id BETWEEN 500 AND 502 ORDER BY id").fetch_all(db).await.unwrap();
-    assert_eq!(rows[0].1,1);assert_eq!(rows[1].1,1);assert!(!rows[1].2);assert_eq!(rows[2].1,0);
-    assert_eq!(rows[0].3["vote_count"],1000);assert_eq!(rows[1].3["collection"]["id"],99);
-    // 新目录复用已更新的元数据，不重复访问远端。
-    sqlx::raw_sql("INSERT INTO media_items(id,media_type,tmdb_id,title,root_dir,raw_folder_name,category) VALUES(503,'movie',500,'新目录','/fixture/503','503','电影')").execute(db).await.unwrap();
-    crate::scraper::scrape_single_media(&state,503).await.unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst),1);
-    let version:i16=sqlx::query_scalar("SELECT metadata_version FROM media_items WHERE id=503").fetch_one(db).await.unwrap();assert_eq!(version,2);
-    crate::scraper::scrape_single_media(&state,600).await.unwrap();
-    let season:(i32,i32)=sqlx::query_as("SELECT episode_count,scrape_attempts FROM seasons WHERE media_item_id=600 AND season_number=1").fetch_one(db).await.unwrap();
+    crate::scraper::scrape_single_folder(&state,500).await.unwrap();
+    crate::scraper::scrape_single_folder(&state,501).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst),1,"同作品多个目录共用一次详情请求并合并至同一 work");
+    let work_id_501:Option<i64>=sqlx::query_scalar("SELECT work_id FROM sync_folders WHERE id=501").fetch_one(db).await.unwrap();
+    assert_eq!(work_id_501,Some(500));
+    crate::scraper::scrape_work_seasons_by_id(&state,600,true).await.unwrap();
+    let season:(i32,i32)=sqlx::query_as("SELECT episode_count,scrape_attempts FROM work_seasons WHERE work_id=600 AND season_number=1").fetch_one(db).await.unwrap();
     assert_eq!(season,(3,1),"真实集数与刮削次数分开保存");
-    assert!(crate::scraper::scrape_single_media(&state,700).await.is_err());
-    let failed:(i16,i16)=sqlx::query_as("SELECT scrape_status,metadata_retry_count FROM media_items WHERE id=700").fetch_one(db).await.unwrap();assert_eq!(failed,(1,1));
+    assert!(crate::scraper::scrape_single_folder(&state,700).await.is_err());
+    let retry_cnt:i32=sqlx::query_scalar("SELECT retry_count FROM sync_folders WHERE id=700").fetch_one(db).await.unwrap();
+    assert_eq!(retry_cnt,1);
     server.abort();
 }

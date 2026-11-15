@@ -100,7 +100,51 @@ export const adminApi = {
     })
   },
   retryFailedScrapes() {
-    return requestJson('/api/admin/scrape/retry_failed', { method: 'POST' })
+    return requestJson('/api/admin/staging/retry_failed', { method: 'POST' })
+  },
+  updateFolderPriority(folderId, priorityBoost) {
+    return requestJson(`/api/admin/folders/${folderId}/priority`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority_boost: priorityBoost })
+    })
+  },
+  updateFilePriority(fileId, priorityOverride) {
+    return requestJson(`/api/admin/files/${fileId}/priority`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority_override: priorityOverride })
+    })
+  },
+
+  // 1b. 中间表 (Staging) 工作台
+  listStagingFolders(params) {
+    const qs = new URLSearchParams(params).toString()
+    return requestJson(`/api/admin/staging/folders?${qs}`)
+  },
+  scrapeStagingFolder(folderId) {
+    return requestJson(`/api/admin/staging/folders/${folderId}/scrape`, { method: 'POST' })
+  },
+  promoteStagingFolder(folderId, payload) {
+    return requestJson(`/api/admin/staging/folders/${folderId}/promote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+  },
+  toggleIgnoreStagingFolder(folderId, ignore) {
+    return requestJson(`/api/admin/staging/folders/${folderId}/ignore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ignore })
+    })
+  },
+  batchScrapeStagingFolders(folderIds) {
+    return requestJson('/api/admin/staging/scrape_batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder_ids: folderIds })
+    })
   },
 
   // 2. 自定义虚拟媒体库 (Smart Views)

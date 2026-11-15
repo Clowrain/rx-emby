@@ -85,23 +85,24 @@ pub(super) async fn list_users_and_sessions(
         let s = entry.value().clone();
         let idle_sec = s.last_activity.elapsed().as_secs();
         let ep_label: Option<String> = match s.current_episode_id {
-            Some(eid) if eid > 0 => {
+            Some(fid) if fid > 0 => {
                 sqlx::query_scalar(
                     r#"
-                    SELECT m.title || ' · S' || LPAD(e.season_number::text, 2, '0') || 'E' || LPAD(e.episode_number::text, 2, '0')
-                    FROM episodes e
-                    JOIN media_items m ON m.id = e.media_item_id
-                    WHERE e.id = $1
+                    SELECT COALESCE(w.title, f.parsed_title, '未知') || ' · S' || LPAD(sf.season_number::text, 2, '0') || 'E' || LPAD(sf.episode_number::text, 2, '0')
+                    FROM sync_files sf
+                    JOIN sync_folders f ON f.id = sf.folder_id
+                    LEFT JOIN media_works w ON w.id = f.work_id
+                    WHERE sf.id = $1
                     "#,
                 )
-                .bind(eid)
+                .bind(fid)
                 .fetch_optional(&state.db)
                 .await
                 .unwrap_or(None)
             }
-            Some(neg_mid) if neg_mid < 0 => {
-                sqlx::query_scalar("SELECT title FROM media_items WHERE id = $1")
-                    .bind(-neg_mid)
+            Some(neg_wid) if neg_wid < 0 => {
+                sqlx::query_scalar("SELECT title FROM media_works WHERE id = $1")
+                    .bind(-neg_wid)
                     .fetch_optional(&state.db)
                     .await
                     .unwrap_or(None)

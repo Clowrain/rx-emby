@@ -1,4 +1,7 @@
-use crate::{scraper::scrape_single_media, state::AppState};
+use crate::{
+    scraper::{promote_folder_manually, scrape_single_folder, scrape_work_seasons_by_id},
+    state::{AppState, ScrapeTask},
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -10,10 +13,9 @@ use std::sync::Arc;
 
 #[derive(Deserialize, Default)]
 pub(super) struct AdminMediaQuery {
-    scrape_status: Option<i16>,
     category: Option<String>,
     keyword: Option<String>,
-    is_ignored: Option<bool>,
+    media_type: Option<String>,
     sort_by: Option<String>,
     sort_order: Option<String>,
     limit: Option<i64>,
@@ -21,7 +23,7 @@ pub(super) struct AdminMediaQuery {
 }
 
 #[derive(Serialize, sqlx::FromRow)]
-struct AdminMediaRow {
+struct AdminWorkRow {
     id: i64,
     media_type: String,
     tmdb_id: Option<i32>,
@@ -29,23 +31,20 @@ struct AdminMediaRow {
     year: Option<i32>,
     rating: f32,
     category: String,
-    scrape_status: i16,
     is_locked: bool,
-    is_ignored: bool,
-    root_dir: String,
     poster_path: Option<String>,
     episode_count: i64,
-    sibling_count: i64,
+    folder_count: i64,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-
+/// 正式作品库列表 (`media_works`)
 pub(super) async fn list_admin_media(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AdminMediaQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(30).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
-    let ignored_filter = q.is_ignored.unwrap_or(false);
     let kw_raw = q.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let kw = kw_raw.map(|s| format!("%{}%", s));
     let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
@@ -56,26 +55,25 @@ pub(super) async fn list_admin_media(
         .map(|s| s.eq_ignore_ascii_case("asc") || s.eq_ignore_ascii_case("ascending"))
         .unwrap_or(false);
     let order_clause = match q.sort_by.as_deref().unwrap_or("updated_at") {
-        "created_at" => if is_asc { "created_at ASC, id ASC" } else { "created_at DESC, id DESC" },
-        "year" => if is_asc { "year ASC NULLS LAST, id ASC" } else { "year DESC NULLS LAST, id DESC" },
-        "rating" => if is_asc { "rating ASC, id ASC" } else { "rating DESC, id DESC" },
-        "title" => if is_asc { "title ASC, id ASC" } else { "title DESC, id DESC" },
-        _ => if is_asc { "updated_at ASC, id ASC" } else { "updated_at DESC, id DESC" },
+        "created_at" => if is_asc { "w.created_at ASC, w.id ASC" } else { "w.created_at DESC, w.id DESC" },
+        "year" => if is_asc { "w.year ASC NULLS LAST, w.id ASC" } else { "w.year DESC NULLS LAST, w.id DESC" },
+        "rating" => if is_asc { "w.rating ASC, w.id ASC" } else { "w.rating DESC, w.id DESC" },
+        "title" => if is_asc { "w.title ASC, w.id ASC" } else { "w.title DESC, w.id DESC" },
+        _ => if is_asc { "w.updated_at ASC, w.id ASC" } else { "w.updated_at DESC, w.id DESC" },
     };
 
     let total: i64 = sqlx::query_scalar(
         r#"
-        SELECT COUNT(DISTINCT COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-        FROM media_items m
-        WHERE m.is_ignored = $1
-          AND ($2::int2 IS NULL OR m.scrape_status = $2)
-          AND ($3::text IS NULL OR m.category = $3)
-          AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND m.tmdb_id = $5))
+        SELECT COUNT(*)
+        FROM media_works w
+        WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
+          AND ($1::text IS NULL OR w.category = $1)
+          AND ($2::text IS NULL OR w.media_type = $2)
+          AND ($3::text IS NULL OR w.title ILIKE $3 OR w.original_title ILIKE $3 OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
         "#,
     )
-    .bind(ignored_filter)
-    .bind(q.scrape_status)
     .bind(&q.category)
+    .bind(&q.media_type)
     .bind(&kw)
     .bind(kw_tmdb_id)
     .fetch_one(&state.db)
@@ -85,53 +83,23 @@ pub(super) async fn list_admin_media(
     let sql = format!(
         r#"
         SELECT
-            page.id, page.media_type, page.tmdb_id, page.title, page.year, page.rating, page.category,
-            page.scrape_status, page.is_locked, page.is_ignored, page.root_dir, page.poster_path,
-            CASE
-                WHEN page.tmdb_id IS NOT NULL THEN (
-                    SELECT COUNT(*) FROM episodes e
-                    JOIN media_items sm ON sm.id = e.media_item_id
-                    WHERE sm.tmdb_id = page.tmdb_id AND sm.media_type = page.media_type AND sm.is_ignored = page.is_ignored
-                )
-                ELSE (SELECT COUNT(*) FROM episodes e WHERE e.media_item_id = page.id)
-            END AS episode_count,
-            CASE
-                WHEN page.tmdb_id IS NOT NULL THEN (
-                    SELECT COUNT(*) FROM media_items s
-                    WHERE s.tmdb_id = page.tmdb_id AND s.media_type = page.media_type AND s.is_ignored = page.is_ignored
-                )
-                ELSE 1
-            END AS sibling_count
-        FROM (
-            SELECT
-                id, media_type, tmdb_id, title, year, rating, category,
-                scrape_status, is_locked, is_ignored, root_dir, poster_path, updated_at, created_at
-            FROM (
-                SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-                    m.id, m.media_type, m.tmdb_id, m.title, m.year, m.rating, m.category,
-                    m.scrape_status, m.is_locked, m.is_ignored, m.root_dir, m.poster_path, m.updated_at, m.created_at
-                FROM media_items m
-                WHERE m.is_ignored = $1
-                  AND ($2::int2 IS NULL OR m.scrape_status = $2)
-                  AND ($3::text IS NULL OR m.category = $3)
-                  AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND m.tmdb_id = $5))
-                ORDER BY
-                    COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
-                    (m.scrape_status IN (1, 3)) DESC,
-                    (m.poster_path IS NOT NULL) DESC,
-                    m.id ASC
-            ) AS deduped
-            ORDER BY {order_clause}
-            LIMIT $6 OFFSET $7
-        ) AS page
+            w.id, w.media_type, w.tmdb_id, w.title, w.year, w.rating, w.category,
+            w.is_locked, w.poster_path, w.updated_at,
+            (SELECT COUNT(*) FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = w.id AND f.is_ignored = FALSE) AS episode_count,
+            (SELECT COUNT(*) FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE) AS folder_count
+        FROM media_works w
+        WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
+          AND ($1::text IS NULL OR w.category = $1)
+          AND ($2::text IS NULL OR w.media_type = $2)
+          AND ($3::text IS NULL OR w.title ILIKE $3 OR w.original_title ILIKE $3 OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
         ORDER BY {order_clause}
+        LIMIT $5 OFFSET $6
         "#,
     );
 
-    let items: Vec<AdminMediaRow> = sqlx::query_as(&sql)
-        .bind(ignored_filter)
-        .bind(q.scrape_status)
+    let items: Vec<AdminWorkRow> = sqlx::query_as(&sql)
         .bind(&q.category)
+        .bind(&q.media_type)
         .bind(&kw)
         .bind(kw_tmdb_id)
         .bind(limit)
@@ -144,7 +112,7 @@ pub(super) async fn list_admin_media(
 }
 
 #[derive(Serialize, sqlx::FromRow)]
-struct AdminMediaFullRow {
+struct AdminWorkFullRow {
     id: i64,
     media_type: String,
     tmdb_id: Option<i32>,
@@ -160,24 +128,27 @@ struct AdminMediaFullRow {
     networks: Vec<String>,
     genres: Vec<String>,
     category: String,
-    scrape_status: i16,
+    is_locked: bool,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct AdminLinkedFolderRow {
+    id: i64,
+    folder_path: String,
+    parsed_title: String,
+    parsed_year: Option<i32>,
+    category: String,
+    scrape_state: String,
+    priority_boost: i32,
     is_locked: bool,
     is_ignored: bool,
-    root_dir: String,
+    file_count: i64,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
-struct AdminSiblingDirRow {
+struct AdminFileDetailRow {
     id: i64,
-    root_dir: String,
-    scrape_status: i16,
-    episode_count: i64,
-}
-
-#[derive(Serialize, sqlx::FromRow)]
-struct AdminEpisodeDetailRow {
-    id: i64,
-    media_item_id: i64,
+    folder_id: i64,
     season_number: i32,
     episode_number: i32,
     title: Option<String>,
@@ -185,121 +156,134 @@ struct AdminEpisodeDetailRow {
     still_path: Option<String>,
     air_date: Option<String>,
     runtime: i32,
-    meta_incomplete: bool,
     version_tag: String,
     priority_score: i32,
+    priority_override: Option<i32>,
+    folder_priority_boost: i32,
+    effective_priority: i32,
     container: String,
     file_name: String,
     alist_path: String,
     file_size_bytes: Option<i64>,
 }
 
-/// 获取某部影视的完整详情、跨目录同 TMDB 聚合目录列表以及所有分集多版本源明细
+/// 获取正式作品详情、关联的物理目录（含目录级权重加成）及所有分集多版本物理源
 pub(super) async fn get_admin_media_detail(
     State(state): State<Arc<AppState>>,
-    Path(media_id): Path<i64>,
+    Path(work_id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let media: Option<AdminMediaFullRow> = sqlx::query_as(
+    let media: Option<AdminWorkFullRow> = sqlx::query_as(
         r#"
         SELECT id, media_type, tmdb_id, title, original_title, year, premiered_at,
                overview, rating, poster_path, backdrop_path, countries, networks,
-               genres, category, scrape_status, is_locked, is_ignored, root_dir
-        FROM media_items
+               genres, category, is_locked
+        FROM media_works
         WHERE id = $1
         "#,
     )
-    .bind(media_id)
+    .bind(work_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let Some(media) = media else {
-        return Err((StatusCode::NOT_FOUND, "影视条目不存在".to_string()));
+        return Err((StatusCode::NOT_FOUND, "作品条目不存在".to_string()));
     };
 
-    if media.scrape_status != 1 || media.media_type == "tv" {
-        let _ = state.scraper.priority_tx.try_send(media_id);
+    if media.media_type == "tv" {
+        let _ = state.scraper.priority_tx.try_send(ScrapeTask::WorkSeasons(work_id));
     }
 
-    let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
-
-    let sibling_dirs: Vec<AdminSiblingDirRow> = sqlx::query_as(
+    let folders: Vec<AdminLinkedFolderRow> = sqlx::query_as(
         r#"
-        SELECT m.id, m.root_dir, m.scrape_status,
-               (SELECT COUNT(*) FROM episodes e WHERE e.media_item_id = m.id) AS episode_count
-        FROM media_items m
-        WHERE m.id = ANY($1)
-        ORDER BY (m.id = $2) DESC, m.id ASC
+        SELECT f.id, f.folder_path, f.parsed_title, f.parsed_year, f.category,
+               f.scrape_state, f.priority_boost, f.is_locked, f.is_ignored,
+               (SELECT COUNT(*) FROM sync_files sf WHERE sf.folder_id = f.id) AS file_count
+        FROM sync_folders f
+        WHERE f.work_id = $1
+        ORDER BY f.is_ignored ASC, f.priority_boost DESC, f.id ASC
         "#,
     )
-    .bind(&sibling_ids)
-    .bind(media_id)
+    .bind(work_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut episodes: Vec<AdminEpisodeDetailRow> = sqlx::query_as(
+    let mut files: Vec<AdminFileDetailRow> = sqlx::query_as(
         r#"
-        SELECT id, media_item_id, season_number, episode_number, title,
-               overview, still_path, air_date, runtime, meta_incomplete,
-               version_tag, priority_score, container, file_name, alist_path, file_size_bytes
-        FROM episodes
-        WHERE media_item_id = ANY($1)
-        ORDER BY season_number ASC, episode_number ASC, priority_score DESC, id ASC
+        SELECT
+            sf.id, sf.folder_id, sf.season_number, sf.episode_number,
+            we.title, we.overview, we.still_path, we.air_date, COALESCE(we.runtime, 0) AS runtime,
+            sf.version_tag, sf.priority_score, sf.priority_override,
+            f.priority_boost AS folder_priority_boost,
+            COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) AS effective_priority,
+            sf.container, sf.file_name, sf.alist_path, sf.file_size_bytes
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        LEFT JOIN work_episodes we
+          ON we.work_id = $1
+         AND we.season_number = sf.season_number
+         AND we.episode_number = sf.episode_number
+        WHERE f.work_id = $1
+        ORDER BY sf.season_number ASC, sf.episode_number ASC,
+                 COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC,
+                 sf.id ASC
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(work_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 按同集 (season_number, episode_number) 分组执行多维标签重算与重名自动消歧
     let mut idx = 0;
-    while idx < episodes.len() {
-        let s_num = episodes[idx].season_number;
-        let e_num = episodes[idx].episode_number;
+    while idx < files.len() {
+        let s_num = files[idx].season_number;
+        let e_num = files[idx].episode_number;
         let mut end = idx + 1;
-        while end < episodes.len()
-            && episodes[end].season_number == s_num
-            && episodes[end].episode_number == e_num
+        while end < files.len()
+            && files[end].season_number == s_num
+            && files[end].episode_number == e_num
         {
             end += 1;
         }
 
-        let slice = &mut episodes[idx..end];
+        let slice = &mut files[idx..end];
         let mut tuples: Vec<(String, i32, String, String)> = slice
             .iter()
             .map(|r| {
                 (
                     r.version_tag.clone(),
-                    r.priority_score,
+                    r.effective_priority,
                     r.alist_path.clone(),
                     r.container.clone(),
                 )
             })
             .collect();
         crate::sync::parser::disambiguate_version_tags(&mut tuples);
-        for (ep, (new_tag, new_score, _, _)) in slice.iter_mut().zip(tuples.into_iter()) {
-            ep.version_tag = new_tag;
-            ep.priority_score = new_score;
+        for (f_row, (new_tag, _, _, _)) in slice.iter_mut().zip(tuples.into_iter()) {
+            f_row.version_tag = new_tag;
         }
-        slice.sort_by(|a, b| b.priority_score.cmp(&a.priority_score).then(a.id.cmp(&b.id)));
+        slice.sort_by(|a, b| {
+            b.effective_priority
+                .cmp(&a.effective_priority)
+                .then(a.id.cmp(&b.id))
+        });
         idx = end;
     }
 
     Ok(Json(json!({
         "media": media,
-        "sibling_dirs": sibling_dirs,
-        "episodes": episodes
+        "folders": folders,
+        "episodes": files
     })))
 }
 
-/// 手动触发该影视小雅父目录 `fs/list` 寻址预热并回填文件体积
+/// 手动触发该作品小雅父目录 `fs/list` 寻址预热并回填文件体积
 pub(super) async fn prewarm_admin_media_dirs(
     State(state): State<Arc<AppState>>,
-    Path(media_id): Path<i64>,
+    Path(work_id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    state.spawn_prewarm_media_dirs(media_id, None);
+    state.spawn_prewarm_media_dirs(work_id, None);
     Ok(Json(json!({
         "status": "ok",
         "message": "已触发小雅目录寻址预热与文件体积回填，请稍候刷新详情查看"
@@ -308,109 +292,69 @@ pub(super) async fn prewarm_admin_media_dirs(
 
 #[derive(Deserialize)]
 pub(super) struct BindTmdbReq {
-    tmdb_id: i32,
+    tmdb_id: Option<i32>,
     media_type: Option<String>,
 }
 
+/// 在正式作品上改绑 TMDB ID（会联动重新归并其下关联的物理目录）
 pub(super) async fn bind_tmdb_id(
     State(state): State<Arc<AppState>>,
-    Path(media_id): Path<i64>,
+    Path(work_id): Path<i64>,
     Json(payload): Json<BindTmdbReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    sqlx::query(
-        r#"
-        UPDATE media_items SET
-            tmdb_id = $1,
-            media_type = COALESCE($2, media_type),
-            is_locked = FALSE,
-            scrape_status = 0,
-            retry_count = 0,
-            next_retry_at = NULL
-        WHERE id = $3
-        "#,
-    )
-    .bind(payload.tmdb_id)
-    .bind(&payload.media_type)
-    .bind(media_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(tmdb_id) = payload.tmdb_id else {
+        return Err((StatusCode::BAD_REQUEST, "请提供有效的 TMDB ID".into()));
+    };
 
-    // 清空当前条目旧分集元数据，避免改绑 TMDB ID 或切换 movie/tv 时残留旧剧集标题/简介/季信息
-    let current_type: String = sqlx::query_scalar("SELECT media_type FROM media_items WHERE id = $1")
-        .bind(media_id)
-        .fetch_one(&state.db)
+    let folder_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM sync_folders WHERE work_id = $1")
+        .bind(work_id)
+        .fetch_all(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if current_type == "movie" {
-        let _ = sqlx::query("UPDATE episodes SET season_id = NULL, season_number = 0, title = NULL, overview = NULL, still_path = NULL, air_date = NULL, meta_incomplete = FALSE WHERE media_item_id = $1")
-            .bind(media_id)
-            .execute(&state.db)
-            .await;
-        let _ = sqlx::query("DELETE FROM seasons WHERE media_item_id = $1")
-            .bind(media_id)
-            .execute(&state.db)
-            .await;
-    } else {
-        // 若由 movie 改绑为 tv，将默认 season_number=0 的单集归一至第 1 季并重建 seasons
-        let _ = sqlx::query("UPDATE episodes SET season_number = 1 WHERE media_item_id = $1 AND season_number = 0")
-            .bind(media_id)
-            .execute(&state.db)
-            .await;
-        let _ = sqlx::query("UPDATE episodes SET title = NULL, overview = NULL, still_path = NULL, air_date = NULL, meta_incomplete = TRUE WHERE media_item_id = $1")
-            .bind(media_id)
-            .execute(&state.db)
-            .await;
-        let _ = sqlx::query("DELETE FROM seasons WHERE media_item_id = $1")
-            .bind(media_id)
-            .execute(&state.db)
-            .await;
+    let mut target_work_id = work_id;
+    for fid in folder_ids {
+        target_work_id = promote_folder_manually(
+            &state,
+            fid,
+            Some(tmdb_id),
+            payload.media_type.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("改绑 TMDB 失败: {:#}", e)))?;
     }
 
-    scrape_single_media(&state, media_id)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("绑定后刮削 TMDB 失败: {:#}", e)))?;
-
-    sqlx::query("UPDATE media_items SET is_locked = TRUE, scrape_status = 3 WHERE id = $1")
-        .bind(media_id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    state.caches.admin_stats_cache.invalidate_all();
-
-    Ok(Json(json!({ "status": "ok", "message": "已成功绑定 TMDB ID 并刷新锁定主条目与分集元数据" })))
-}
-
-/// 单部影视立即实时刮削（不开启全库后台扫描时用于手动测试单条，同时强制刷新其下季与分集）
-pub(super) async fn scrape_one_now(
-    State(state): State<Arc<AppState>>,
-    Path(media_id): Path<i64>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
-    // 仅重置当前条目及未锁定的兄弟目录，不强行解锁用户手动锁定的其它兄弟目录
-    sqlx::query(
-        "UPDATE media_items SET is_locked = FALSE, scrape_status = 0, retry_count = 0, next_retry_at = NULL WHERE id = $1 OR (id = ANY($2) AND is_locked = FALSE)",
-    )
-    .bind(media_id)
-    .bind(&sibling_ids)
-    .execute(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let _ = sqlx::query("UPDATE seasons SET scrape_attempts = 0 WHERE media_item_id = ANY($1)")
-        .bind(&sibling_ids)
+    let _ = sqlx::query("UPDATE media_works SET is_locked = TRUE WHERE id = $1")
+        .bind(target_work_id)
         .execute(&state.db)
         .await;
 
-    scrape_single_media(&state, media_id)
+    state.caches.admin_stats_cache.invalidate_all();
+
+    Ok(Json(json!({
+        "status": "ok",
+        "work_id": target_work_id,
+        "message": "已成功改绑 TMDB ID 并同步更新关联目录与分集元数据"
+    })))
+}
+
+/// 单部作品立即刷新分集/季元数据
+pub(super) async fn scrape_one_now(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let _ = sqlx::query("UPDATE work_seasons SET scrape_attempts = 0 WHERE work_id = $1")
+        .bind(work_id)
+        .execute(&state.db)
+        .await;
+
+    scrape_work_seasons_by_id(&state, work_id, true)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("单条刮削失败: {:#}", e)))?;
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("作品分集刮削失败: {:#}", e)))?;
 
     state.caches.admin_stats_cache.invalidate_all();
 
-    Ok(Json(json!({ "status": "ok", "message": "单条及分集元数据刮削成功" })))
+    Ok(Json(json!({ "status": "ok", "message": "作品及分集元数据刷新成功" })))
 }
 
 #[derive(Deserialize)]
@@ -418,32 +362,297 @@ pub(super) struct ToggleIgnoreReq {
     ignore: bool,
 }
 
-/// 将不想要的影视移出或恢复到媒体库（软屏蔽，增量同步不会重新导入；同时联动同 tmdb_id 兄弟目录）
+/// 屏蔽或恢复整部作品关联的所有物理目录
 pub(super) async fn toggle_ignore_media(
     State(state): State<Arc<AppState>>,
-    Path(media_id): Path<i64>,
+    Path(work_id): Path<i64>,
     Json(payload): Json<ToggleIgnoreReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    sqlx::query(
-        r#"
-        UPDATE media_items AS target
-        SET is_ignored = $1, updated_at = NOW()
-        FROM (SELECT id, tmdb_id, media_type FROM media_items WHERE id = $2) AS anchor
-        WHERE target.id = anchor.id
-           OR (anchor.tmdb_id IS NOT NULL AND target.tmdb_id = anchor.tmdb_id AND target.media_type = anchor.media_type)
-        "#,
-    )
-    .bind(payload.ignore)
-    .bind(media_id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query("UPDATE sync_folders SET is_ignored = $1, updated_at = NOW() WHERE work_id = $2")
+        .bind(payload.ignore)
+        .bind(work_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.caches.admin_stats_cache.invalidate_all();
 
     Ok(Json(json!({
         "status": "ok",
-        "message": if payload.ignore { "已屏蔽该影视，后续同步将自动跳过（可在「已屏蔽」中恢复）" } else { "已恢复显示到媒体库" }
+        "message": if payload.ignore { "已屏蔽该作品关联目录，后续同步将自动跳过" } else { "已恢复显示到媒体库" }
+    })))
+}
+
+// =========================================================================
+// 多版本权重调整 (目录级 priority_boost / 单集文件级 priority_override)
+// =========================================================================
+
+#[derive(Deserialize)]
+pub(super) struct FolderPriorityReq {
+    priority_boost: i32,
+}
+
+pub(super) async fn update_folder_priority(
+    State(state): State<Arc<AppState>>,
+    Path(folder_id): Path<i64>,
+    Json(payload): Json<FolderPriorityReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let res = sqlx::query("UPDATE sync_folders SET priority_boost = $1, updated_at = NOW() WHERE id = $2")
+        .bind(payload.priority_boost)
+        .bind(folder_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if res.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "物理目录不存在".into()));
+    }
+
+    Ok(Json(json!({
+        "status": "ok",
+        "message": format!("已将目录权重加成调整为 {}", payload.priority_boost)
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct FilePriorityReq {
+    priority_override: Option<i32>,
+}
+
+pub(super) async fn update_file_priority(
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<i64>,
+    Json(payload): Json<FilePriorityReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let res = sqlx::query("UPDATE sync_files SET priority_override = $1 WHERE id = $2")
+        .bind(payload.priority_override)
+        .bind(file_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if res.rows_affected() == 0 {
+        return Err((StatusCode::NOT_FOUND, "物理文件不存在".into()));
+    }
+
+    Ok(Json(json!({
+        "status": "ok",
+        "message": match payload.priority_override {
+            Some(v) => format!("已将该版本文件覆盖权重设为 {}", v),
+            None => "已恢复默认自动权重计算".to_string(),
+        }
+    })))
+}
+
+// =========================================================================
+// Staging 中间表管理工作台 (`sync_folders`: pending / conflict / failed / ignored)
+// =========================================================================
+
+#[derive(Deserialize, Default)]
+pub(super) struct StagingFoldersQuery {
+    scrape_state: Option<String>,
+    is_ignored: Option<bool>,
+    category: Option<String>,
+    keyword: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct StagingFolderRow {
+    id: i64,
+    folder_path: String,
+    parsed_title: String,
+    parsed_year: Option<i32>,
+    hint_tmdb_id: Option<i32>,
+    media_type: String,
+    category: String,
+    scrape_state: String,
+    conflict_reason: Option<String>,
+    retry_count: i32,
+    is_locked: bool,
+    is_ignored: bool,
+    priority_boost: i32,
+    work_id: Option<i64>,
+    work_title: Option<String>,
+    file_count: i64,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub(super) async fn list_staging_folders(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StagingFoldersQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(30).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let ignored_filter = q.is_ignored.unwrap_or(false);
+    let state_filter = q
+        .scrape_state
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all")
+        .map(str::to_string);
+    let kw_raw = q.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let kw = kw_raw.map(|s| format!("%{}%", s));
+    let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM sync_folders f
+        WHERE f.is_ignored = $1
+          AND ($2::text IS NULL OR f.scrape_state = $2)
+          AND ($3::text IS NULL OR f.category = $3)
+          AND ($4::text IS NULL OR f.parsed_title ILIKE $4 OR f.folder_path ILIKE $4 OR ($5::int4 IS NOT NULL AND f.hint_tmdb_id = $5))
+        "#,
+    )
+    .bind(ignored_filter)
+    .bind(&state_filter)
+    .bind(&q.category)
+    .bind(&kw)
+    .bind(kw_tmdb_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+
+    let items: Vec<StagingFolderRow> = sqlx::query_as(
+        r#"
+        SELECT
+            f.id, f.folder_path, f.parsed_title, f.parsed_year, f.hint_tmdb_id,
+            f.media_type, f.category, f.scrape_state, f.conflict_reason,
+            f.retry_count, f.is_locked, f.is_ignored, f.priority_boost,
+            f.work_id, w.title AS work_title,
+            (SELECT COUNT(*) FROM sync_files sf WHERE sf.folder_id = f.id) AS file_count,
+            f.updated_at
+        FROM sync_folders f
+        LEFT JOIN media_works w ON w.id = f.work_id
+        WHERE f.is_ignored = $1
+          AND ($2::text IS NULL OR f.scrape_state = $2)
+          AND ($3::text IS NULL OR f.category = $3)
+          AND ($4::text IS NULL OR f.parsed_title ILIKE $4 OR f.folder_path ILIKE $4 OR ($5::int4 IS NOT NULL AND f.hint_tmdb_id = $5))
+        ORDER BY f.updated_at DESC, f.id DESC
+        LIMIT $6 OFFSET $7
+        "#,
+    )
+    .bind(ignored_filter)
+    .bind(&state_filter)
+    .bind(&q.category)
+    .bind(&kw)
+    .bind(kw_tmdb_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+pub(super) async fn scrape_staging_folder(
+    State(state): State<Arc<AppState>>,
+    Path(folder_id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let _ = sqlx::query(
+        "UPDATE sync_folders SET scrape_state = 'pending', is_locked = FALSE, retry_count = 0, next_retry_at = NULL, conflict_reason = NULL WHERE id = $1",
+    )
+    .bind(folder_id)
+    .execute(&state.db)
+    .await;
+
+    scrape_single_folder(&state, folder_id)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("目录刮削失败: {:#}", e)))?;
+
+    let state_after: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT scrape_state, conflict_reason, work_id FROM sync_folders WHERE id = $1",
+    )
+    .bind(folder_id)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    state.caches.admin_stats_cache.invalidate_all();
+
+    let (scrape_state, conflict_reason, work_id) =
+        state_after.unwrap_or(("pending".into(), None, None));
+    Ok(Json(json!({
+        "status": "ok",
+        "scrape_state": scrape_state,
+        "conflict_reason": conflict_reason,
+        "work_id": work_id,
+        "message": match scrape_state.as_str() {
+            "verified" => "刮削并通过四维校验，已自动入库正式作品表".to_string(),
+            "conflict" => format!("刮削存在校验冲突：{}", conflict_reason.unwrap_or_default()),
+            _ => "刮削执行完成，请查看最新状态".to_string(),
+        }
+    })))
+}
+
+/// 人工裁决 / 绑定 TMDB ID / 无 TMDB 直接发布到正式作品库
+pub(super) async fn promote_staging_folder(
+    State(state): State<Arc<AppState>>,
+    Path(folder_id): Path<i64>,
+    Json(payload): Json<BindTmdbReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let work_id = promote_folder_manually(
+        &state,
+        folder_id,
+        payload.tmdb_id,
+        payload.media_type.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, format!("手动发布失败: {:#}", e)))?;
+
+    state.caches.admin_stats_cache.invalidate_all();
+
+    Ok(Json(json!({
+        "status": "ok",
+        "work_id": work_id,
+        "message": if payload.tmdb_id.is_some() {
+            "已绑定 TMDB ID 并直接发布至正式作品库"
+        } else {
+            "已作为自定义条目直接发布至正式作品库"
+        }
+    })))
+}
+
+pub(super) async fn toggle_ignore_staging_folder(
+    State(state): State<Arc<AppState>>,
+    Path(folder_id): Path<i64>,
+    Json(payload): Json<ToggleIgnoreReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    sqlx::query("UPDATE sync_folders SET is_ignored = $1, updated_at = NOW() WHERE id = $2")
+        .bind(payload.ignore)
+        .bind(folder_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state.caches.admin_stats_cache.invalidate_all();
+
+    Ok(Json(json!({
+        "status": "ok",
+        "message": if payload.ignore { "已屏蔽该物理目录" } else { "已取消屏蔽该物理目录" }
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct BatchScrapeReq {
+    folder_ids: Vec<i64>,
+}
+
+pub(super) async fn batch_scrape_staging_folders(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchScrapeReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let count = payload.folder_ids.len();
+    for fid in payload.folder_ids {
+        let _ = state.scraper.priority_tx.try_send(ScrapeTask::Folder(fid));
+    }
+    Ok(Json(json!({
+        "status": "ok",
+        "queued": count,
+        "message": format!("已将 {} 个目录加入高优先级刮削队列", count)
     })))
 }
 
@@ -451,7 +660,11 @@ pub(super) async fn retry_failed_scrapes(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let res = sqlx::query(
-        "UPDATE media_items SET scrape_status = 0, retry_count = 0, next_retry_at = NULL WHERE scrape_status = 2 AND is_locked = FALSE",
+        r#"
+        UPDATE sync_folders
+        SET scrape_state = 'pending', retry_count = 0, next_retry_at = NULL, conflict_reason = NULL
+        WHERE scrape_state IN ('failed', 'conflict') AND is_locked = FALSE AND is_ignored = FALSE
+        "#,
     )
     .execute(&state.db)
     .await
@@ -462,7 +675,6 @@ pub(super) async fn retry_failed_scrapes(
     Ok(Json(json!({
         "status": "ok",
         "reset_count": res.rows_affected(),
-        "message": format!("已将 {} 部未匹配影视重新加入待刮削队列", res.rows_affected())
+        "message": format!("已将 {} 个失败/冲突目录重新加入待刮削队列", res.rows_affected())
     })))
 }
-

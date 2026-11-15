@@ -31,6 +31,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/api/admin/media/:id/bind_tmdb", post(media::bind_tmdb_id))
         .route("/api/admin/media/:id/scrape", post(media::scrape_one_now))
         .route("/api/admin/media/:id/ignore", post(media::toggle_ignore_media))
+        .route("/api/admin/folders/:id/priority", post(media::update_folder_priority))
+        .route("/api/admin/files/:id/priority", post(media::update_file_priority))
+        .route("/api/admin/staging/folders", get(media::list_staging_folders))
+        .route("/api/admin/staging/folders/:id/scrape", post(media::scrape_staging_folder))
+        .route("/api/admin/staging/folders/:id/promote", post(media::promote_staging_folder))
+        .route("/api/admin/staging/folders/:id/ignore", post(media::toggle_ignore_staging_folder))
+        .route("/api/admin/staging/scrape_batch", post(media::batch_scrape_staging_folders))
+        .route("/api/admin/staging/retry_failed", post(media::retry_failed_scrapes))
         .route("/api/admin/scrape/retry_failed", post(media::retry_failed_scrapes))
         .route(
             "/api/admin/virtual_libraries",

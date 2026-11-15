@@ -69,8 +69,14 @@ impl Default for SyncControl {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ScrapeTask {
+    Folder(i64),
+    WorkSeasons(i64),
+}
+
 pub struct ScrapeScheduler {
-    pub priority_tx: mpsc::Sender<i64>,
+    pub priority_tx: mpsc::Sender<ScrapeTask>,
     pub limiter: ArcSwap<SharedRateLimiter>,
 }
 
@@ -105,7 +111,7 @@ impl AppState {
     pub fn new(
         initial_cfg: DynamicConfig,
         db: PgPool,
-        priority_tx: mpsc::Sender<i64>,
+        priority_tx: mpsc::Sender<ScrapeTask>,
     ) -> Result<Arc<Self>> {
         let tmdb_http = build_tmdb_client(initial_cfg.tmdb_proxy_url.as_deref())?;
         let alist_http = build_alist_client()?;

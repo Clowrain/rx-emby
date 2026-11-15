@@ -80,58 +80,81 @@ async fn get_playback_info_inner(
         .to_string();
     let token = extract_emby_token(&headers, q.api_key.as_deref()).unwrap_or_default();
     let session_id = Uuid::new_v4().simple().to_string();
-    let sources = if let Some(raw_mid) = item_id.strip_prefix("media_") {
-        let mid = raw_mid
+    let sources = if let Some(raw_wid) = item_id
+        .strip_prefix("work_")
+        .or_else(|| item_id.strip_prefix("media_"))
+    {
+        let wid = raw_wid
             .parse::<i64>()
-            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 media_id".to_string()))?;
-        let (mtype, _, _) = ensure_media_accessible(&state, &user_id, mid).await?;
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的作品 ID".to_string()))?;
+        let (mtype, _, _) = ensure_media_accessible(&state, &user_id, wid).await?;
         if mtype == "tv" {
-            // 剧集按首集返回播放源，避免把整季全部剧集混为多版本源
             let first_ep: Option<(i32, i32)> = sqlx::query_as(
-                "SELECT season_number, episode_number FROM episodes WHERE media_item_id = $1 ORDER BY season_number ASC, episode_number ASC LIMIT 1",
+                r#"
+                SELECT sf.season_number, sf.episode_number
+                FROM sync_files sf
+                JOIN sync_folders f ON f.id = sf.folder_id
+                WHERE f.work_id = $1 AND f.is_ignored = FALSE
+                ORDER BY sf.season_number ASC, sf.episode_number ASC
+                LIMIT 1
+                "#,
             )
-            .bind(mid)
+            .bind(wid)
             .fetch_optional(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             match first_ep {
                 Some((snum, epnum)) => {
-                    build_media_sources_for_episode(&state, &host, &token, &session_id, mid, snum, epnum).await?
+                    build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum).await?
                 }
                 None => return Err((StatusCode::NOT_FOUND, "剧集暂无可播放分集".to_string())),
             }
         } else {
-            build_media_sources_for_movie(&state, &host, &token, &session_id, mid).await?
+            build_media_sources_for_movie(&state, &host, &token, &session_id, wid).await?
         }
-    } else if let Some(raw_eid) = item_id
-        .strip_prefix("ep_")
-        .or_else(|| item_id.strip_prefix("src_"))
+    } else if let Some(rest) = item_id.strip_prefix("ep_") {
+        let mut parts = rest.rsplitn(3, '_');
+        let epnum = parts
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的分集集号".to_string()))?;
+        let snum = parts
+            .next()
+            .and_then(|s| s.parse::<i32>().ok())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的分集季号".to_string()))?;
+        let wid = parts
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的作品 ID".to_string()))?;
+
+        ensure_media_accessible(&state, &user_id, wid).await?;
+        build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum).await?
+    } else if let Some(raw_sid) = item_id
+        .strip_prefix("src_")
         .or_else(|| item_id.chars().all(|c| c.is_ascii_digit()).then_some(item_id.as_str()))
     {
-        let eid = raw_eid
+        let sid = raw_sid
             .parse::<i64>()
-            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 episode_id".to_string()))?;
-        let ep_meta: Option<(i64, i32, i32)> = sqlx::query_as(
-            "SELECT e.media_item_id, e.season_number, e.episode_number FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.id = $1 AND m.is_ignored = FALSE",
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的源 ID".to_string()))?;
+        let src_meta: Option<(i64, i32, i32)> = sqlx::query_as(
+            "SELECT f.work_id, sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.id = $1 AND f.work_id IS NOT NULL AND f.is_ignored = FALSE",
         )
-        .bind(eid)
+        .bind(sid)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        match ep_meta {
-            Some((mid, snum, epnum)) => {
-                ensure_media_accessible(&state, &user_id, mid).await?;
-                build_media_sources_for_episode(&state, &host, &token, &session_id, mid, snum, epnum).await?
+        match src_meta {
+            Some((wid, snum, epnum)) => {
+                ensure_media_accessible(&state, &user_id, wid).await?;
+                build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum).await?
             }
-            None => return Err((StatusCode::NOT_FOUND, "分集不存在或已屏蔽".to_string())),
+            None => return Err((StatusCode::NOT_FOUND, "播放源不存在或已屏蔽".to_string())),
         }
     } else {
         return Err((StatusCode::NOT_FOUND, "未找到播放条目".to_string()));
     };
 
-    // 当客户端明确处于点击播放状态 (IsPlayback=true) 时，立即启动 Singleflight 异步换链，
-    // 与客户端解析 JSON 及初始化播放器解码器并行执行，后续 stream.mp4 直接复用该换链任务
     if q.is_playback.unwrap_or(true) {
         let target_src_id = q
             .media_source_id
@@ -147,13 +170,13 @@ async fn get_playback_info_inner(
                     .and_then(|s| s.parse::<i64>().ok())
             });
 
-        if let Some(ep_id) = target_src_id {
+        if let Some(src_id) = target_src_id {
             let state_clone = state.clone();
             tokio::spawn(async move {
                 if let Ok(Some((alist_path, path_hash))) = sqlx::query_as::<_, (String, i64)>(
-                    "SELECT alist_path, path_hash FROM episodes WHERE id = $1",
+                    "SELECT alist_path, path_hash FROM sync_files WHERE id = $1",
                 )
-                .bind(ep_id)
+                .bind(src_id)
                 .fetch_optional(&state_clone.db)
                 .await
                 {
@@ -186,23 +209,23 @@ pub(super) async fn build_media_sources_for_movie(
     host: &str,
     token: &str,
     session_id: &str,
-    media_id: i64,
+    work_id: i64,
 ) -> Result<Vec<Value>, (StatusCode, String)> {
-    let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
     let rows: Vec<SourceRecord> = sqlx::query_as(
         r#"
-        SELECT id, version_tag, container, alist_path, file_size_bytes
-        FROM episodes
-        WHERE media_item_id = ANY($1)
-        ORDER BY priority_score DESC, id ASC
+        SELECT sf.id, sf.version_tag, sf.container, sf.alist_path, sf.file_size_bytes
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        ORDER BY COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(work_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    serialize_media_sources(state, host, token, session_id, format!("media_{}", media_id), rows).await
+    serialize_media_sources(state, host, token, session_id, format!("work_{}", work_id), rows).await
 }
 
 pub(super) async fn build_media_sources_for_episode(
@@ -210,28 +233,38 @@ pub(super) async fn build_media_sources_for_episode(
     host: &str,
     token: &str,
     session_id: &str,
-    media_id: i64,
+    work_id: i64,
     season_num: i32,
     episode_num: i32,
 ) -> Result<Vec<Value>, (StatusCode, String)> {
-    let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
     let rows: Vec<SourceRecord> = sqlx::query_as(
         r#"
-        SELECT id, version_tag, container, alist_path, file_size_bytes
-        FROM episodes
-        WHERE media_item_id = ANY($1) AND season_number = $2 AND episode_number = $3
-        ORDER BY priority_score DESC, id ASC
+        SELECT sf.id, sf.version_tag, sf.container, sf.alist_path, sf.file_size_bytes
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1
+          AND f.is_ignored = FALSE
+          AND sf.season_number = $2
+          AND sf.episode_number = $3
+        ORDER BY COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(work_id)
     .bind(season_num)
     .bind(episode_num)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let rep_id = rows.first().map(|r| r.id).unwrap_or(0);
-    serialize_media_sources(state, host, token, session_id, format!("ep_{}", rep_id), rows).await
+    serialize_media_sources(
+        state,
+        host,
+        token,
+        session_id,
+        format!("ep_{}_{}_{}", work_id, season_num, episode_num),
+        rows,
+    )
+    .await
 }
 
 async fn serialize_media_sources(
@@ -337,23 +370,53 @@ pub(super) async fn stream_video(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // 提取具体多版本 Source ID（若未指定则回退到 item_id 对应默认源）
-    let target_ep_id: i64 = if let Some(ref msid) = q.media_source_id {
+    // 提取具体多版本 Source ID（若未指定则回退到 item_id 对应最高权重源）
+    let target_src_id: i64 = if let Some(ref msid) = q.media_source_id {
         msid.strip_prefix("src_")
-            .or_else(|| msid.strip_prefix("ep_"))
             .unwrap_or(msid)
             .parse::<i64>()
             .unwrap_or(0)
     } else if let Some(raw_sid) = item_id.strip_prefix("src_") {
         raw_sid.parse::<i64>().unwrap_or(0)
-    } else if let Some(raw_eid) = item_id.strip_prefix("ep_") {
-        raw_eid.parse::<i64>().unwrap_or(0)
-    } else if let Some(raw_mid) = item_id.strip_prefix("media_") {
-        let mid = raw_mid.parse::<i64>().unwrap_or(0);
+    } else if let Some(rest) = item_id.strip_prefix("ep_") {
+        let mut parts = rest.rsplitn(3, '_');
+        let epnum = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+        let snum = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+        let wid = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
         sqlx::query_scalar(
-            "SELECT e.id FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.media_item_id = $1 AND m.is_ignored = FALSE ORDER BY e.priority_score DESC LIMIT 1",
+            r#"
+            SELECT sf.id
+            FROM sync_files sf
+            JOIN sync_folders f ON f.id = sf.folder_id
+            WHERE f.work_id = $1 AND f.is_ignored = FALSE
+              AND sf.season_number = $2 AND sf.episode_number = $3
+            ORDER BY COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
+            LIMIT 1
+            "#,
         )
-        .bind(mid)
+        .bind(wid)
+        .bind(snum)
+        .bind(epnum)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(0)
+    } else if let Some(raw_wid) = item_id
+        .strip_prefix("work_")
+        .or_else(|| item_id.strip_prefix("media_"))
+    {
+        let wid = raw_wid.parse::<i64>().unwrap_or(0);
+        sqlx::query_scalar(
+            r#"
+            SELECT sf.id
+            FROM sync_files sf
+            JOIN sync_folders f ON f.id = sf.folder_id
+            WHERE f.work_id = $1 AND f.is_ignored = FALSE
+            ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(wid)
         .fetch_optional(&state.db)
         .await
         .unwrap_or(None)
@@ -363,32 +426,31 @@ pub(super) async fn stream_video(
     };
 
     let row: Option<(i64, String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT e.media_item_id, e.alist_path, e.path_hash, e.file_size_bytes FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.id = $1 AND m.is_ignored = FALSE",
+        "SELECT f.work_id, sf.alist_path, sf.path_hash, sf.file_size_bytes FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.id = $1 AND f.work_id IS NOT NULL AND f.is_ignored = FALSE",
     )
-    .bind(target_ep_id)
+    .bind(target_src_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let Some((mid, alist_path, path_hash, existing_size)) = row else {
+    let Some((wid, alist_path, path_hash, existing_size)) = row else {
         return Err((StatusCode::NOT_FOUND, "未找到对应的视频播放源或条目已被屏蔽".to_string()));
     };
 
-    ensure_media_accessible(&state, &user_id, mid).await?;
+    ensure_media_accessible(&state, &user_id, wid).await?;
 
     let resolved = state
         .resolve_playback_url(path_hash, &alist_path, client_ua)
         .await
-        .map_err(|e| { tracing::error!("❌ [Stream Error] target_ep_id={} alist_path={} 失败: {:#}", target_ep_id, alist_path, e); (StatusCode::BAD_GATEWAY, format!("获取网盘直链失败: {:#}", e)) })?;
+        .map_err(|e| { tracing::error!("❌ [Stream Error] target_src_id={} alist_path={} 失败: {:#}", target_src_id, alist_path, e); (StatusCode::BAD_GATEWAY, format!("获取网盘直链失败: {:#}", e)) })?;
 
-    // 顺手异步回填文件体积
     if existing_size.is_none() {
         if let Some(sz) = resolved.file_size {
             let db = state.db.clone();
             tokio::spawn(async move {
-                let _ = sqlx::query("UPDATE episodes SET file_size_bytes = $1 WHERE id = $2")
+                let _ = sqlx::query("UPDATE sync_files SET file_size_bytes = $1 WHERE id = $2")
                     .bind(sz)
-                    .bind(target_ep_id)
+                    .bind(target_src_id)
                     .execute(&db)
                     .await;
             });
@@ -421,8 +483,8 @@ pub(super) async fn stream_by_d_path(
     let alist_path = format!("/{}", decoded.trim_start_matches('/'));
     let path_hash = xxhash_rust::xxh3::xxh3_64(alist_path.as_bytes()) as i64;
 
-    if let Ok(Some((mid, is_ignored))) = sqlx::query_as::<_, (i64, bool)>(
-        "SELECT e.media_item_id, m.is_ignored FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE e.path_hash = $1 LIMIT 1",
+    if let Ok(Some((wid, is_ignored))) = sqlx::query_as::<_, (Option<i64>, bool)>(
+        "SELECT f.work_id, f.is_ignored FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.path_hash = $1 LIMIT 1",
     )
     .bind(path_hash)
     .fetch_optional(&state.db)
@@ -431,7 +493,9 @@ pub(super) async fn stream_by_d_path(
         if is_ignored {
             return Err((StatusCode::NOT_FOUND, "条目已被屏蔽".to_string()));
         }
-        ensure_media_accessible(&state, &user_id, mid).await?;
+        if let Some(wid) = wid {
+            ensure_media_accessible(&state, &user_id, wid).await?;
+        }
     }
 
     let resolved = state
@@ -453,7 +517,7 @@ pub(super) async fn stream_by_d_path(
         let db = state.db.clone();
         tokio::spawn(async move {
             let _ = sqlx::query(
-                "UPDATE episodes SET file_size_bytes = $1 WHERE path_hash = $2 AND file_size_bytes IS NULL",
+                "UPDATE sync_files SET file_size_bytes = $1 WHERE path_hash = $2 AND file_size_bytes IS NULL",
             )
             .bind(sz)
             .bind(path_hash)

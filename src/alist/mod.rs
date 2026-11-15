@@ -199,7 +199,7 @@ impl AppState {
                     let db_clone = db.clone();
                     tokio::spawn(async move {
                         let _ = sqlx::query(
-                            "UPDATE episodes SET file_size_bytes = $1 WHERE path_hash = $2 AND file_size_bytes IS NULL",
+                            "UPDATE sync_files SET file_size_bytes = $1 WHERE path_hash = $2 AND file_size_bytes IS NULL",
                         )
                         .bind(sz)
                         .bind(path_hash)
@@ -235,52 +235,28 @@ impl AppState {
         })
     }
 
-    /// 查询与指定 `media_item_id` 属于同一部影视（同 `tmdb_id` + `media_type` 且未屏蔽）的所有兄弟目录 ID 列表
-    pub async fn resolve_sibling_media_ids(&self, media_item_id: i64) -> Vec<i64> {
-        let ids: Vec<i64> = sqlx::query_scalar(
-            r#"
-            SELECT m2.id
-            FROM media_items m1
-            JOIN media_items m2
-              ON m2.id = m1.id
-              OR (m1.tmdb_id IS NOT NULL AND m2.tmdb_id = m1.tmdb_id AND m2.media_type = m1.media_type AND m2.is_ignored = FALSE)
-            WHERE m1.id = $1
-            ORDER BY (m2.id = m1.id) DESC, m2.id ASC
-            "#,
-        )
-        .bind(media_item_id)
-        .fetch_all(&self.db)
-        .await
-        .unwrap_or_default();
-
-        if ids.is_empty() {
-            vec![media_item_id]
-        } else {
-            ids
-        }
-    }
-
     /// 零转存浪费的目录寻址预热：用户点进详情页/分集列表时，在后台对父目录执行只读 `/api/fs/list`，
     /// 让小雅提前把挂载目录树和分享文件列表加载进内存，并顺手把整季单集的真实文件体积批量回填到数据库。
     pub fn spawn_prewarm_media_dirs(
         self: &Arc<Self>,
-        media_item_id: i64,
+        work_id: i64,
         season_number: Option<i32>,
     ) {
         let state = self.clone();
         tokio::spawn(async move {
-            let sibling_ids = state.resolve_sibling_media_ids(media_item_id).await;
             let sample_paths: Vec<String> = sqlx::query_scalar(
                 r#"
-                SELECT DISTINCT ON (media_item_id, season_number) alist_path
-                FROM episodes
-                WHERE media_item_id = ANY($1)
-                  AND ($2::int4 IS NULL OR season_number = $2)
-                ORDER BY media_item_id ASC, season_number ASC, priority_score DESC
+                SELECT DISTINCT ON (sf.folder_id, sf.season_number) sf.alist_path
+                FROM sync_files sf
+                JOIN sync_folders f ON f.id = sf.folder_id
+                WHERE f.work_id = $1
+                  AND f.is_ignored = FALSE
+                  AND ($2::int4 IS NULL OR sf.season_number = $2)
+                ORDER BY sf.folder_id ASC, sf.season_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC
                 LIMIT 4
                 "#,
             )
-            .bind(&sibling_ids)
+            .bind(work_id)
             .bind(season_number)
             .fetch_all(&state.db)
             .await
@@ -299,7 +275,6 @@ impl AppState {
                 }
 
                 let state_inner = state.clone();
-                let sibling_ids_inner = sibling_ids.clone();
                 let dir_key = full_dir.clone();
                 let _ = state
                     .caches
@@ -309,15 +284,22 @@ impl AppState {
                         let items = state_inner.call_alist_fs_list(&full_dir).await?;
                         let elapsed = start.elapsed().as_millis();
 
-                        // 顺手把目录下的视频文件真实体积回填到数据库（覆盖所有同 tmdb_id 兄弟目录）
                         let mut updated = 0usize;
                         for item in &items {
                             if !item.is_dir && item.size > 0 {
                                 if let Ok(res) = sqlx::query(
-                                    "UPDATE episodes SET file_size_bytes = $1 WHERE media_item_id = ANY($2) AND file_name = $3 AND file_size_bytes IS NULL",
+                                    r#"
+                                    UPDATE sync_files sf SET file_size_bytes = $1
+                                    FROM sync_folders f
+                                    WHERE sf.folder_id = f.id
+                                      AND f.work_id = $2
+                                      AND f.is_ignored = FALSE
+                                      AND sf.file_name = $3
+                                      AND sf.file_size_bytes IS NULL
+                                    "#,
                                 )
                                 .bind(item.size)
-                                .bind(&sibling_ids_inner)
+                                .bind(work_id)
                                 .bind(&item.name)
                                 .execute(&state_inner.db)
                                 .await

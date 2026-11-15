@@ -51,7 +51,7 @@
           <div class="flex gap-4 bg-slate-950/60 p-4 rounded-2xl border border-slate-800/90">
             <img
               v-if="media.poster_path"
-              :src="`/emby/Items/media_${media.id}/Images/Primary`"
+              :src="`/emby/Items/work_${media.id}/Images/Primary`"
               :alt="`${media.title} 海报`"
               width="96"
               height="144"
@@ -112,15 +112,35 @@
               <div
                 v-for="d in siblingDirs"
                 :key="d.id"
-                class="flex items-center justify-between bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2 text-xs tabular-nums"
+                class="flex flex-wrap items-center justify-between gap-2 bg-slate-950/70 border border-slate-800 rounded-xl px-3.5 py-2 text-xs tabular-nums"
               >
-                <div class="truncate pr-3">
+                <div class="truncate flex-1 min-w-0 pr-2">
                   <span class="text-slate-500 mr-2 font-mono">#{{ d.id }}</span>
-                  <span class="font-mono text-slate-200">{{ d.root_dir }}</span>
+                  <span class="font-mono text-slate-200">{{ d.folder_path }}</span>
                 </div>
-                <span class="shrink-0 px-2 py-0.5 rounded-md bg-slate-800 text-emerald-400 font-mono">
-                  {{ d.episode_count }} 个源
-                </span>
+                <div class="flex items-center gap-2 shrink-0">
+                  <div class="flex items-center gap-1 bg-slate-900 border border-slate-700/80 rounded-lg px-2 py-0.5">
+                    <span class="text-[11px] text-slate-400">目录加权</span>
+                    <button
+                      type="button"
+                      @click="adjustFolderPriority(d, (d.priority_boost || 0) - 20)"
+                      class="cursor-pointer px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                    >
+                      -20
+                    </button>
+                    <span class="font-mono text-emerald-300 w-10 text-center">{{ d.priority_boost || 0 }}</span>
+                    <button
+                      type="button"
+                      @click="adjustFolderPriority(d, (d.priority_boost || 0) + 20)"
+                      class="cursor-pointer px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                    >
+                      +20
+                    </button>
+                  </div>
+                  <span class="px-2 py-0.5 rounded-md bg-slate-800 text-emerald-400 font-mono">
+                    {{ d.file_count }} 个源
+                  </span>
+                </div>
               </div>
             </div>
           </div>
@@ -142,7 +162,7 @@
               <div class="flex gap-3.5 items-start">
                 <img
                   v-if="media.media_type !== 'movie' && grp.rep.still_path"
-                  :src="`/emby/Items/ep_${grp.rep.id}/Images/Primary`"
+                  :src="`/emby/Items/ep_${media.id}_${grp.rep.season_number}_${grp.rep.episode_number}/Images/Primary`"
                   :alt="grp.headerLabel"
                   width="128"
                   height="72"
@@ -196,7 +216,25 @@
                       <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 uppercase font-mono text-[10px]">
                         {{ src.container }}
                       </span>
-                      <span class="text-slate-500 text-[11px] font-mono">权重: {{ src.priority_score }}</span>
+                      <span class="text-slate-400 text-[11px] font-mono">
+                        有效权重: <strong class="text-emerald-300">{{ src.effective_priority }}</strong>
+                        <span v-if="src.priority_override !== null && src.priority_override !== undefined" class="text-amber-300 ml-1">(已锁定 {{ src.priority_override }})</span>
+                      </span>
+                      <button
+                        type="button"
+                        @click="setFilePriority(src, (src.effective_priority || 0) + 100)"
+                        class="cursor-pointer px-1.5 py-0.5 rounded bg-indigo-950/80 hover:bg-indigo-900 text-indigo-300 border border-indigo-500/30 text-[10px]"
+                      >
+                        置顶(+100)
+                      </button>
+                      <button
+                        v-if="src.priority_override !== null && src.priority_override !== undefined"
+                        type="button"
+                        @click="setFilePriority(src, null)"
+                        class="cursor-pointer px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
+                      >
+                        恢复默认
+                      </button>
                     </div>
                     <div>
                       <span v-if="!src.file_size_bytes || src.file_size_bytes <= 0" class="text-slate-500">
@@ -273,12 +311,32 @@ async function fetchDetail(id) {
   try {
     const data = await adminApi.getMediaDetail(id)
     media.value = data.media
-    siblingDirs.value = data.sibling_dirs || []
+    siblingDirs.value = data.folders || data.sibling_dirs || []
     episodes.value = data.episodes || []
   } catch (err) {
     toast.error('加载详情失败：' + err.message)
   } finally {
     loading.value = false
+  }
+}
+
+async function adjustFolderPriority(folder, nextVal) {
+  try {
+    const res = await adminApi.updateFolderPriority(folder.id, nextVal)
+    toast.success(res.message)
+    if (props.mediaId) await fetchDetail(props.mediaId)
+  } catch (err) {
+    toast.error('调整目录权重失败：' + err.message)
+  }
+}
+
+async function setFilePriority(file, overrideVal) {
+  try {
+    const res = await adminApi.updateFilePriority(file.id, overrideVal)
+    toast.success(res.message)
+    if (props.mediaId) await fetchDetail(props.mediaId)
+  } catch (err) {
+    toast.error('调整文件权重失败：' + err.message)
   }
 }
 

@@ -1,21 +1,34 @@
 pub mod tmdb;
 
-use crate::state::AppState;
+use crate::state::{AppState, ScrapeTask};
 use anyhow::Result;
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use std::{collections::HashSet, sync::Arc, time::Duration};
+use tmdb::ScrapedMetadata;
 use tokio::{sync::mpsc, time::sleep};
 use tracing::{debug, error, info};
 
 #[derive(sqlx::FromRow, Debug)]
-struct PendingMediaRow {
+struct PendingFolderRow {
+    id: i64,
+    inferred_media_type: String,
+    parsed_tmdb_id: Option<i32>,
+    clean_title: String,
+    year: Option<i32>,
+    retry_count: i16,
+    scrape_state: String,
+    work_id: Option<i64>,
+    is_locked: bool,
+}
+
+#[derive(sqlx::FromRow, Debug)]
+struct WorkSummaryRow {
     id: i64,
     media_type: String,
     tmdb_id: Option<i32>,
     title: String,
+    original_title: Option<String>,
     year: Option<i32>,
-    retry_count: i16,
-    scrape_status: i16,
     is_locked: bool,
     metadata_version: i16,
     metadata_refresh_requested: bool,
@@ -23,9 +36,9 @@ struct PendingMediaRow {
 }
 
 /// 启动后台四级优先级智能刮削协程
-pub fn spawn_scrape_worker(state: Arc<AppState>, mut priority_rx: mpsc::Receiver<i64>) {
+pub fn spawn_scrape_worker(state: Arc<AppState>, mut priority_rx: mpsc::Receiver<ScrapeTask>) {
     tokio::spawn(async move {
-        info!("TMDB 智能刮削调度器已启动（支持 P0 实时插队、分集刮削与追更自动补齐）");
+        info!("TMDB 智能刮削调度器已启动（支持 Staging 校验、P0 实时插队与分集追更补齐）");
 
         loop {
             tokio::select! {
@@ -33,23 +46,35 @@ pub fn spawn_scrape_worker(state: Arc<AppState>, mut priority_rx: mpsc::Receiver
                     info!("收到停机信号，刮削调度器退出");
                     break;
                 }
-                // P0 实时插队通道（前端浏览或点开详情/季列表触发）
-                Some(urgent_media_id) = priority_rx.recv() => {
-                    if let Err(e) = scrape_single_media_with_mode(&state, urgent_media_id, true).await {
-                        debug!("P0 实时刮削条目 {} 失败: {:#}", urgent_media_id, e);
+                Some(task) = priority_rx.recv() => {
+                    match task {
+                        ScrapeTask::Folder(fid) => {
+                            if let Err(e) = scrape_single_folder_with_mode(&state, fid, true).await {
+                                debug!("P0 实时刮削目录 {} 失败: {:#}", fid, e);
+                            }
+                        }
+                        ScrapeTask::WorkSeasons(wid) => {
+                            if let Err(e) = scrape_work_seasons_by_id(&state, wid, true).await {
+                                debug!("P0 实时刷新作品 {} 分集失败: {:#}", wid, e);
+                            }
+                        }
                     }
                 }
-                // 常规队列轮询（按 P1 -> P2 -> P3 顺序消化主条目与待补齐分集）
                 _ = sleep(Duration::from_millis(200)) => {
-                    match fetch_next_pending_id(&state).await {
-                        Ok(Some(next_id)) => {
-                            if let Err(e) = scrape_single_media_with_mode(&state, next_id, false).await {
-                                debug!("常规队列刮削条目 {} 失败: {:#}", next_id, e);
+                    match fetch_next_pending_task(&state).await {
+                        Ok(Some(ScrapeTask::Folder(fid))) => {
+                            if let Err(e) = scrape_single_folder_with_mode(&state, fid, false).await {
+                                debug!("常规队列刮削目录 {} 失败: {:#}", fid, e);
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                        Ok(Some(ScrapeTask::WorkSeasons(wid))) => {
+                            if let Err(e) = scrape_work_seasons_by_id(&state, wid, false).await {
+                                debug!("常规队列刷新作品 {} 失败: {:#}", wid, e);
                                 sleep(Duration::from_secs(1)).await;
                             }
                         }
                         Ok(None) => {
-                            // 队列空闲时休眠 3 秒避免空转查询 PG
                             sleep(Duration::from_secs(3)).await;
                         }
                         Err(e) => {
@@ -63,19 +88,17 @@ pub fn spawn_scrape_worker(state: Arc<AppState>, mut priority_rx: mpsc::Receiver
     });
 }
 
-async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
+async fn fetch_next_pending_task(state: &AppState) -> Result<Option<ScrapeTask>> {
     let cfg = state.config.load();
-    // 若未开启后台全库自动刮削，或未配置 API Key，则静默等待 P0 实时插队请求
     if cfg.tmdb_api_key.is_empty() || cfg.tmdb_api_key == "your_tmdb_api_key" {
         return Ok(None);
     }
 
-    // 1. 显式触发的元数据补齐任务（即使关闭全库自动刮削也优先执行）
+    // 1. 显式触发的正式作品元数据补齐任务
     let explicit_refresh: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT id FROM media_items
-        WHERE NOT is_ignored
-          AND NOT is_locked
+        SELECT id FROM media_works
+        WHERE NOT is_locked
           AND metadata_refresh_requested = TRUE
           AND (metadata_retry_at IS NULL OR metadata_retry_at <= NOW())
           AND metadata_retry_count < 3
@@ -85,102 +108,100 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
     )
     .fetch_optional(&state.db)
     .await?;
-    if explicit_refresh.is_some() {
-        return Ok(explicit_refresh);
+    if let Some(wid) = explicit_refresh {
+        return Ok(Some(ScrapeTask::WorkSeasons(wid)));
     }
+
     if !cfg.scraper_auto_background {
         return Ok(None);
     }
 
-    // 2a. 优先消化尚未完成主条目刮削的新入库影视（命中 idx_media_scrape_queue 索引）
-    let id: Option<i64> = sqlx::query_scalar(
+    // 2a. 待刮削中间表目录（pending）
+    let pending_fid: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT id FROM media_items m
-        WHERE m.is_ignored = FALSE
-          AND m.is_locked = FALSE
-          AND m.scrape_status = 0
-          AND EXISTS (SELECT 1 FROM episodes e WHERE e.media_item_id = m.id)
-        ORDER BY m.scrape_priority ASC, m.id DESC
+        SELECT id FROM sync_folders
+        WHERE scrape_state = 'pending' AND is_ignored = FALSE AND is_locked = FALSE
+        ORDER BY scrape_priority ASC, id DESC
         LIMIT 1
         "#,
     )
     .fetch_optional(&state.db)
     .await?;
-
-    if id.is_some() {
-        return Ok(id);
+    if let Some(fid) = pending_fid {
+        return Ok(Some(ScrapeTask::Folder(fid)));
     }
 
-    // 2b. 消化已到退避冷却时间的待重试影视（命中 idx_media_retry_queue 索引）
-    let retry_id: Option<i64> = sqlx::query_scalar(
+    // 2b. 到期重试的失败目录（failed）
+    let retry_fid: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT id FROM media_items m
-        WHERE m.is_ignored = FALSE
-          AND m.is_locked = FALSE
-          AND m.scrape_status = 2
-          AND m.retry_count < 3
-          AND (m.next_retry_at IS NULL OR m.next_retry_at <= NOW())
-          AND EXISTS (SELECT 1 FROM episodes e WHERE e.media_item_id = m.id)
-        ORDER BY m.scrape_priority ASC, m.id DESC
+        SELECT id FROM sync_folders
+        WHERE scrape_state = 'failed'
+          AND is_ignored = FALSE
+          AND is_locked = FALSE
+          AND retry_count < 3
+          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+        ORDER BY scrape_priority ASC, id DESC
         LIMIT 1
         "#,
     )
     .fetch_optional(&state.db)
     .await?;
-
-    if retry_id.is_some() {
-        return Ok(retry_id);
+    if let Some(fid) = retry_fid {
+        return Ok(Some(ScrapeTask::Folder(fid)));
     }
 
-    // 3. 消化已刮削（含手动锁定追更）剧集中存在“未刮削新季/新集 (scrape_attempts = 0)”或“连载残缺集已过 24h 冷却期 (meta_incomplete = TRUE)”的条目
-    let season_pending_id: Option<i64> = sqlx::query_scalar(
+    // 3. 正式剧集作品存在未刮削季 / 增量新集 / 连载残缺集
+    let cooldown_cutoff = Utc::now() - ChronoDuration::hours(24);
+    let tv_wid: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT m.id
-        FROM media_items m
-        WHERE m.is_ignored = FALSE
-          AND m.media_type = 'tv'
-          AND m.tmdb_id IS NOT NULL
-          AND m.scrape_status IN (1, 3)
+        SELECT w.id
+        FROM media_works w
+        WHERE w.media_type = 'tv'
+          AND w.tmdb_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM sync_folders f
+              WHERE f.work_id = w.id AND f.is_ignored = FALSE
+          )
           AND (
               EXISTS (
-                  SELECT 1 FROM seasons s
-                  WHERE s.media_item_id = m.id AND s.scrape_attempts = 0
-              )
-              OR EXISTS (
-                  SELECT 1 FROM seasons s
-                  JOIN episodes e ON e.media_item_id = s.media_item_id AND e.season_number = s.season_number
-                  WHERE s.media_item_id = m.id
-                    AND s.scrape_attempts BETWEEN 1 AND 4
-                    AND e.meta_incomplete = TRUE
-                    AND e.updated_at <= NOW() - INTERVAL '24 hours'
-              )
-              OR EXISTS (
-                  SELECT 1 FROM episodes e
-                  WHERE e.media_item_id = m.id
+                  SELECT 1 FROM sync_files sf
+                  JOIN sync_folders f ON f.id = sf.folder_id
+                  WHERE f.work_id = w.id AND f.is_ignored = FALSE
                     AND NOT EXISTS (
-                        SELECT 1 FROM seasons s
-                        WHERE s.media_item_id = m.id AND s.season_number = e.season_number
+                        SELECT 1 FROM work_seasons ws
+                        WHERE ws.work_id = w.id AND ws.season_number = sf.season_number
                     )
               )
+              OR EXISTS (
+                  SELECT 1 FROM work_seasons ws
+                  WHERE ws.work_id = w.id AND ws.scrape_attempts = 0
+              )
+              OR EXISTS (
+                  SELECT 1 FROM work_episodes we
+                  JOIN work_seasons ws ON ws.work_id = we.work_id AND ws.season_number = we.season_number
+                  WHERE we.work_id = w.id
+                    AND we.meta_incomplete = TRUE
+                    AND we.updated_at <= $1
+                    AND ws.scrape_attempts BETWEEN 1 AND 4
+              )
           )
-        ORDER BY m.scrape_priority ASC, m.id DESC
+        ORDER BY w.id DESC
         LIMIT 1
         "#,
     )
+    .bind(cooldown_cutoff)
     .fetch_optional(&state.db)
     .await?;
-
-    if season_pending_id.is_some() {
-        return Ok(season_pending_id);
+    if let Some(wid) = tv_wid {
+        return Ok(Some(ScrapeTask::WorkSeasons(wid)));
     }
 
-    // 4. 最后再被动补齐/刷新已刮削老条目的扩展元数据（避免堵死待刮削新片队列）
-    let passive_refresh: Option<i64> = sqlx::query_scalar(
+    // 4. 被动刷新过期作品元数据
+    let stale_wid: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT id FROM media_items
-        WHERE NOT is_ignored
-          AND NOT is_locked
-          AND scrape_status IN (1, 3)
+        SELECT id FROM media_works
+        WHERE NOT is_locked
+          AND tmdb_id IS NOT NULL
           AND (metadata_retry_at IS NULL OR metadata_retry_at <= NOW())
           AND metadata_retry_count < 3
           AND (
@@ -197,179 +218,369 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
     .fetch_optional(&state.db)
     .await?;
 
-    Ok(passive_refresh)
+    Ok(stale_wid.map(ScrapeTask::WorkSeasons))
 }
 
-pub async fn scrape_single_media(state: &AppState, media_id: i64) -> Result<()> {
-    scrape_single_media_with_mode(state, media_id, true).await
+fn normalize_for_match(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
-pub async fn scrape_single_media_with_mode(
+fn titles_similar(local_title: &str, tmdb_title: &str, tmdb_orig: Option<&str>) -> bool {
+    let a = normalize_for_match(local_title);
+    if a.chars().count() < 2 {
+        return true;
+    }
+
+    for cand_raw in std::iter::once(tmdb_title).chain(tmdb_orig) {
+        let b = normalize_for_match(cand_raw);
+        if b.is_empty() {
+            continue;
+        }
+        if a.contains(&b) || b.contains(&a) {
+            return true;
+        }
+        let set_a: HashSet<char> = a.chars().collect();
+        let set_b: HashSet<char> = b.chars().collect();
+        let common = set_a.intersection(&set_b).count();
+        let min_len = set_a.len().min(set_b.len()).max(1);
+        if (common as f64 / min_len as f64) >= 0.45 {
+            return true;
+        }
+    }
+    false
+}
+
+/// 4 维度交叉校验：基本类型、片名相似度（含原名）、发行年份容差、本地多集结构
+fn verify_tmdb_match(
+    clean_title: &str,
+    local_year: Option<i32>,
+    ep_count: i64,
+    max_season: i32,
+    strict_title_check: bool,
+    tmdb_media_type: &str,
+    tmdb_title: &str,
+    tmdb_orig: Option<&str>,
+    tmdb_year: Option<i32>,
+) -> std::result::Result<(), String> {
+    if (ep_count > 1 || max_season > 0) && tmdb_media_type != "tv" {
+        return Err(format!(
+            "类型冲突：本地包含多集/季({}集, S{})，TMDB 返回电影《{}》",
+            ep_count, max_season, tmdb_title
+        ));
+    }
+
+    let title_ok = titles_similar(clean_title, tmdb_title, tmdb_orig);
+    let year_diff = match (local_year, tmdb_year) {
+        (Some(ly), Some(ty)) => Some((ly - ty).abs()),
+        _ => None,
+    };
+
+    if strict_title_check && !title_ok {
+        return Err(format!(
+            "片名冲突：本地「{}」与 TMDB「{} / {}」差异过大",
+            clean_title,
+            tmdb_title,
+            tmdb_orig.unwrap_or("-")
+        ));
+    }
+
+    if !title_ok && year_diff.unwrap_or(0) > 2 {
+        return Err(format!(
+            "片名与年份双重冲突：本地「{}({})」vs TMDB「{}({})」",
+            clean_title,
+            local_year.unwrap_or(0),
+            tmdb_title,
+            tmdb_year.unwrap_or(0)
+        ));
+    }
+
+    Ok(())
+}
+
+async fn upsert_media_work(state: &AppState, meta: &ScrapedMetadata) -> Result<i64> {
+    let extra_json = serde_json::to_value(&meta.extra)?;
+    let wid: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO media_works (
+            media_type, tmdb_id, title, original_title, year, premiered_at, overview,
+            rating, poster_path, backdrop_path, countries, networks, genres, category,
+            tmdb_metadata, metadata_version, metadata_fetched_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 2, NOW())
+        ON CONFLICT (tmdb_id, media_type) WHERE tmdb_id IS NOT NULL DO UPDATE SET
+            title = CASE WHEN media_works.is_locked THEN media_works.title ELSE EXCLUDED.title END,
+            original_title = CASE WHEN media_works.is_locked THEN media_works.original_title ELSE EXCLUDED.original_title END,
+            year = CASE WHEN media_works.is_locked THEN media_works.year ELSE COALESCE(EXCLUDED.year, media_works.year) END,
+            premiered_at = CASE WHEN media_works.is_locked THEN media_works.premiered_at ELSE EXCLUDED.premiered_at END,
+            overview = CASE WHEN media_works.is_locked THEN media_works.overview ELSE EXCLUDED.overview END,
+            rating = CASE WHEN media_works.is_locked THEN media_works.rating ELSE EXCLUDED.rating END,
+            poster_path = CASE WHEN media_works.is_locked THEN media_works.poster_path ELSE EXCLUDED.poster_path END,
+            backdrop_path = CASE WHEN media_works.is_locked THEN media_works.backdrop_path ELSE EXCLUDED.backdrop_path END,
+            countries = CASE WHEN media_works.is_locked THEN media_works.countries ELSE EXCLUDED.countries END,
+            networks = CASE WHEN media_works.is_locked THEN media_works.networks ELSE EXCLUDED.networks END,
+            genres = CASE WHEN media_works.is_locked THEN media_works.genres ELSE EXCLUDED.genres END,
+            category = CASE WHEN media_works.is_locked THEN media_works.category ELSE EXCLUDED.category END,
+            tmdb_metadata = EXCLUDED.tmdb_metadata,
+            metadata_version = 2,
+            metadata_fetched_at = NOW(),
+            metadata_refresh_requested = FALSE,
+            metadata_retry_count = 0,
+            metadata_retry_at = NULL,
+            updated_at = NOW()
+        RETURNING id
+        "#,
+    )
+    .bind(&meta.media_type)
+    .bind(meta.tmdb_id)
+    .bind(&meta.title)
+    .bind(&meta.original_title)
+    .bind(meta.year)
+    .bind(&meta.premiered_at)
+    .bind(&meta.overview)
+    .bind(meta.rating)
+    .bind(&meta.poster_path)
+    .bind(&meta.backdrop_path)
+    .bind(&meta.countries)
+    .bind(&meta.networks)
+    .bind(&meta.genres)
+    .bind(&meta.category)
+    .bind(extra_json)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(wid)
+}
+
+pub async fn scrape_single_folder(state: &AppState, folder_id: i64) -> Result<()> {
+    scrape_single_folder_with_mode(state, folder_id, true).await
+}
+
+pub async fn scrape_single_folder_with_mode(
     state: &AppState,
-    media_id: i64,
+    folder_id: i64,
     is_p0: bool,
 ) -> Result<()> {
-    let row: Option<PendingMediaRow> = sqlx::query_as(
-        "SELECT id, media_type, tmdb_id, title, year, retry_count, scrape_status, is_locked, metadata_version, metadata_refresh_requested, metadata_retry_count FROM media_items WHERE id = $1",
+    let row: Option<PendingFolderRow> = sqlx::query_as(
+        "SELECT id, inferred_media_type, parsed_tmdb_id, clean_title, year, retry_count, scrape_state, work_id, is_locked FROM sync_folders WHERE id = $1",
     )
-    .bind(media_id)
+    .bind(folder_id)
     .fetch_optional(&state.db)
     .await?;
 
-    let Some(item) = row else {
+    let Some(folder) = row else {
         return Ok(());
     };
 
-    // 若主条目已手动锁定，仅允许剧集追更季/分集元数据，不覆盖主条目自身
-    if item.is_locked {
-        if item.media_type == "tv" {
-            if let Some(tid) = item.tmdb_id {
-                scrape_tv_seasons(state, item.id, tid, item.year, is_p0).await?;
-            }
+    if folder.is_locked {
+        if let Some(wid) = folder.work_id {
+            let _ = scrape_work_seasons_by_id(state, wid, is_p0).await;
         }
         return Ok(());
     }
 
-    // 若主条目已刮削完成（scrape_status 为 1 或 3），直接检查并刮削其下待更新的季与分集
-    let stale: bool = sqlx::query_scalar("SELECT metadata_fetched_at IS NULL OR metadata_fetched_at < NOW() - CASE WHEN tmdb_metadata->>'status'='Returning Series' THEN INTERVAL '1 day' ELSE INTERVAL '7 days' END FROM media_items WHERE id=$1")
-        .bind(item.id).fetch_one(&state.db).await?;
-    if (item.scrape_status == 1 || item.scrape_status == 3) && item.metadata_version >= 2 && !item.metadata_refresh_requested && !stale {
-        if item.media_type == "tv" {
-            if let Some(tid) = item.tmdb_id {
-                scrape_tv_seasons(state, item.id, tid, item.year, is_p0).await?;
-            }
+    if folder.scrape_state == "verified" {
+        if let Some(wid) = folder.work_id {
+            return scrape_work_seasons_by_id(state, wid, is_p0).await;
         }
-        return Ok(());
     }
 
-    // 优化：若当前条目已带 tmdb_id，且库中已有其它同 (tmdb_id, media_type) 的已刮削兄弟目录，
-    // 直接零网络开销复用本地元数据，省去重复请求 TMDB API
-    if let Some(tid) = item.tmdb_id {
-        let reused = sqlx::query(
+    let (ep_count, max_season): (i64, i32) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(MAX(season_number), 0) FROM sync_files WHERE folder_id = $1",
+    )
+    .bind(folder.id)
+    .fetch_one(&state.db)
+    .await?;
+
+    // 1. 若自带 parsed_tmdb_id 且库中已有新鲜且同类型的正式作品，先本地交叉校验后零开销复用
+    if let Some(tid) = folder.parsed_tmdb_id {
+        let cached_work: Option<WorkSummaryRow> = sqlx::query_as(
             r#"
-            UPDATE media_items AS target SET
-                title = src.title,
-                original_title = src.original_title,
-                year = COALESCE(src.year, target.year),
-                premiered_at = src.premiered_at,
-                overview = src.overview,
-                rating = src.rating,
-                poster_path = src.poster_path,
-                backdrop_path = src.backdrop_path,
-                countries = src.countries,
-                networks = src.networks,
-                genres = src.genres,
-                category = src.category,
-                tmdb_metadata = src.tmdb_metadata,
-                metadata_version = src.metadata_version,
-                metadata_fetched_at = src.metadata_fetched_at,
-                metadata_refresh_requested = FALSE, metadata_retry_count = 0, metadata_retry_at = NULL,
-                scrape_status = 1, retry_count = 0, next_retry_at = NULL,
-                updated_at = NOW()
-            FROM (
-                SELECT title, original_title, year, premiered_at, overview, rating,
-                       poster_path, backdrop_path, countries, networks, genres, category, tmdb_metadata, metadata_version, metadata_fetched_at
-                FROM media_items
-                WHERE tmdb_id = $1 AND media_type = $2 AND scrape_status IN (1, 3) AND id != $3
-                  AND is_ignored = FALSE
-                  AND metadata_version >= 2
-                  AND metadata_fetched_at > NOW() - INTERVAL '1 day'
-                  AND NOT metadata_refresh_requested
-                  AND ($4::timestamptz IS NULL OR metadata_fetched_at > $4)
-                ORDER BY metadata_fetched_at DESC LIMIT 1
-            ) AS src
-            WHERE target.id = $3
+            SELECT id, media_type, tmdb_id, title, original_title, year, is_locked,
+                   metadata_version, metadata_refresh_requested, metadata_retry_count
+            FROM media_works
+            WHERE tmdb_id = $1 AND media_type = $2
+              AND metadata_version >= 2
+              AND metadata_fetched_at > NOW() - INTERVAL '1 day'
+              AND NOT metadata_refresh_requested
+            LIMIT 1
             "#,
         )
         .bind(tid)
-        .bind(&item.media_type)
-        .bind(item.id)
-        .bind(if stale && item.metadata_version >= 2 { Some(Utc::now() - ChronoDuration::days(1)) } else { None })
-        .execute(&state.db)
-        .await?
-        .rows_affected();
+        .bind(&folder.inferred_media_type)
+        .fetch_optional(&state.db)
+        .await?;
 
-        if reused > 0 {
-            state.caches.admin_stats_cache.invalidate_all();
-            debug!(
-                "♻️ [Scraper] media_id={} (tmdb_id={}) 命中本地兄弟目录元数据缓存，跳过主条目远端请求",
-                item.id, tid
-            );
-            if item.media_type == "tv" {
-                scrape_tv_seasons(state, item.id, tid, item.year, is_p0).await?;
+        if let Some(work) = cached_work {
+            if verify_tmdb_match(
+                &folder.clean_title,
+                folder.year,
+                ep_count,
+                max_season,
+                true,
+                &work.media_type,
+                &work.title,
+                work.original_title.as_deref(),
+                work.year,
+            )
+            .is_ok()
+            {
+                sqlx::query(
+                    "UPDATE sync_folders SET work_id = $1, scrape_state = 'verified', conflict_reason = NULL, retry_count = 0, next_retry_at = NULL, updated_at = NOW() WHERE id = $2",
+                )
+                .bind(work.id)
+                .bind(folder.id)
+                .execute(&state.db)
+                .await?;
+
+                state.caches.admin_stats_cache.invalidate_all();
+                if work.media_type == "tv" {
+                    scrape_tv_seasons(state, work.id, tid, work.year.or(folder.year), is_p0).await?;
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     }
 
-    match state
-        .scrape_tmdb_metadata(item.tmdb_id, &item.media_type, &item.title, item.year)
-        .await
-    {
-        Ok(meta) => {
-            // 同时更新当前条目以及库中具有相同 (tmdb_id, media_type) 未锁定的兄弟目录
+    // 2. 请求 TMDB 刮削并做多重交叉校验
+    let effective_type = if ep_count > 1 || max_season > 0 {
+        "tv"
+    } else {
+        folder.inferred_media_type.as_str()
+    };
+
+    let fetch_res = if let Some(tid) = folder.parsed_tmdb_id {
+        match state
+            .scrape_tmdb_metadata(Some(tid), effective_type, &folder.clean_title, folder.year)
+            .await
+        {
+            Ok(meta) => {
+                match verify_tmdb_match(
+                    &folder.clean_title,
+                    folder.year,
+                    ep_count,
+                    max_season,
+                    true,
+                    &meta.media_type,
+                    &meta.title,
+                    meta.original_title.as_deref(),
+                    meta.year,
+                ) {
+                    Ok(()) => Ok(Ok(meta)),
+                    Err(reason) => {
+                        debug!(
+                            "⚠️ [Scraper] folder_id={} parsed_tmdb_id={} 校验未通过({}), 降级用片名搜索兜底",
+                            folder.id, tid, reason
+                        );
+                        match state
+                            .scrape_tmdb_metadata(None, effective_type, &folder.clean_title, folder.year)
+                            .await
+                        {
+                            Ok(fb) => {
+                                match verify_tmdb_match(
+                                    &folder.clean_title,
+                                    folder.year,
+                                    ep_count,
+                                    max_season,
+                                    false,
+                                    &fb.media_type,
+                                    &fb.title,
+                                    fb.original_title.as_deref(),
+                                    fb.year,
+                                ) {
+                                    Ok(()) => Ok(Ok(fb)),
+                                    Err(fb_reason) => Ok(Err(fb_reason)),
+                                }
+                            }
+                            Err(_) => Ok(Err(reason)),
+                        }
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        match state
+            .scrape_tmdb_metadata(None, effective_type, &folder.clean_title, folder.year)
+            .await
+        {
+            Ok(meta) => {
+                match verify_tmdb_match(
+                    &folder.clean_title,
+                    folder.year,
+                    ep_count,
+                    max_season,
+                    false,
+                    &meta.media_type,
+                    &meta.title,
+                    meta.original_title.as_deref(),
+                    meta.year,
+                ) {
+                    Ok(()) => Ok(Ok(meta)),
+                    Err(reason) => Ok(Err(reason)),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    };
+
+    match fetch_res {
+        Ok(Ok(meta)) => {
+            let work_id = upsert_media_work(state, &meta).await?;
             sqlx::query(
                 r#"
-                UPDATE media_items SET
-                    media_type = $1, tmdb_id = $2, title = $3, original_title = $4,
-                    year = CASE WHEN $5 IS NOT NULL THEN $5 WHEN year > EXTRACT(YEAR FROM NOW())::int + 2 THEN NULL ELSE year END, premiered_at = $6, overview = $7,
-                    rating = $8, poster_path = $9, backdrop_path = $10,
-                    countries = $11, networks = $12, genres = $13, category = $14,
-                    tmdb_metadata = $16, metadata_version = 2, metadata_fetched_at = NOW(),
-                    metadata_refresh_requested = FALSE, metadata_retry_count = 0, metadata_retry_at = NULL,
-                    scrape_status = 1, retry_count = 0, next_retry_at = NULL, updated_at = NOW()
-                WHERE id = $15
-                   OR (tmdb_id = $2 AND media_type = $1 AND is_locked = FALSE AND is_ignored = FALSE)
+                UPDATE sync_folders SET
+                    work_id = $1,
+                    scrape_state = 'verified',
+                    conflict_reason = NULL,
+                    retry_count = 0,
+                    next_retry_at = NULL,
+                    updated_at = NOW()
+                WHERE id = $2
                 "#,
             )
-            .bind(&meta.media_type)
-            .bind(meta.tmdb_id)
-            .bind(&meta.title)
-            .bind(&meta.original_title)
-            .bind(meta.year)
-            .bind(&meta.premiered_at)
-            .bind(&meta.overview)
-            .bind(meta.rating)
-            .bind(&meta.poster_path)
-            .bind(&meta.backdrop_path)
-            .bind(&meta.countries)
-            .bind(&meta.networks)
-            .bind(&meta.genres)
-            .bind(&meta.category)
-            .bind(item.id)
-            .bind(serde_json::to_value(&meta.extra)?)
+            .bind(work_id)
+            .bind(folder.id)
             .execute(&state.db)
             .await?;
 
             state.caches.admin_stats_cache.invalidate_all();
-
             info!(
-                "✅ [Scraper] 刮削完成 media_id={} tmdb_id={} type={} title={:?}",
-                item.id, meta.tmdb_id, meta.media_type, meta.title
+                "✅ [Scraper] 目录刮削并校验通过 folder_id={} -> work_id={} tmdb_id={} type={} title={:?}",
+                folder.id, work_id, meta.tmdb_id, meta.media_type, meta.title
             );
 
-            // 主条目刮削成功后，若为剧集则继续刮削其下所有季与单集元数据
             if meta.media_type == "tv" {
                 if let Err(e) =
-                    scrape_tv_seasons(state, item.id, meta.tmdb_id, meta.year.or(item.year), is_p0)
+                    scrape_tv_seasons(state, work_id, meta.tmdb_id, meta.year.or(folder.year), is_p0)
                         .await
                 {
-                    debug!(
-                        "剧集 media_id={} (tmdb_id={}) 分集元数据刮削部分异常: {:#}",
-                        item.id, meta.tmdb_id, e
-                    );
+                    debug!("作品 work_id={} 分集刮削部分异常: {:#}", work_id, e);
                 }
             }
         }
+        Ok(Err(conflict_reason)) => {
+            sqlx::query(
+                r#"
+                UPDATE sync_folders SET
+                    scrape_state = 'conflict',
+                    conflict_reason = $1,
+                    work_id = NULL,
+                    updated_at = NOW()
+                WHERE id = $2
+                "#,
+            )
+            .bind(&conflict_reason)
+            .bind(folder.id)
+            .execute(&state.db)
+            .await?;
+            state.caches.admin_stats_cache.invalidate_all();
+            info!("⚠️ [Scraper] 目录校验存疑 folder_id={}: {}", folder.id, conflict_reason);
+        }
         Err(e) => {
-            if item.scrape_status == 1 || item.scrape_status == 3 {
-                let retries = item.metadata_retry_count.saturating_add(1);
-                sqlx::query("UPDATE media_items SET metadata_retry_count=$2, metadata_retry_at=NOW()+INTERVAL '1 day' WHERE id=$1")
-                    .bind(item.id).bind(retries).execute(&state.db).await?;
-                return Err(e);
-            }
-            // 指数退避重试：第1次 24小时，第2次 3天，第3次 7天
-            let next_retry = item.retry_count + 1;
+            let next_retry = folder.retry_count + 1;
             let backoff_hours = match next_retry {
                 1 => 24,
                 2 => 72,
@@ -378,18 +589,14 @@ pub async fn scrape_single_media_with_mode(
             let next_at = Utc::now() + ChronoDuration::hours(backoff_hours);
 
             sqlx::query(
-                r#"
-                UPDATE media_items SET
-                    scrape_status = 2, retry_count = $1, next_retry_at = $2, updated_at = NOW()
-                WHERE id = $3
-                "#,
+                "UPDATE sync_folders SET scrape_state = 'failed', retry_count = $1, next_retry_at = $2, updated_at = NOW() WHERE id = $3",
             )
             .bind(next_retry)
             .bind(next_at)
-            .bind(item.id)
+            .bind(folder.id)
             .execute(&state.db)
             .await?;
-
+            state.caches.admin_stats_cache.invalidate_all();
             return Err(e);
         }
     }
@@ -397,160 +604,163 @@ pub async fn scrape_single_media_with_mode(
     Ok(())
 }
 
-/// 刮削电视剧的季与单集元数据（支持多目录共享复用、增量新集立即刮削、未完结残缺新集冷却重刷）
+/// 刷新正式作品（扩展元数据 + 剧集季/分集）
+pub async fn scrape_work_seasons_by_id(
+    state: &AppState,
+    work_id: i64,
+    is_p0: bool,
+) -> Result<()> {
+    let row: Option<WorkSummaryRow> = sqlx::query_as(
+        "SELECT id, media_type, tmdb_id, title, original_title, year, is_locked, metadata_version, metadata_refresh_requested, metadata_retry_count FROM media_works WHERE id = $1",
+    )
+    .bind(work_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let Some(work) = row else {
+        return Ok(());
+    };
+
+    let Some(tid) = work.tmdb_id else {
+        return Ok(());
+    };
+
+    let stale: bool = sqlx::query_scalar(
+        "SELECT metadata_fetched_at IS NULL OR metadata_fetched_at < NOW() - CASE WHEN tmdb_metadata->>'status'='Returning Series' THEN INTERVAL '1 day' ELSE INTERVAL '7 days' END FROM media_works WHERE id = $1",
+    )
+    .bind(work.id)
+    .fetch_one(&state.db)
+    .await?;
+
+    if !work.is_locked && (work.metadata_version < 2 || work.metadata_refresh_requested || stale) {
+        match state
+            .scrape_tmdb_metadata(Some(tid), &work.media_type, &work.title, work.year)
+            .await
+        {
+            Ok(meta) => {
+                let _ = upsert_media_work(state, &meta).await?;
+                state.caches.admin_stats_cache.invalidate_all();
+            }
+            Err(e) => {
+                let retries = work.metadata_retry_count.saturating_add(1);
+                let _ = sqlx::query(
+                    "UPDATE media_works SET metadata_retry_count = $2, metadata_retry_at = NOW() + INTERVAL '1 day' WHERE id = $1",
+                )
+                .bind(work.id)
+                .bind(retries)
+                .execute(&state.db)
+                .await;
+                return Err(e);
+            }
+        }
+    }
+
+    if work.media_type == "tv" {
+        scrape_tv_seasons(state, work.id, tid, work.year, is_p0).await?;
+    }
+    Ok(())
+}
+
+/// 刮削正式剧集作品的季与单集元数据（全库单份存储在 work_seasons / work_episodes）
 pub async fn scrape_tv_seasons(
     state: &AppState,
-    media_id: i64,
+    work_id: i64,
     tmdb_id: i32,
     series_year: Option<i32>,
     is_p0: bool,
 ) -> Result<()> {
-    let sibling_ids = state.resolve_sibling_media_ids(media_id).await;
-
-    // 1. 确保所有包含单集的季都在 seasons 表中有对应记录（兼容原本被推断为 movie 后修正为 tv 的条目）
+    // 1. 确保所有关联物理源包含的季都在 work_seasons 中存在
     sqlx::query(
         r#"
-        INSERT INTO seasons (media_item_id, season_number, name, scrape_attempts)
+        INSERT INTO work_seasons (work_id, season_number, name, scrape_attempts)
         SELECT DISTINCT
-            e.media_item_id,
-            e.season_number,
-            CASE WHEN e.season_number = 0 THEN '特别篇' ELSE '第 ' || e.season_number || ' 季' END,
+            $1,
+            sf.season_number,
+            CASE WHEN sf.season_number = 0 THEN '特别篇' ELSE '第 ' || sf.season_number || ' 季' END,
             0
-        FROM episodes e
-        WHERE e.media_item_id = ANY($1)
-        ON CONFLICT (media_item_id, season_number) DO NOTHING
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        ON CONFLICT (work_id, season_number) DO NOTHING
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(work_id)
     .execute(&state.db)
     .await?;
 
-    // 2. 先在同 tmdb_id 兄弟目录之间横向复用已刮削的季与单集元数据（如 1080P 已刮削，新增 4K 目录同集直接零网络开销复用）
+    // 确保新同步进来的单集占位在 work_episodes 中存在（便于追踪 meta_incomplete）
     sqlx::query(
         r#"
-        UPDATE episodes AS target SET
-            title = src.title,
-            overview = src.overview,
-            still_path = src.still_path,
-            air_date = src.air_date,
-            runtime = CASE WHEN src.runtime > 0 THEN src.runtime ELSE target.runtime END,
-            meta_incomplete = src.meta_incomplete,
-            updated_at = NOW()
-        FROM (
-            SELECT DISTINCT ON (season_number, episode_number)
-                season_number, episode_number, title, overview, still_path, air_date, runtime, meta_incomplete
-            FROM episodes
-            WHERE media_item_id = ANY($1)
-              AND (still_path IS NOT NULL OR overview IS NOT NULL)
-            ORDER BY season_number, episode_number, (still_path IS NOT NULL AND overview IS NOT NULL) DESC, updated_at DESC
-        ) AS src
-        WHERE target.media_item_id = ANY($1)
-          AND target.season_number = src.season_number
-          AND target.episode_number = src.episode_number
-          AND target.still_path IS NULL
-          AND target.overview IS NULL
+        INSERT INTO work_episodes (work_id, season_number, episode_number, meta_incomplete)
+        SELECT DISTINCT $1, sf.season_number, sf.episode_number, TRUE
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        ON CONFLICT (work_id, season_number, episode_number) DO NOTHING
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(work_id)
     .execute(&state.db)
     .await?;
 
-    // 若兄弟目录某季所有分集均已通过横向复用补齐（不存在未刮削的新集），同步复用 seasons 表元数据与状态
-    sqlx::query(
-        r#"
-        UPDATE seasons AS target SET
-            name = COALESCE(src.name, target.name),
-            overview = COALESCE(src.overview, target.overview),
-            poster_path = COALESCE(src.poster_path, target.poster_path),
-            air_date = COALESCE(src.air_date, target.air_date),
-            scrape_attempts = src.scrape_attempts,
-            episode_count = src.episode_count
-        FROM (
-            SELECT DISTINCT ON (season_number)
-                season_number, name, overview, poster_path, air_date, scrape_attempts, episode_count
-            FROM seasons
-            WHERE media_item_id = ANY($1) AND scrape_attempts > 0
-            ORDER BY season_number, scrape_attempts DESC
-        ) AS src
-        WHERE target.media_item_id = ANY($1)
-          AND target.season_number = src.season_number
-          AND target.scrape_attempts = 0
-          AND NOT EXISTS (
-              SELECT 1 FROM episodes e
-              WHERE e.media_item_id = target.media_item_id
-                AND e.season_number = target.season_number
-                AND e.still_path IS NULL
-                AND e.overview IS NULL
-          )
-        "#,
-    )
-    .bind(&sibling_ids)
-    .execute(&state.db)
-    .await?;
-
-    // 3. 查询仍需向 TMDB 请求的季列表：
-    //    - scrape_attempts = 0：首次刮削或增量同步刚入库了新集，立即刮削（无冷却等待）
-    //    - scrape_attempts IN 1..4 且存在 meta_incomplete = TRUE 的分集已过冷却期（P0 点开 12h，常规后台 24h）
     let cooldown_hours = if is_p0 { 12 } else { 24 };
     let cutoff = Utc::now() - ChronoDuration::hours(cooldown_hours);
 
     let pending_seasons: Vec<(i32, i32)> = sqlx::query_as(
         r#"
-        SELECT
-            s.season_number,
-            CASE WHEN MIN(s.scrape_attempts) = 0 THEN 0 ELSE MAX(s.scrape_attempts) END AS base_attempts
-        FROM seasons s
-        WHERE s.media_item_id = ANY($1)
+        SELECT s.season_number, s.scrape_attempts
+        FROM work_seasons s
+        WHERE s.work_id = $1
           AND s.scrape_attempts >= 0
           AND (
               s.scrape_attempts = 0
               OR (
                   s.scrape_attempts BETWEEN 1 AND 4
                   AND EXISTS (
-                      SELECT 1 FROM episodes e
-                      WHERE e.media_item_id = ANY($1)
+                      SELECT 1 FROM work_episodes e
+                      WHERE e.work_id = $1
                         AND e.season_number = s.season_number
                         AND e.meta_incomplete = TRUE
                         AND e.updated_at <= $2
                   )
               )
+              OR EXISTS (
+                  SELECT 1 FROM work_episodes e
+                  WHERE e.work_id = $1
+                    AND e.season_number = s.season_number
+                    AND e.still_path IS NULL
+                    AND e.overview IS NULL
+                    AND e.meta_incomplete = TRUE
+              )
           )
-        GROUP BY s.season_number
         ORDER BY s.season_number ASC
         "#,
     )
-    .bind(&sibling_ids)
+    .bind(work_id)
     .bind(cutoff)
     .fetch_all(&state.db)
     .await?;
 
     if pending_seasons.is_empty() {
-        // 兜底：若存在无任何分集的空季仍停留在 scrape_attempts = 0，推进为 1 防止后台每 200ms 重复选中
-        sqlx::query(
-            "UPDATE seasons SET scrape_attempts = 1 WHERE media_item_id = ANY($1) AND scrape_attempts = 0",
-        )
-        .bind(&sibling_ids)
-        .execute(&state.db)
-        .await?;
         return Ok(());
     }
 
     let current_year = Utc::now().year();
 
-    for (season_num, max_attempts) in pending_seasons {
-        let next_attempt = (max_attempts.max(0) + 1).min(5);
+    for (season_num, attempts) in pending_seasons {
+        let next_attempt = (attempts.max(0) + 1).min(5);
         match state.fetch_tmdb_season(tmdb_id, season_num).await {
             Ok(Some(season_meta)) => {
-                // 更新 seasons 表（名称、简介、季海报、开播日期、刮削次数状态）
                 sqlx::query(
                     r#"
-                    UPDATE seasons SET
+                    UPDATE work_seasons SET
                         name = COALESCE($1, name),
                         overview = COALESCE($2, overview),
                         poster_path = COALESCE($3, poster_path),
                         air_date = COALESCE($4, air_date),
-                        scrape_attempts = $5, episode_count = $8
-                    WHERE media_item_id = ANY($6) AND season_number = $7
+                        scrape_attempts = $5,
+                        episode_count = $8
+                    WHERE work_id = $6 AND season_number = $7
                     "#,
                 )
                 .bind(&season_meta.name)
@@ -558,13 +768,12 @@ pub async fn scrape_tv_seasons(
                 .bind(&season_meta.poster_path)
                 .bind(&season_meta.air_date)
                 .bind(next_attempt)
-                .bind(&sibling_ids)
+                .bind(work_id)
                 .bind(season_num)
                 .bind(season_meta.episodes.len() as i32)
                 .execute(&state.db)
                 .await?;
 
-                // 判定该季是否属于正在连载/近期热播季（任意一集播出时间在最近 35 天内，或尚无播出日期但剧集年份为近两年）
                 let has_any_air_date = season_meta.episodes.iter().any(|e| e.air_date.is_some());
                 let season_is_ongoing = season_meta
                     .episodes
@@ -580,10 +789,8 @@ pub async fn scrape_tv_seasons(
                 let mut air_dates = Vec::with_capacity(season_meta.episodes.len());
                 let mut runtimes = Vec::with_capacity(season_meta.episodes.len());
                 let mut incompletes = Vec::with_capacity(season_meta.episodes.len());
-                let mut matched_ep_set = HashSet::with_capacity(season_meta.episodes.len());
 
                 for ep in season_meta.episodes {
-                    matched_ep_set.insert(ep.episode_number);
                     let has_still = ep.still_path.is_some();
                     let has_overview = ep.overview.is_some();
                     let has_real_name = ep
@@ -595,8 +802,6 @@ pub async fn scrape_tv_seasons(
                     let is_complete = has_still && has_overview && has_real_name;
                     let ep_is_recent = is_air_date_recent(ep.air_date.as_deref(), 30)
                         || (ep.air_date.is_none() && season_is_ongoing);
-
-                    // 若单集缺少剧照/简介/正式标题，且属于近期连载剧集且重试未满 5 次，则保留 meta_incomplete = TRUE 以便后续自动补齐
                     let keep_incomplete = !is_complete && ep_is_recent && next_attempt < 5;
 
                     ep_nums.push(ep.episode_number);
@@ -611,20 +816,24 @@ pub async fn scrape_tv_seasons(
                 if !ep_nums.is_empty() {
                     sqlx::query(
                         r#"
-                        UPDATE episodes AS e SET
-                            title = COALESCE(src.name, e.title),
-                            overview = COALESCE(src.overview, e.overview),
-                            still_path = COALESCE(src.still_path, e.still_path),
-                            air_date = COALESCE(src.air_date, e.air_date),
-                            runtime = CASE WHEN src.runtime > 0 THEN src.runtime ELSE e.runtime END,
-                            meta_incomplete = src.incomplete,
-                            updated_at = NOW()
+                        INSERT INTO work_episodes (
+                            work_id, season_number, episode_number, title, overview,
+                            still_path, air_date, runtime, meta_incomplete, updated_at
+                        )
+                        SELECT
+                            $8, $9, src.episode_number, src.name, src.overview,
+                            src.still_path, src.air_date, src.runtime, src.incomplete, NOW()
                         FROM UNNEST(
                             $1::int4[], $2::varchar[], $3::text[], $4::varchar[], $5::varchar[], $6::int4[], $7::bool[]
                         ) AS src(episode_number, name, overview, still_path, air_date, runtime, incomplete)
-                        WHERE e.media_item_id = ANY($8)
-                          AND e.season_number = $9
-                          AND e.episode_number = src.episode_number
+                        ON CONFLICT (work_id, season_number, episode_number) DO UPDATE SET
+                            title = COALESCE(EXCLUDED.title, work_episodes.title),
+                            overview = COALESCE(EXCLUDED.overview, work_episodes.overview),
+                            still_path = COALESCE(EXCLUDED.still_path, work_episodes.still_path),
+                            air_date = COALESCE(EXCLUDED.air_date, work_episodes.air_date),
+                            runtime = CASE WHEN EXCLUDED.runtime > 0 THEN EXCLUDED.runtime ELSE work_episodes.runtime END,
+                            meta_incomplete = EXCLUDED.meta_incomplete,
+                            updated_at = NOW()
                         "#,
                     )
                     .bind(&ep_nums)
@@ -634,77 +843,66 @@ pub async fn scrape_tv_seasons(
                     .bind(&air_dates)
                     .bind(&runtimes)
                     .bind(&incompletes)
-                    .bind(&sibling_ids)
+                    .bind(work_id)
                     .bind(season_num)
                     .execute(&state.db)
                     .await?;
                 }
 
-                // 对于本地已入库但 TMDB 季列表尚未收录的超前分集（如刚更新的第 N 集）：
-                // 若该季仍在连载且未满 5 次重试则保持 meta_incomplete = TRUE 并刷新 updated_at 进入冷却；否则置为 FALSE
                 let unindexed_incomplete = season_is_ongoing && next_attempt < 5;
                 sqlx::query(
                     r#"
-                    UPDATE episodes SET
+                    UPDATE work_episodes SET
                         meta_incomplete = $1,
                         updated_at = NOW()
-                    WHERE media_item_id = ANY($2)
+                    WHERE work_id = $2
                       AND season_number = $3
                       AND NOT (episode_number = ANY($4))
                     "#,
                 )
                 .bind(unindexed_incomplete)
-                .bind(&sibling_ids)
+                .bind(work_id)
                 .bind(season_num)
                 .bind(&ep_nums)
                 .execute(&state.db)
                 .await?;
 
                 info!(
-                    "📺 [SeasonScraper] 剧集 tmdb_id={} S{:02} 分集刮削完成 (TMDB集数={}, 尝试次数={}/5, 连载跟进={})",
-                    tmdb_id,
-                    season_num,
-                    ep_nums.len(),
-                    next_attempt,
-                    season_is_ongoing
+                    "📺 [SeasonScraper] 剧集 work_id={} (tmdb_id={}) S{:02} 分集刮削完成 (TMDB集数={}, 尝试={}/5)",
+                    work_id, tmdb_id, season_num, ep_nums.len(), next_attempt
                 );
             }
             Ok(None) => {
-                // TMDB 返回 404，标记 scrape_attempts = -1 避免后台重复请求不存在的季
                 sqlx::query(
-                    "UPDATE seasons SET scrape_attempts = -1 WHERE media_item_id = ANY($1) AND season_number = $2",
+                    "UPDATE work_seasons SET scrape_attempts = -1 WHERE work_id = $1 AND season_number = $2",
                 )
-                .bind(&sibling_ids)
+                .bind(work_id)
                 .bind(season_num)
                 .execute(&state.db)
                 .await?;
 
                 sqlx::query(
-                    "UPDATE episodes SET meta_incomplete = FALSE, updated_at = NOW() WHERE media_item_id = ANY($1) AND season_number = $2",
+                    "UPDATE work_episodes SET meta_incomplete = FALSE, updated_at = NOW() WHERE work_id = $1 AND season_number = $2",
                 )
-                .bind(&sibling_ids)
+                .bind(work_id)
                 .bind(season_num)
                 .execute(&state.db)
                 .await?;
             }
             Err(e) => {
-                debug!(
-                    "拉取 TMDB 剧集季失败 (tmdb_id={}, S{:02}): {:#}",
-                    tmdb_id, season_num, e
-                );
-                // 正常推进 scrape_attempts（最多封顶 5）并仅对尚未完整刮削的分集刷新 updated_at 进入 24h 冷却
+                debug!("拉取 TMDB 剧集季失败 (tmdb_id={}, S{:02}): {:#}", tmdb_id, season_num, e);
                 sqlx::query(
-                    "UPDATE seasons SET scrape_attempts = LEAST(GREATEST(scrape_attempts, 0) + 1, 5) WHERE media_item_id = ANY($1) AND season_number = $2",
+                    "UPDATE work_seasons SET scrape_attempts = LEAST(GREATEST(scrape_attempts, 0) + 1, 5) WHERE work_id = $1 AND season_number = $2",
                 )
-                .bind(&sibling_ids)
+                .bind(work_id)
                 .bind(season_num)
                 .execute(&state.db)
                 .await?;
 
                 sqlx::query(
-                    "UPDATE episodes SET meta_incomplete = TRUE, updated_at = NOW() WHERE media_item_id = ANY($1) AND season_number = $2 AND still_path IS NULL AND overview IS NULL",
+                    "UPDATE work_episodes SET meta_incomplete = TRUE, updated_at = NOW() WHERE work_id = $1 AND season_number = $2 AND still_path IS NULL AND overview IS NULL",
                 )
-                .bind(&sibling_ids)
+                .bind(work_id)
                 .bind(season_num)
                 .execute(&state.db)
                 .await?;
@@ -715,7 +913,88 @@ pub async fn scrape_tv_seasons(
     Ok(())
 }
 
-/// 判断单集播出日期是否在最近 `within_days` 天内（含未来待播日期）
+/// 人工绑定 TMDB ID 或无 TMDB 强行发布到正式作品表
+pub async fn promote_folder_manually(
+    state: &AppState,
+    folder_id: i64,
+    tmdb_id: Option<i32>,
+    media_type: Option<&str>,
+) -> Result<i64> {
+    if let Some(tid) = tmdb_id {
+        let folder_row: (String, String, Option<i32>) = sqlx::query_as(
+            "SELECT inferred_media_type, clean_title, year FROM sync_folders WHERE id = $1",
+        )
+        .bind(folder_id)
+        .fetch_one(&state.db)
+        .await?;
+
+        let mtype = media_type.unwrap_or(&folder_row.0);
+        let meta = state
+            .scrape_tmdb_metadata(Some(tid), mtype, &folder_row.1, folder_row.2)
+            .await?;
+        let work_id = upsert_media_work(state, &meta).await?;
+
+        sqlx::query(
+            r#"
+            UPDATE sync_folders SET
+                work_id = $1,
+                parsed_tmdb_id = $2,
+                scrape_state = 'verified',
+                conflict_reason = NULL,
+                is_locked = TRUE,
+                retry_count = 0,
+                next_retry_at = NULL,
+                updated_at = NOW()
+            WHERE id = $3
+            "#,
+        )
+        .bind(work_id)
+        .bind(tid)
+        .bind(folder_id)
+        .execute(&state.db)
+        .await?;
+
+        state.caches.admin_stats_cache.invalidate_all();
+        if meta.media_type == "tv" {
+            let _ = scrape_tv_seasons(state, work_id, tid, meta.year.or(folder_row.2), true).await;
+        }
+        Ok(work_id)
+    } else {
+        // 无 TMDB 强行发布：创建自定义 media_works 记录
+        let folder_row: (String, String, Option<i32>, String) = sqlx::query_as(
+            "SELECT inferred_media_type, clean_title, year, category FROM sync_folders WHERE id = $1",
+        )
+        .bind(folder_id)
+        .fetch_one(&state.db)
+        .await?;
+
+        let work_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO media_works (media_type, tmdb_id, title, year, category, is_locked, metadata_version)
+            VALUES ($1, NULL, $2, $3, $4, TRUE, 2)
+            RETURNING id
+            "#,
+        )
+        .bind(&folder_row.0)
+        .bind(&folder_row.1)
+        .bind(folder_row.2)
+        .bind(&folder_row.3)
+        .fetch_one(&state.db)
+        .await?;
+
+        sqlx::query(
+            "UPDATE sync_folders SET work_id = $1, scrape_state = 'verified', conflict_reason = NULL, is_locked = TRUE, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(work_id)
+        .bind(folder_id)
+        .execute(&state.db)
+        .await?;
+
+        state.caches.admin_stats_cache.invalidate_all();
+        Ok(work_id)
+    }
+}
+
 fn is_air_date_recent(air_date: Option<&str>, within_days: i64) -> bool {
     let Some(raw) = air_date else {
         return false;
@@ -724,20 +1003,15 @@ fn is_air_date_recent(air_date: Option<&str>, within_days: i64) -> bool {
         return false;
     };
     let today = Utc::now().date_naive();
-    let days_since = (today - date).num_days();
-    days_since <= within_days
+    (today - date).num_days() <= within_days
 }
 
-/// 判断单集标题是否仍为 TMDB 默认占位标题（如 "第 8 集"、"Episode 8"）
 fn is_placeholder_episode_title(name: &str, ep_num: i32) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return true;
     }
-    let cn_default_no_space = format!("第{}集", ep_num);
-    let cn_default_with_space = format!("第 {} 集", ep_num);
-    let en_default = format!("episode {}", ep_num);
-    trimmed == cn_default_no_space
-        || trimmed == cn_default_with_space
-        || trimmed.eq_ignore_ascii_case(&en_default)
+    trimmed == format!("第{}集", ep_num)
+        || trimmed == format!("第 {} 集", ep_num)
+        || trimmed.eq_ignore_ascii_case(&format!("episode {}", ep_num))
 }

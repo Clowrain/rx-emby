@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 
     // 3. 合并数据库中的动态热配置
     let dynamic_cfg = file_cfg.into_dynamic().sync_with_db(&db).await?;
-    let (priority_tx, priority_rx) = mpsc::channel::<i64>(1024);
+    let (priority_tx, priority_rx) = mpsc::channel::<state::ScrapeTask>(1024);
 
     // 4. 初始化全局 AppState
     let app_state = AppState::new(dynamic_cfg, db, priority_tx)?;
