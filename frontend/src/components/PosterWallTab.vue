@@ -16,7 +16,10 @@ import {
   Search,
   X,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown
 } from 'lucide-vue-next'
 import { adminApi } from '../api/admin'
 import { useToast } from '../composables/useToast'
@@ -57,11 +60,21 @@ const statusTabs = [
   { key: 'ignored', label: '已屏蔽', icon: Trash2, isIgnored: 'true', status: '' }
 ]
 
+const sortOptions = [
+  { value: 'updated_at', label: '更新时间' },
+  { value: 'created_at', label: '入库时间' },
+  { value: 'year', label: '发行年份' },
+  { value: 'rating', label: 'TMDB 评分' },
+  { value: 'title', label: '片名' }
+]
+
 const filters = reactive({
   isIgnored: 'false',
   scrapeStatus: props.initialStatus || '',
   category: props.initialCategory || '',
-  keyword: ''
+  keyword: '',
+  sortBy: 'updated_at',
+  sortOrder: 'desc'
 })
 
 const activeStatusKey = computed(() => {
@@ -99,13 +112,26 @@ function selectStatusTab(st) {
   resetAndLoad()
 }
 
+function handleSortFieldChange(val) {
+  filters.sortBy = val
+  filters.sortOrder = val === 'title' ? 'asc' : 'desc'
+  resetAndLoad()
+}
+
+function toggleSortOrder() {
+  filters.sortOrder = filters.sortOrder === 'asc' ? 'desc' : 'asc'
+  resetAndLoad()
+}
+
 async function loadMedia() {
   loading.value = true
   try {
     const params = {
       limit: pageSize,
       offset: offset.value,
-      is_ignored: filters.isIgnored
+      is_ignored: filters.isIgnored,
+      sort_by: filters.sortBy,
+      sort_order: filters.sortOrder
     }
     if (filters.scrapeStatus !== '') params.scrape_status = filters.scrapeStatus
     if (filters.category !== '') params.category = filters.category
@@ -304,7 +330,33 @@ onMounted(loadMedia)
           </button>
         </div>
 
-        <div class="flex items-center gap-3 tabular-nums">
+        <div class="flex flex-wrap items-center gap-3 tabular-nums">
+          <!-- 排序选择器 + 升/降序切换 -->
+          <div class="flex items-center gap-1.5 bg-slate-950/70 border border-slate-800 rounded-lg px-2 py-1">
+            <ArrowUpDown class="w-3.5 h-3.5 text-slate-400 shrink-0" aria-hidden="true" />
+            <label for="poster-sort-select" class="visually-hidden">海报排序方式</label>
+            <select
+              id="poster-sort-select"
+              :value="filters.sortBy"
+              @change="handleSortFieldChange($event.target.value)"
+              class="bg-transparent text-xs text-slate-200 focus:outline-none cursor-pointer pr-1"
+            >
+              <option v-for="opt in sortOptions" :key="opt.value" :value="opt.value" class="bg-slate-900 text-slate-200">
+                {{ opt.label }}
+              </option>
+            </select>
+            <button
+              type="button"
+              @click="toggleSortOrder"
+              :title="filters.sortOrder === 'asc' ? '当前升序，点击切换为降序' : '当前降序，点击切换为升序'"
+              class="cursor-pointer p-1 rounded hover:bg-slate-800 text-slate-300 hover:text-emerald-400 transition-colors flex items-center gap-0.5 text-[11px]"
+            >
+              <ArrowUp v-if="filters.sortOrder === 'asc'" class="w-3.5 h-3.5" aria-hidden="true" />
+              <ArrowDown v-else class="w-3.5 h-3.5" aria-hidden="true" />
+              <span>{{ filters.sortOrder === 'asc' ? '升序' : '降序' }}</span>
+            </button>
+          </div>
+
           <span class="text-xs text-slate-400">
             共 <strong class="text-white font-mono">{{ total.toLocaleString() }}</strong> 部影视 · 第
             <strong class="text-emerald-400 font-mono">{{ currentPage }}</strong> / {{ totalPages }} 页

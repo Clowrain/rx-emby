@@ -48,10 +48,12 @@ struct MediaListRow {
     title: String,
     original_title: Option<String>,
     year: Option<i32>,
+    premiered_at: Option<String>,
     overview: Option<String>,
     rating: f32,
     poster_path: Option<String>,
     backdrop_path: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub(super) async fn get_user_items(
@@ -180,45 +182,22 @@ pub(super) async fn get_user_items(
             .collect()
     });
 
-    // 4. 组装排序规则（兼容 SortBy 与 SortOrder），并在同 (tmdb_id, media_type) 多目录间自动折叠去重
-    let is_asc = q
-        .sort_order
+    // 4. 组装排序规则（完整支持逗号分隔多字段 SortBy 与 SortOrder），并在同 (tmdb_id, media_type) 多目录间自动折叠去重
+    let sort_key = q
+        .sort_by
         .as_deref()
-        .map(|s| s.eq_ignore_ascii_case("Ascending"))
-        .unwrap_or(false);
-    let sort_key = q.sort_by.as_deref().or_else(|| vlib_rule.as_ref().and_then(|r| r.sort_by.as_deref())).unwrap_or("");
-    let order_clause = if sort_key.contains("DateCreated") {
-        if is_asc {
-            "created_at ASC, id ASC"
-        } else {
-            "created_at DESC, id DESC"
-        }
-    } else if sort_key == "Popularity" {
-        if is_asc { "popularity ASC NULLS LAST, id ASC" } else { "popularity DESC NULLS LAST, id DESC" }
-    } else if sort_key.contains("CommunityRating") {
-        if is_asc {
-            "rating ASC, id DESC"
-        } else {
-            "rating DESC, id DESC"
-        }
-    } else if sort_key.contains("SortName") || sort_key.contains("Name") {
-        if is_asc {
-            "title ASC, id DESC"
-        } else {
-            "title DESC, id DESC"
-        }
-    } else if is_asc {
-        "year ASC NULLS LAST, id ASC"
-    } else {
-        "year DESC NULLS LAST, id DESC"
-    };
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| vlib_rule.as_ref().and_then(|r| r.sort_by.as_deref()))
+        .unwrap_or("");
+    let order_clause = build_emby_order_clause(sort_key, q.sort_order.as_deref());
 
     let sql = format!(
         r#"
-        SELECT id, media_type, tmdb_id, title, original_title, year, overview, rating, poster_path, backdrop_path
+        SELECT id, media_type, tmdb_id, title, original_title, year, premiered_at, overview, rating, poster_path, backdrop_path, created_at
         FROM (
             SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-                m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.overview, m.rating, m.poster_path, m.backdrop_path, m.created_at, (m.tmdb_metadata->>'popularity')::float8 AS popularity
+                m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.premiered_at, m.overview, m.rating, m.poster_path, m.backdrop_path, m.created_at, m.updated_at, (m.tmdb_metadata->>'popularity')::float8 AS popularity
             FROM media_items m
             WHERE m.is_ignored = FALSE
               AND ($1::text IS NULL OR m.category = $1)
@@ -332,14 +311,16 @@ pub(super) async fn get_user_items(
 
             let is_fav = only_favorite || is_media_favorited(&fav_set, r.id, r.tmdb_id, &r.media_type);
 
-            json!({
+            let mut obj = json!({
                 "Id": format!("media_{}", r.id),
                 "Name": r.title,
+                "SortName": r.title,
                 "OriginalTitle": r.original_title,
                 "ServerId": cfg.server_id,
                 "Type": emby_type,
                 "IsFolder": is_folder,
                 "ProductionYear": r.year,
+                "DateCreated": r.created_at.to_rfc3339(),
                 "Overview": r.overview,
                 "CommunityRating": r.rating,
                 "ImageTags": image_tags,
@@ -349,7 +330,13 @@ pub(super) async fn get_user_items(
                     "IsFavorite": is_fav,
                     "Played": false
                 }
-            })
+            });
+            if let Some(ref pdate) = r.premiered_at {
+                if !pdate.is_empty() {
+                    obj["PremiereDate"] = json!(pdate);
+                }
+            }
+            obj
         })
         .collect();
 
@@ -1063,5 +1050,110 @@ async fn build_emby_item_from_history(
         obj["RunTimeTicks"] = json!(effective_dur);
     }
     Some(obj)
+}
+
+/// 解析 Emby 客户端逗号分隔的 `SortBy` 与 `SortOrder` 参数，生成稳定的 PostgreSQL ORDER BY 子句
+fn build_emby_order_clause(sort_by: &str, sort_order: Option<&str>) -> String {
+    let orders: Vec<bool> = sort_order
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.eq_ignore_ascii_case("Ascending") || s.eq_ignore_ascii_case("asc"))
+        .collect();
+
+    let mut clauses: Vec<String> = Vec::new();
+    let mut first_is_asc: Option<bool> = None;
+
+    for (idx, raw_field) in sort_by
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("IsFolder"))
+        .enumerate()
+    {
+        if clauses.len() >= 3 {
+            break;
+        }
+        let default_asc = matches!(raw_field, "SortName" | "Name" | "OriginalTitle");
+        let is_asc = orders
+            .get(idx)
+            .copied()
+            .or_else(|| orders.last().copied())
+            .unwrap_or(default_asc);
+        if first_is_asc.is_none() {
+            first_is_asc = Some(is_asc);
+        }
+        let dir = if is_asc { "ASC" } else { "DESC" };
+
+        let expr = match raw_field {
+            "DateCreated" => format!("created_at {}", dir),
+            "DateLastContentAdded" => format!("updated_at {}", dir),
+            "PremiereDate" => format!(
+                "COALESCE(NULLIF(premiered_at, ''), CASE WHEN year IS NOT NULL THEN year::text || '-01-01' ELSE NULL END) {} NULLS LAST",
+                dir
+            ),
+            "ProductionYear" => format!("year {} NULLS LAST", dir),
+            "Popularity" => format!("popularity {} NULLS LAST", dir),
+            "CommunityRating" | "CriticRating" => format!("rating {}", dir),
+            "SortName" | "Name" | "OriginalTitle" => format!("title {}", dir),
+            "DatePlayed" => format!(
+                "(SELECT MAX(ph.last_played_at) FROM play_histories ph WHERE ph.user_id = $6 AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = deduped.tmdb_id AND ph.media_type = deduped.media_type) OR ph.media_item_id = deduped.id)) {} NULLS LAST",
+                dir
+            ),
+            "PlayCount" => format!(
+                "(SELECT COUNT(*) FROM play_histories ph WHERE ph.user_id = $6 AND ph.is_played = TRUE AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = deduped.tmdb_id AND ph.media_type = deduped.media_type) OR ph.media_item_id = deduped.id)) {}",
+                dir
+            ),
+            "Random" => "RANDOM()".to_string(),
+            _ => continue,
+        };
+        clauses.push(expr);
+    }
+
+    if clauses.is_empty() {
+        let fallback_asc = orders.first().copied().unwrap_or(false);
+        return if fallback_asc {
+            "year ASC NULLS LAST, id ASC".to_string()
+        } else {
+            "year DESC NULLS LAST, id DESC".to_string()
+        };
+    }
+
+    let tie_dir = if first_is_asc.unwrap_or(false) { "ASC" } else { "DESC" };
+    clauses.push(format!("id {}", tie_dir));
+    clauses.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_emby_order_clause;
+
+    #[test]
+    fn test_emby_sort_priority_with_multi_fields() {
+        assert_eq!(
+            build_emby_order_clause("PremiereDate,SortName", Some("Descending")),
+            "COALESCE(NULLIF(premiered_at, ''), CASE WHEN year IS NOT NULL THEN year::text || '-01-01' ELSE NULL END) DESC NULLS LAST, title DESC, id DESC"
+        );
+        assert_eq!(
+            build_emby_order_clause("Popularity,SortName", Some("Descending")),
+            "popularity DESC NULLS LAST, title DESC, id DESC"
+        );
+        assert_eq!(
+            build_emby_order_clause("CommunityRating,DateCreated", Some("Descending,Ascending")),
+            "rating DESC, created_at ASC, id DESC"
+        );
+        assert_eq!(
+            build_emby_order_clause("IsFolder,SortName", None),
+            "title ASC, id ASC"
+        );
+        assert_eq!(
+            build_emby_order_clause("DateLastContentAdded", Some("Descending")),
+            "updated_at DESC, id DESC"
+        );
+        assert_eq!(
+            build_emby_order_clause("Random", None),
+            "RANDOM(), id DESC"
+        );
+    }
 }
 

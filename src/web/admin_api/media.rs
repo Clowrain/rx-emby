@@ -14,6 +14,8 @@ pub(super) struct AdminMediaQuery {
     category: Option<String>,
     keyword: Option<String>,
     is_ignored: Option<bool>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -44,12 +46,22 @@ pub(super) async fn list_admin_media(
     let limit = q.limit.unwrap_or(30).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
     let ignored_filter = q.is_ignored.unwrap_or(false);
-    let kw = q
-        .keyword
+    let kw_raw = q.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let kw = kw_raw.map(|s| format!("%{}%", s));
+    let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
+
+    let is_asc = q
+        .sort_order
         .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("%{}%", s));
+        .map(|s| s.eq_ignore_ascii_case("asc") || s.eq_ignore_ascii_case("ascending"))
+        .unwrap_or(false);
+    let order_clause = match q.sort_by.as_deref().unwrap_or("updated_at") {
+        "created_at" => if is_asc { "created_at ASC, id ASC" } else { "created_at DESC, id DESC" },
+        "year" => if is_asc { "year ASC NULLS LAST, id ASC" } else { "year DESC NULLS LAST, id DESC" },
+        "rating" => if is_asc { "rating ASC, id ASC" } else { "rating DESC, id DESC" },
+        "title" => if is_asc { "title ASC, id ASC" } else { "title DESC, id DESC" },
+        _ => if is_asc { "updated_at ASC, id ASC" } else { "updated_at DESC, id DESC" },
+    };
 
     let total: i64 = sqlx::query_scalar(
         r#"
@@ -58,18 +70,19 @@ pub(super) async fn list_admin_media(
         WHERE m.is_ignored = $1
           AND ($2::int2 IS NULL OR m.scrape_status = $2)
           AND ($3::text IS NULL OR m.category = $3)
-          AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4)
+          AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND m.tmdb_id = $5))
         "#,
     )
     .bind(ignored_filter)
     .bind(q.scrape_status)
     .bind(&q.category)
     .bind(&kw)
+    .bind(kw_tmdb_id)
     .fetch_one(&state.db)
     .await
     .unwrap_or(0);
 
-    let items: Vec<AdminMediaRow> = sqlx::query_as(
+    let sql = format!(
         r#"
         SELECT
             page.id, page.media_type, page.tmdb_id, page.title, page.year, page.rating, page.category,
@@ -92,37 +105,40 @@ pub(super) async fn list_admin_media(
         FROM (
             SELECT
                 id, media_type, tmdb_id, title, year, rating, category,
-                scrape_status, is_locked, is_ignored, root_dir, poster_path, updated_at
+                scrape_status, is_locked, is_ignored, root_dir, poster_path, updated_at, created_at
             FROM (
                 SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
                     m.id, m.media_type, m.tmdb_id, m.title, m.year, m.rating, m.category,
-                    m.scrape_status, m.is_locked, m.is_ignored, m.root_dir, m.poster_path, m.updated_at
+                    m.scrape_status, m.is_locked, m.is_ignored, m.root_dir, m.poster_path, m.updated_at, m.created_at
                 FROM media_items m
                 WHERE m.is_ignored = $1
                   AND ($2::int2 IS NULL OR m.scrape_status = $2)
                   AND ($3::text IS NULL OR m.category = $3)
-                  AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4)
+                  AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND m.tmdb_id = $5))
                 ORDER BY
                     COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
                     (m.scrape_status IN (1, 3)) DESC,
                     (m.poster_path IS NOT NULL) DESC,
                     m.id ASC
             ) AS deduped
-            ORDER BY updated_at DESC, id DESC
-            LIMIT $5 OFFSET $6
+            ORDER BY {order_clause}
+            LIMIT $6 OFFSET $7
         ) AS page
-        ORDER BY page.updated_at DESC, page.id DESC
+        ORDER BY {order_clause}
         "#,
-    )
-    .bind(ignored_filter)
-    .bind(q.scrape_status)
-    .bind(&q.category)
-    .bind(&kw)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    );
+
+    let items: Vec<AdminMediaRow> = sqlx::query_as(&sql)
+        .bind(ignored_filter)
+        .bind(q.scrape_status)
+        .bind(&q.category)
+        .bind(&kw)
+        .bind(kw_tmdb_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({ "items": items, "total": total })))
 }
