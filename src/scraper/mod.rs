@@ -45,6 +45,7 @@ pub fn spawn_scrape_worker(state: Arc<AppState>, mut priority_rx: mpsc::Receiver
                         Ok(Some(next_id)) => {
                             if let Err(e) = scrape_single_media_with_mode(&state, next_id, false).await {
                                 debug!("常规队列刮削条目 {} 失败: {:#}", next_id, e);
+                                sleep(Duration::from_secs(1)).await;
                             }
                         }
                         Ok(None) => {
@@ -78,7 +79,7 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
           AND metadata_refresh_requested = TRUE
           AND (metadata_retry_at IS NULL OR metadata_retry_at <= NOW())
           AND metadata_retry_count < 3
-        ORDER BY id ASC
+        ORDER BY metadata_version ASC, id ASC
         LIMIT 1
         "#,
     )
@@ -91,16 +92,13 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
         return Ok(None);
     }
 
-    // 2. 优先消化尚未完成主条目刮削的新入库/待重试影视
+    // 2a. 优先消化尚未完成主条目刮削的新入库影视（命中 idx_media_scrape_queue 索引）
     let id: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT id FROM media_items
         WHERE is_ignored = FALSE
           AND is_locked = FALSE
-          AND (
-              scrape_status = 0
-              OR (scrape_status = 2 AND retry_count < 3 AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
-          )
+          AND scrape_status = 0
         ORDER BY scrape_priority ASC, id DESC
         LIMIT 1
         "#,
@@ -112,12 +110,33 @@ async fn fetch_next_pending_id(state: &AppState) -> Result<Option<i64>> {
         return Ok(id);
     }
 
-    // 3. 消化已刮削剧集中存在“未刮削新季/新集 (scrape_attempts = 0)”或“连载残缺集已过 24h 冷却期 (meta_incomplete = TRUE)”的条目
+    // 2b. 消化已到退避冷却时间的待重试影视（命中 idx_media_retry_queue 索引）
+    let retry_id: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM media_items
+        WHERE is_ignored = FALSE
+          AND is_locked = FALSE
+          AND scrape_status = 2
+          AND retry_count < 3
+          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+        ORDER BY scrape_priority ASC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.db)
+    .await?;
+
+    if retry_id.is_some() {
+        return Ok(retry_id);
+    }
+
+    // 3. 消化已刮削且未锁定剧集中存在“未刮削新季/新集 (scrape_attempts = 0)”或“连载残缺集已过 24h 冷却期 (meta_incomplete = TRUE)”的条目
     let season_pending_id: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT m.id
         FROM media_items m
         WHERE m.is_ignored = FALSE
+          AND m.is_locked = FALSE
           AND m.media_type = 'tv'
           AND m.tmdb_id IS NOT NULL
           AND m.scrape_status IN (1, 3)
@@ -261,6 +280,7 @@ pub async fn scrape_single_media_with_mode(
         .rows_affected();
 
         if reused > 0 {
+            state.caches.admin_stats_cache.invalidate_all();
             debug!(
                 "♻️ [Scraper] media_id={} (tmdb_id={}) 命中本地兄弟目录元数据缓存，跳过主条目远端请求",
                 item.id, tid
@@ -310,6 +330,8 @@ pub async fn scrape_single_media_with_mode(
             .bind(serde_json::to_value(&meta.extra)?)
             .execute(&state.db)
             .await?;
+
+            state.caches.admin_stats_cache.invalidate_all();
 
             info!(
                 "✅ [Scraper] 刮削完成 media_id={} tmdb_id={} type={} title={:?}",
@@ -493,6 +515,13 @@ pub async fn scrape_tv_seasons(
     .await?;
 
     if pending_seasons.is_empty() {
+        // 兜底：若存在无任何分集的空季仍停留在 scrape_attempts = 0，推进为 1 防止后台每 200ms 重复选中
+        sqlx::query(
+            "UPDATE seasons SET scrape_attempts = 1 WHERE media_item_id = ANY($1) AND scrape_attempts = 0",
+        )
+        .bind(&sibling_ids)
+        .execute(&state.db)
+        .await?;
         return Ok(());
     }
 
@@ -653,9 +682,17 @@ pub async fn scrape_tv_seasons(
                     "拉取 TMDB 剧集季失败 (tmdb_id={}, S{:02}): {:#}",
                     tmdb_id, season_num, e
                 );
-                // 将该季分集 updated_at 推后，避免网络波动时高频死循环重试
+                // 推进 scrape_attempts 至少为 1 并刷新该季分集 updated_at，进入 24h 冷却，彻底防止 scrape_attempts=0 导致 200ms 死循环重扫
                 sqlx::query(
-                    "UPDATE episodes SET updated_at = NOW() WHERE media_item_id = ANY($1) AND season_number = $2",
+                    "UPDATE seasons SET scrape_attempts = GREATEST(scrape_attempts, 1) WHERE media_item_id = ANY($1) AND season_number = $2",
+                )
+                .bind(&sibling_ids)
+                .bind(season_num)
+                .execute(&state.db)
+                .await?;
+
+                sqlx::query(
+                    "UPDATE episodes SET meta_incomplete = TRUE, updated_at = NOW() WHERE media_item_id = ANY($1) AND season_number = $2",
                 )
                 .bind(&sibling_ids)
                 .bind(season_num)

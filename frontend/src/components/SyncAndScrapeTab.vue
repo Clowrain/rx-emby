@@ -236,12 +236,17 @@ const metadataPercent = computed(() => {
 
 async function loadAll() {
   try {
-    const [logsData, opts] = await Promise.all([
-      adminApi.listSyncLogs(),
-      adminApi.smartViewOptions().catch(() => null)
-    ])
+    const logsData = await adminApi.listSyncLogs()
     logs.value = logsData.logs || []
-    if (opts?.metadata) metadataStats.value = opts.metadata
+    if (logsData.metadata) {
+      metadataStats.value = logsData.metadata
+    } else {
+      adminApi.smartViewOptions()
+        .then(opts => {
+          if (opts?.metadata) metadataStats.value = opts.metadata
+        })
+        .catch(() => null)
+    }
   } catch (err) {
     toast.error('加载同步记录失败：' + err.message)
   }

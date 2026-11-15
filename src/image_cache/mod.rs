@@ -97,8 +97,9 @@ impl AppState {
         let db = self.db.clone();
         let key = cache_key.to_string();
         tokio::spawn(async move {
+            // 仅当距上次更新时间超过 1 小时才执行写入，避免浏览海报墙时高频 UPDATE 引发 PG 写放大与 Vacuum 扫盘
             let _ = sqlx::query(
-                "UPDATE image_cache_index SET last_accessed_at = NOW() WHERE cache_key = $1",
+                "UPDATE image_cache_index SET last_accessed_at = NOW() WHERE cache_key = $1 AND last_accessed_at < NOW() - INTERVAL '1 hour'",
             )
             .bind(&key)
             .execute(&db)

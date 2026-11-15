@@ -13,13 +13,13 @@ services:
     command:
       - "postgres"
       - "-c"
-      - "shared_buffers=64MB"
+      - "shared_buffers=256MB"
       - "-c"
-      - "work_mem=4MB"
+      - "work_mem=16MB"
       - "-c"
-      - "maintenance_work_mem=32MB"
+      - "maintenance_work_mem=64MB"
       - "-c"
-      - "effective_cache_size=128MB"
+      - "effective_cache_size=768MB"
       - "-c"
       - "synchronous_commit=off"
       - "-c"
@@ -32,7 +32,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 1024M
     networks:
       - default
 

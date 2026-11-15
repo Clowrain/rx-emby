@@ -33,6 +33,15 @@ pub(super) struct PlaybackQuery {
     pub(super) api_key: Option<String>,
 }
 
+pub(super) async fn get_user_playback_info(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((_user_id, item_id)): Path<(String, String)>,
+    q: Query<PlaybackQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    get_playback_info(state, headers, Path(item_id), q).await
+}
+
 pub(super) async fn get_playback_info(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -64,7 +73,11 @@ pub(super) async fn get_playback_info(
     let sources = if let Some(raw_mid) = item_id.strip_prefix("media_") {
         let mid = raw_mid.parse::<i64>().unwrap_or(0);
         build_media_sources_for_movie(&state, &host, &token, &session_id, mid).await?
-    } else if let Some(raw_eid) = item_id.strip_prefix("ep_") {
+    } else if let Some(raw_eid) = item_id
+        .strip_prefix("ep_")
+        .or_else(|| item_id.strip_prefix("src_"))
+        .or_else(|| item_id.chars().all(|c| c.is_ascii_digit()).then_some(item_id.as_str()))
+    {
         let eid = raw_eid.parse::<i64>().unwrap_or(0);
         let ep_meta: Option<(i64, i32, i32)> = sqlx::query_as(
             "SELECT media_item_id, season_number, episode_number FROM episodes WHERE id = $1",
@@ -190,7 +203,7 @@ pub(super) async fn build_media_sources_for_episode(
 
 async fn serialize_media_sources(
     _state: &AppState,
-    host: &str,
+    _host: &str,
     token: &str,
     session_id: &str,
     item_id: String,
@@ -224,10 +237,10 @@ async fn serialize_media_sources(
                 _ => s.version_tag,
             };
 
-            let ext = if s.container.is_empty() { "mp4" } else { s.container.as_str() };
+            // 使用相对 Emby 路径且不带视频文件后缀，避免反代丢失协议/端口或被 Nginx 静态资源正则规则拦截 404
             let direct_url = format!(
-                "http://{}/emby/Videos/{}/stream.{}?MediaSourceId=src_{}&Static=true&PlaySessionId={}&api_key={}",
-                host, item_id, ext, s.id, session_id, token
+                "/Videos/{}/stream?MediaSourceId=src_{}&Static=true&PlaySessionId={}&api_key={}",
+                item_id, s.id, session_id, token
             );
             let display_path = format!("/d{}", s.alist_path);
 

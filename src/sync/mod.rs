@@ -199,6 +199,8 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             .execute(&state.db)
             .await?;
 
+            state.caches.admin_stats_cache.invalidate_all();
+
             info!(
                 "同步任务完成 (耗时 {}ms): 新增剧集 {}, 清理失效 {}, 新增影视条目 {}",
                 duration_ms, added, deleted, new_media

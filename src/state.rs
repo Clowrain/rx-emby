@@ -80,6 +80,8 @@ pub struct CacheLayer {
     /// Key = AList 父目录路径，记录已通过 fs/list 预热过寻址的目录（避免短时间重复 list）
     pub alist_dir_prewarmed: Cache<String, ()>,
     pub image_fetch_inflight: Cache<String, ()>,
+    /// 后台概览与统计短时缓存（避免频繁切换 Tab 反复触发全表聚合扫描）
+    pub admin_stats_cache: Cache<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +95,11 @@ pub struct PlaybackSession {
     pub next_ep_prewarmed: bool,
     pub last_activity: Instant,
 }
+
+/// 播放会话最大无心跳存活时间（Emby 客户端正常播放时每 10 秒上报一次 Progress）
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// 刚发起 Playing 但进度仍为 0（如流失败或秒退）的会话最大存活时间
+const SESSION_ZERO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl AppState {
     pub fn new(
@@ -119,6 +126,11 @@ impl AppState {
             .time_to_live(Duration::from_secs(30))
             .build();
 
+        let admin_stats_cache = Cache::builder()
+            .max_capacity(32)
+            .time_to_live(Duration::from_secs(10))
+            .build();
+
         let cfg_arc = Arc::new(initial_cfg);
         let (config_tx, _) = watch::channel(cfg_arc.clone());
 
@@ -138,10 +150,23 @@ impl AppState {
                 alist_direct_urls: direct_urls,
                 alist_dir_prewarmed: dir_prewarmed,
                 image_fetch_inflight: inflight,
+                admin_stats_cache,
             },
             sessions: DashMap::new(),
             shutdown_token: CancellationToken::new(),
         }))
+    }
+
+    /// 清理已断开但未收到 Stopped 信号的过期僵尸会话
+    pub fn prune_stale_sessions(&self) {
+        self.sessions.retain(|_, s| {
+            let idle = s.last_activity.elapsed();
+            if s.position_ticks <= 0 {
+                idle <= SESSION_ZERO_PROGRESS_TIMEOUT
+            } else {
+                idle <= SESSION_IDLE_TIMEOUT
+            }
+        });
     }
 
     /// 运行时热更新配置（Web 后台保存设置后调用，无需重启服务）

@@ -79,25 +79,58 @@ pub(super) async fn authenticate_by_name(
         }
     };
 
-    let token = Uuid::new_v4().simple().to_string();
-    let client_ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("EmbyClient")
-        .chars()
-        .take(60)
-        .collect::<String>();
+    let (device_id, device_name, client_name) = parse_emby_client_identity(&headers);
 
-    let _ = sqlx::query(
-        "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
+    // 按 (user_id, device_id / client_name) 复用已有令牌并清理同客户端历史重复记录
+    let existing_token: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT token FROM access_tokens
+        WHERE user_id = $1 AND (device_id = $2 OR client_name = $3)
+        ORDER BY last_used_at DESC
+        LIMIT 1
+        "#,
     )
-    .bind(&token)
     .bind(&user_id)
-    .bind(&token[..12])
-    .bind(&client_ua)
-    .bind(&client_ua)
-    .execute(&state.db)
-    .await;
+    .bind(&device_id)
+    .bind(&client_name)
+    .fetch_optional(&state.db)
+    .await
+    .unwrap_or(None);
+
+    let token = if let Some(tok) = existing_token {
+        let _ = sqlx::query(
+            "UPDATE access_tokens SET device_id = $2, device_name = $3, client_name = $4, last_used_at = NOW() WHERE token = $1",
+        )
+        .bind(&tok)
+        .bind(&device_id)
+        .bind(&device_name)
+        .bind(&client_name)
+        .execute(&state.db)
+        .await;
+        let _ = sqlx::query(
+            "DELETE FROM access_tokens WHERE user_id = $1 AND token <> $2 AND (device_id = $3 OR client_name = $4)",
+        )
+        .bind(&user_id)
+        .bind(&tok)
+        .bind(&device_id)
+        .bind(&client_name)
+        .execute(&state.db)
+        .await;
+        tok
+    } else {
+        let new_tok = Uuid::new_v4().simple().to_string();
+        let _ = sqlx::query(
+            "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&new_tok)
+        .bind(&user_id)
+        .bind(&device_id)
+        .bind(&device_name)
+        .bind(&client_name)
+        .execute(&state.db)
+        .await;
+        new_tok
+    };
 
     let cfg = state.config.load();
     Ok(Json(json!({
@@ -110,6 +143,61 @@ pub(super) async fn authenticate_by_name(
         "AccessToken": token,
         "ServerId": cfg.server_id
     })))
+}
+
+fn extract_emby_auth_field(auth_header: &str, key: &str) -> Option<String> {
+    let needle = format!("{}=", key);
+    let idx = auth_header.find(&needle)?;
+    let rest = &auth_header[idx + needle.len()..];
+    if let Some(after_quote) = rest.strip_prefix('"') {
+        let end = after_quote.find('"')?;
+        let val = after_quote[..end].trim();
+        return (!val.is_empty()).then(|| val.to_string());
+    }
+    let val = rest.split(',').next().unwrap_or("").trim();
+    (!val.is_empty()).then(|| val.to_string())
+}
+
+fn parse_emby_client_identity(headers: &HeaderMap) -> (String, String, String) {
+    let auth_header = headers
+        .get("x-emby-authorization")
+        .or_else(|| headers.get(header::AUTHORIZATION))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("EmbyClient")
+        .trim();
+
+    let client = extract_emby_auth_field(auth_header, "Client");
+    let version = extract_emby_auth_field(auth_header, "Version");
+    let device = extract_emby_auth_field(auth_header, "Device");
+    let device_id = extract_emby_auth_field(auth_header, "DeviceId");
+
+    let client_name: String = match (client, version) {
+        (Some(c), Some(v)) => format!("{}/{}", c, v),
+        (Some(c), None) => c,
+        _ => ua.to_string(),
+    }
+    .chars()
+    .take(60)
+    .collect();
+
+    let device_name: String = device
+        .unwrap_or_else(|| client_name.clone())
+        .chars()
+        .take(60)
+        .collect();
+
+    let stable_device_id: String = device_id
+        .unwrap_or_else(|| format!("client:{}", client_name))
+        .chars()
+        .take(64)
+        .collect();
+
+    (stable_device_id, device_name, client_name)
 }
 
 pub(super) async fn get_user_info(

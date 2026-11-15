@@ -158,7 +158,6 @@ pub(super) async fn admin_login(
         ));
     }
 
-    let token = Uuid::new_v4().simple().to_string();
     let client_ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -166,18 +165,55 @@ pub(super) async fn admin_login(
         .chars()
         .take(60)
         .collect::<String>();
+    let stable_device_id = format!("admin-web-{}", user_id);
 
-    sqlx::query(
-        "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
+    let existing_token: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT token FROM access_tokens
+        WHERE user_id = $1 AND client_name = 'RX-Emby Admin'
+        ORDER BY last_used_at DESC
+        LIMIT 1
+        "#,
     )
-    .bind(&token)
     .bind(&user_id)
-    .bind(format!("admin-{}", &token[..8]))
-    .bind(&client_ua)
-    .bind("RX-Emby Admin")
-    .execute(&state.db)
+    .fetch_optional(&state.db)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .unwrap_or(None);
+
+    let token = if let Some(tok) = existing_token {
+        sqlx::query(
+            "UPDATE access_tokens SET device_id = $2, device_name = $3, last_used_at = NOW() WHERE token = $1",
+        )
+        .bind(&tok)
+        .bind(&stable_device_id)
+        .bind(&client_ua)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let _ = sqlx::query(
+            "DELETE FROM access_tokens WHERE user_id = $1 AND client_name = 'RX-Emby Admin' AND token <> $2",
+        )
+        .bind(&user_id)
+        .bind(&tok)
+        .execute(&state.db)
+        .await;
+        tok
+    } else {
+        let new_tok = Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&new_tok)
+        .bind(&user_id)
+        .bind(&stable_device_id)
+        .bind(&client_ua)
+        .bind("RX-Emby Admin")
+        .execute(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        new_tok
+    };
 
     Ok(Json(json!({
         "token": token,

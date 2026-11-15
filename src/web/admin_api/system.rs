@@ -107,7 +107,49 @@ pub(super) async fn list_sync_logs(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(json!({ "logs": logs })))
+    // 复用 10s 缓存提供轻量级元数据扩展覆盖率统计，避免前端额外触发 smart_view_options 的 7 次 JSONB 全表扫描
+    let metadata = if let Some(cached) = state.caches.admin_stats_cache.get("sync_metadata_stats").await {
+        cached
+    } else {
+        let stats: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            WITH active AS (
+                SELECT COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text) AS dedup_key,
+                       metadata_version, metadata_refresh_requested, metadata_retry_count
+                FROM media_items
+                WHERE is_ignored = FALSE
+            ),
+            grouped AS (
+                SELECT dedup_key, MAX(metadata_version) AS max_ver
+                FROM active
+                GROUP BY dedup_key
+            )
+            SELECT
+                (SELECT COUNT(*) FROM grouped),
+                (SELECT COUNT(*) FROM grouped WHERE max_ver >= 2),
+                (SELECT COUNT(*) FROM active WHERE metadata_refresh_requested),
+                (SELECT COUNT(*) FROM active WHERE metadata_refresh_requested AND metadata_retry_count >= 3)
+            "#,
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or((0, 0, 0, 0));
+
+        let val = json!({
+            "total": stats.0,
+            "enriched": stats.1,
+            "queued": stats.2,
+            "failed": stats.3
+        });
+        state
+            .caches
+            .admin_stats_cache
+            .insert("sync_metadata_stats".to_string(), val.clone())
+            .await;
+        val
+    };
+
+    Ok(Json(json!({ "logs": logs, "metadata": metadata })))
 }
 
 pub(super) async fn image_cache_stats(
@@ -155,19 +197,34 @@ pub(super) async fn trigger_cache_evict(
 pub(super) async fn get_admin_overview(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    state.prune_stale_sessions();
     let cfg = state.config.load();
+    let active_sessions = state.sessions.len();
 
-    // 1. 统计去重后在库影视总数及各刮削状态占比
+    if let Some(mut cached) = state.caches.admin_stats_cache.get("overview").await {
+        if let Some(sys) = cached.get_mut("system").and_then(|v| v.as_object_mut()) {
+            sys.insert("active_sessions".to_string(), json!(active_sessions));
+        }
+        return Ok(Json(cached));
+    }
+
+    // 1. 统计去重后在库影视总数及各刮削状态占比（单次扫描 + 分组去重）
     let (total_media, scraped_count, pending_count, failed_count, ignored_count): (i64, i64, i64, i64, i64) =
         sqlx::query_as(
             r#"
+            WITH dedup AS (
+                SELECT DISTINCT ON (is_ignored, COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text))
+                    is_ignored, scrape_status
+                FROM media_items
+                ORDER BY is_ignored, COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text), id ASC
+            )
             SELECT
-                COUNT(DISTINCT CASE WHEN NOT is_ignored THEN COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text) END),
-                COUNT(DISTINCT CASE WHEN NOT is_ignored AND scrape_status IN (1, 3) THEN COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text) END),
-                COUNT(DISTINCT CASE WHEN NOT is_ignored AND scrape_status = 0 THEN COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text) END),
-                COUNT(DISTINCT CASE WHEN NOT is_ignored AND scrape_status = 2 THEN COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text) END),
-                COUNT(DISTINCT CASE WHEN is_ignored THEN COALESCE(tmdb_id::text || ':' || media_type, 'raw:' || id::text) END)
-            FROM media_items
+                COUNT(*) FILTER (WHERE NOT is_ignored),
+                COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_status IN (1, 3)),
+                COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_status = 0),
+                COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_status = 2),
+                COUNT(*) FILTER (WHERE is_ignored)
+            FROM dedup
             "#,
         )
         .fetch_one(&state.db)
@@ -175,7 +232,7 @@ pub(super) async fn get_admin_overview(
         .unwrap_or((0, 0, 0, 0, 0));
 
     let total_episodes: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE m.is_ignored = FALSE",
+        "SELECT GREATEST(0, (SELECT COUNT(*) FROM episodes) - (SELECT COUNT(*) FROM episodes e JOIN media_items m ON m.id = e.media_item_id WHERE m.is_ignored = TRUE))",
     )
     .fetch_one(&state.db)
     .await
@@ -225,7 +282,7 @@ pub(super) async fn get_admin_overview(
         .await
         .unwrap_or(1);
 
-    Ok(Json(json!({
+    let payload = json!({
         "media": {
             "total_media": total_media,
             "total_episodes": total_episodes,
@@ -246,11 +303,18 @@ pub(super) async fn get_admin_overview(
             "alist_base_url": cfg.alist_base_url,
             "auto_background_scraper": cfg.scraper_auto_background,
             "tmdb_rate_limit": cfg.tmdb_rate_limit_per_sec,
-            "active_sessions": state.sessions.len(),
+            "active_sessions": active_sessions,
             "vlib_count": vlib_count,
             "user_count": user_count
         },
         "last_sync": last_sync
-    })))
+    });
+    state
+        .caches
+        .admin_stats_cache
+        .insert("overview".to_string(), payload.clone())
+        .await;
+
+    Ok(Json(payload))
 }
 

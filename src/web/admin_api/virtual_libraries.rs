@@ -358,6 +358,9 @@ pub(super) async fn preview_smart_view(
 }
 
 pub(super) async fn smart_view_options(State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode,String)> {
+    if let Some(cached) = state.caches.admin_stats_cache.get("smart_view_options").await {
+        return Ok(Json(cached));
+    }
     let mut result = json!({});
     for (key,expr) in [
         ("networks", "m.tmdb_metadata->'networks'"),
@@ -368,7 +371,7 @@ pub(super) async fn smart_view_options(State(state): State<Arc<AppState>>) -> Re
         ("cast", "m.tmdb_metadata->'cast'"),
         ("watch_providers", "m.tmdb_metadata->'watch_providers'"),
     ] {
-        let sql = format!("SELECT DISTINCT (v->>'id')::int AS id, v->>'name' AS name FROM media_items m CROSS JOIN LATERAL jsonb_array_elements(COALESCE({},'[]')) v WHERE NOT m.is_ignored AND v->>'id' IS NOT NULL ORDER BY name,id LIMIT 500",expr);
+        let sql = format!("SELECT DISTINCT (v->>'id')::int AS id, v->>'name' AS name FROM media_items m CROSS JOIN LATERAL jsonb_array_elements(COALESCE({},'[]')) v WHERE NOT m.is_ignored AND m.metadata_version >= 2 AND v->>'id' IS NOT NULL ORDER BY name,id LIMIT 500",expr);
         let rows: Vec<(i32,String)> = sqlx::query_as(&sql).fetch_all(&state.db).await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
         result[key] = json!(rows.into_iter().map(|(id,name)|json!({"id":id,"name":name})).collect::<Vec<_>>());
@@ -376,6 +379,7 @@ pub(super) async fn smart_view_options(State(state): State<Arc<AppState>>) -> Re
     let stats: (i64,i64,i64,i64) = sqlx::query_as("SELECT COUNT(DISTINCT COALESCE(tmdb_id::text||':'||media_type,'raw:'||id::text)), COUNT(DISTINCT COALESCE(tmdb_id::text||':'||media_type,'raw:'||id::text)) FILTER(WHERE metadata_version>=2), COUNT(*) FILTER(WHERE metadata_refresh_requested), COUNT(*) FILTER(WHERE metadata_refresh_requested AND metadata_retry_count>=3) FROM media_items WHERE NOT is_ignored")
         .fetch_one(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
     result["metadata"] = json!({"total":stats.0,"enriched":stats.1,"queued":stats.2,"failed":stats.3});
+    state.caches.admin_stats_cache.insert("smart_view_options".to_string(), result.clone()).await;
     Ok(Json(result))
 }
 
@@ -386,5 +390,6 @@ pub(super) async fn queue_metadata_backfill(State(state): State<Arc<AppState>>) 
     }
     let result = sqlx::query("UPDATE media_items SET metadata_refresh_requested=TRUE, metadata_retry_count=0, metadata_retry_at=NULL WHERE NOT is_locked AND NOT is_ignored AND scrape_status IN (1,3) AND (metadata_version<2 OR metadata_retry_count>0)")
         .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    state.caches.admin_stats_cache.invalidate_all();
     Ok(Json(json!({"queued":result.rows_affected(),"message":format!("已将 {} 条已刮削目录加入补齐队列，同作品共享更新结果",result.rows_affected())})))
 }

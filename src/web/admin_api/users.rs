@@ -78,6 +78,8 @@ pub(super) async fn list_users_and_sessions(
     .await
     .unwrap_or_default();
 
+    state.prune_stale_sessions();
+
     let mut active_sessions = Vec::new();
     for entry in state.sessions.iter() {
         let s = entry.value().clone();

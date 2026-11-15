@@ -155,6 +155,7 @@ pub(super) async fn session_playing(
     Query(q_report): Query<SessionReportPayload>,
     payload: Option<Json<SessionReportPayload>>,
 ) -> StatusCode {
+    state.prune_stale_sessions();
     let body = payload.map(|Json(b)| b).unwrap_or(q_report);
     let Some(ref raw_item_id) = body.item_id else {
         return StatusCode::NO_CONTENT;
@@ -176,6 +177,11 @@ pub(super) async fn session_playing(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("EmbyClient")
         .to_string();
+
+    // 同一用户的同一客户端重新开播时，移除旧会话避免残留僵尸会话
+    state
+        .sessions
+        .retain(|k, v| k == &sid || !(v.user_id == user_id && v.client_name == ua));
 
     state.sessions.insert(
         sid.clone(),
@@ -220,6 +226,7 @@ pub(super) async fn session_progress(
     Query(q_report): Query<SessionReportPayload>,
     payload: Option<Json<SessionReportPayload>>,
 ) -> StatusCode {
+    state.prune_stale_sessions();
     let body = payload.map(|Json(b)| b).unwrap_or(q_report);
     let Some(ref raw_item_id) = body.item_id else {
         return StatusCode::NO_CONTENT;
@@ -356,10 +363,12 @@ pub(super) async fn session_stopped(
     Query(q_report): Query<SessionReportPayload>,
     payload: Option<Json<SessionReportPayload>>,
 ) -> StatusCode {
+    state.prune_stale_sessions();
     let body = payload.map(|Json(b)| b).unwrap_or(q_report);
+    let resolved_uid = resolve_valid_user_id(&state, body.user_id.as_deref(), &headers).await.ok();
     if let Some(ref raw_item_id) = body.item_id {
         if body.position_ticks > 0 {
-            if let Ok(user_id) = resolve_valid_user_id(&state, body.user_id.as_deref(), &headers).await {
+            if let Some(ref user_id) = resolved_uid {
                 if let Some((mid, tmdb_id, mtype, snum, epnum)) =
                     resolve_item_target(&state, raw_item_id).await
                 {
@@ -368,7 +377,7 @@ pub(super) async fn session_stopped(
                     let saved_pos = if auto_completed { 0 } else { body.position_ticks };
                     let _ = upsert_play_history(
                         &state,
-                        &user_id,
+                        user_id,
                         mid,
                         tmdb_id,
                         &mtype,
@@ -383,8 +392,23 @@ pub(super) async fn session_stopped(
             }
         }
     }
-    if let Some(sid) = body.play_session_id {
-        state.sessions.remove(&sid);
+    if let Some(ref sid) = body.play_session_id {
+        state.sessions.remove(sid);
+    }
+    if let Some(ref raw_item_id) = body.item_id {
+        let fallback_sid = format!("sess_{}", raw_item_id);
+        state.sessions.remove(&fallback_sid);
+        if let Some(ep_id) = raw_item_id
+            .strip_prefix("ep_")
+            .or_else(|| raw_item_id.strip_prefix("src_"))
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            if let Some(ref uid) = resolved_uid {
+                state
+                    .sessions
+                    .retain(|_, v| !(v.user_id == *uid && v.current_episode_id == Some(ep_id)));
+            }
+        }
     }
     StatusCode::NO_CONTENT
 }

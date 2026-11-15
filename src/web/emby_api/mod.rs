@@ -57,6 +57,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/Shows/:series_id/Seasons", get(items::get_show_seasons))
         .route("/Shows/:series_id/Episodes", get(items::get_show_episodes))
         .route("/Items/:item_id/PlaybackInfo", post(playback::get_playback_info).get(playback::get_playback_info))
+        .route("/Users/:user_id/Items/:item_id/PlaybackInfo", post(playback::get_user_playback_info).get(playback::get_user_playback_info))
         .route("/MediaSegments/:item_id", get(playback::get_media_segments))
         .route("/Sessions/Playing", post(sessions::session_playing))
         .route("/Sessions/Playing/Progress", post(sessions::session_progress))

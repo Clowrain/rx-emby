@@ -72,41 +72,46 @@ pub(super) async fn list_admin_media(
     let items: Vec<AdminMediaRow> = sqlx::query_as(
         r#"
         SELECT
-            id, media_type, tmdb_id, title, year, rating, category,
-            scrape_status, is_locked, is_ignored, root_dir, poster_path,
-            episode_count, sibling_count
+            page.id, page.media_type, page.tmdb_id, page.title, page.year, page.rating, page.category,
+            page.scrape_status, page.is_locked, page.is_ignored, page.root_dir, page.poster_path,
+            CASE
+                WHEN page.tmdb_id IS NOT NULL THEN (
+                    SELECT COUNT(*) FROM episodes e
+                    JOIN media_items sm ON sm.id = e.media_item_id
+                    WHERE sm.tmdb_id = page.tmdb_id AND sm.media_type = page.media_type AND sm.is_ignored = page.is_ignored
+                )
+                ELSE (SELECT COUNT(*) FROM episodes e WHERE e.media_item_id = page.id)
+            END AS episode_count,
+            CASE
+                WHEN page.tmdb_id IS NOT NULL THEN (
+                    SELECT COUNT(*) FROM media_items s
+                    WHERE s.tmdb_id = page.tmdb_id AND s.media_type = page.media_type AND s.is_ignored = page.is_ignored
+                )
+                ELSE 1
+            END AS sibling_count
         FROM (
-            SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
-                m.id, m.media_type, m.tmdb_id, m.title, m.year, m.rating, m.category,
-                m.scrape_status, m.is_locked, m.is_ignored, m.root_dir, m.poster_path, m.updated_at,
-                CASE
-                    WHEN m.tmdb_id IS NOT NULL THEN (
-                        SELECT COUNT(*) FROM episodes e
-                        JOIN media_items sm ON sm.id = e.media_item_id
-                        WHERE sm.tmdb_id = m.tmdb_id AND sm.media_type = m.media_type AND sm.is_ignored = m.is_ignored
-                    )
-                    ELSE (SELECT COUNT(*) FROM episodes e WHERE e.media_item_id = m.id)
-                END AS episode_count,
-                CASE
-                    WHEN m.tmdb_id IS NOT NULL THEN (
-                        SELECT COUNT(*) FROM media_items s
-                        WHERE s.tmdb_id = m.tmdb_id AND s.media_type = m.media_type AND s.is_ignored = m.is_ignored
-                    )
-                    ELSE 1
-                END AS sibling_count
-            FROM media_items m
-            WHERE m.is_ignored = $1
-              AND ($2::int2 IS NULL OR m.scrape_status = $2)
-              AND ($3::text IS NULL OR m.category = $3)
-              AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4)
-            ORDER BY
-                COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
-                (m.scrape_status IN (1, 3)) DESC,
-                (m.poster_path IS NOT NULL) DESC,
-                m.id ASC
-        ) AS deduped
-        ORDER BY updated_at DESC, id DESC
-        LIMIT $5 OFFSET $6
+            SELECT
+                id, media_type, tmdb_id, title, year, rating, category,
+                scrape_status, is_locked, is_ignored, root_dir, poster_path, updated_at
+            FROM (
+                SELECT DISTINCT ON (COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text))
+                    m.id, m.media_type, m.tmdb_id, m.title, m.year, m.rating, m.category,
+                    m.scrape_status, m.is_locked, m.is_ignored, m.root_dir, m.poster_path, m.updated_at
+                FROM media_items m
+                WHERE m.is_ignored = $1
+                  AND ($2::int2 IS NULL OR m.scrape_status = $2)
+                  AND ($3::text IS NULL OR m.category = $3)
+                  AND ($4::text IS NULL OR m.title ILIKE $4 OR m.root_dir ILIKE $4)
+                ORDER BY
+                    COALESCE(m.tmdb_id::text || ':' || m.media_type, 'raw:' || m.id::text),
+                    (m.scrape_status IN (1, 3)) DESC,
+                    (m.poster_path IS NOT NULL) DESC,
+                    m.id ASC
+            ) AS deduped
+            ORDER BY updated_at DESC, id DESC
+            LIMIT $5 OFFSET $6
+        ) AS page
+        ORDER BY page.updated_at DESC, page.id DESC
         "#,
     )
     .bind(ignored_filter)
@@ -329,6 +334,8 @@ pub(super) async fn bind_tmdb_id(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    state.caches.admin_stats_cache.invalidate_all();
+
     Ok(Json(json!({ "status": "ok", "message": "已成功绑定 TMDB ID 并刷新锁定主条目与分集元数据" })))
 }
 
@@ -352,6 +359,8 @@ pub(super) async fn scrape_one_now(
     scrape_single_media(&state, media_id)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("单条刮削失败: {:#}", e)))?;
+
+    state.caches.admin_stats_cache.invalidate_all();
 
     Ok(Json(json!({ "status": "ok", "message": "单条及分集元数据刮削成功" })))
 }
@@ -382,6 +391,8 @@ pub(super) async fn toggle_ignore_media(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    state.caches.admin_stats_cache.invalidate_all();
+
     Ok(Json(json!({
         "status": "ok",
         "message": if payload.ignore { "已屏蔽该影视，后续同步将自动跳过（可在「已屏蔽」中恢复）" } else { "已恢复显示到媒体库" }
@@ -397,6 +408,8 @@ pub(super) async fn retry_failed_scrapes(
     .execute(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state.caches.admin_stats_cache.invalidate_all();
 
     Ok(Json(json!({
         "status": "ok",
