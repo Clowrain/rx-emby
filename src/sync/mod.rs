@@ -2,18 +2,18 @@ pub mod batch_db;
 pub mod parser;
 
 use crate::state::AppState;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use batch_db::{apply_sync_diff, deduplicate_records};
 use chrono::Utc;
 use parser::parse_strm_line;
 use reqwest::{Client, Proxy, StatusCode};
 use std::{
     io::{Cursor, Read},
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 use tokio::{fs, io::AsyncBufReadExt, time::sleep};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 const MIN_SYNC_INTERVAL_SEC: u64 = 60;
@@ -171,11 +171,14 @@ pub fn spawn_sync_worker(state: Arc<AppState>) {
                         current_interval_sec = new_interval;
                         // 索引源地址变更时清理旧 ETag/哈希游标，避免新源命中旧缓存并立即触发同步
                         *state.sync_ctrl.last_file_hash.write().await = None;
-                        let _ = sqlx::query(
+                        if let Err(err) = sqlx::query(
                             "DELETE FROM system_configs WHERE config_key IN ('sync.last_etag', 'sync.last_file_hash')",
                         )
                         .execute(&state.db)
-                        .await;
+                        .await
+                        {
+                            warn!("清理旧同步游标失败: {:#}", err);
+                        }
                         next_run_at = tokio::time::Instant::now() + CONFIG_RELOAD_GRACE;
                         info!(
                             "检测到索引源变更为 {}，已清理旧游标并将在 {} 秒后触发同步",
@@ -218,44 +221,52 @@ pub async fn run_sync_once(state: &AppState, force: bool) -> Result<()> {
     res
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn set_sync_progress(
-    state: &AppState,
+struct SyncProgressUpdate {
     log_id: i64,
     started_at: chrono::DateTime<chrono::Utc>,
-    stage: &str,
+    stage: &'static str,
     step: u8,
     percent: u8,
-    message: impl Into<String>,
+    message: String,
     scanned_lines: i32,
     valid_records: i32,
-) {
+}
+
+async fn set_sync_progress(state: &AppState, update: SyncProgressUpdate) {
     *state.sync_ctrl.progress.write().await = Some(crate::state::SyncProgress {
-        log_id: Some(log_id),
-        stage: stage.to_string(),
-        step,
+        log_id: Some(update.log_id),
+        stage: update.stage.to_string(),
+        step: update.step,
         total_steps: 5,
-        percent: percent.min(100),
-        message: message.into(),
-        scanned_lines,
-        valid_records,
-        started_at,
+        percent: update.percent.min(100),
+        message: update.message,
+        scanned_lines: update.scanned_lines,
+        valid_records: update.valid_records,
+        started_at: update.started_at,
     });
 }
 
 async fn load_persisted_cursor(state: &AppState, key: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>("SELECT config_value FROM system_configs WHERE config_key = $1")
-        .bind(key)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten()
+    let value = match sqlx::query_scalar::<_, String>(
+        "SELECT config_value FROM system_configs WHERE config_key = $1",
+    )
+    .bind(key)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            warn!("读取同步游标 {} 失败: {:#}", key, err);
+            None
+        }
+    };
+    value
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 async fn save_persisted_cursor(state: &AppState, key: &str, val: &str, desc: &str) {
-    let _ = sqlx::query(
+    if let Err(err) = sqlx::query(
         r#"
         INSERT INTO system_configs (config_key, config_value, value_type, description, updated_at)
         VALUES ($1, $2, 'string', $3, NOW())
@@ -268,7 +279,10 @@ async fn save_persisted_cursor(state: &AppState, key: &str, val: &str, desc: &st
     .bind(val)
     .bind(desc)
     .execute(&state.db)
-    .await;
+    .await
+    {
+        warn!("保存同步游标 {} 失败: {:#}", key, err);
+    }
 }
 
 fn build_sync_http_client(proxy_url: Option<&str>) -> Result<Client> {
@@ -443,14 +457,16 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
     set_sync_progress(
         state,
-        log_id,
-        started_at,
-        "downloading",
-        1,
-        10,
-        "正在下载/读取索引源…",
-        0,
-        0,
+        SyncProgressUpdate {
+            log_id,
+            started_at,
+            stage: "downloading",
+            step: 1,
+            percent: 10,
+            message: "正在下载/读取索引源…".to_string(),
+            scanned_lines: 0,
+            valid_records: 0,
+        },
     )
     .await;
 
@@ -466,16 +482,19 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
                 "最近一次索引检查时间",
             )
             .await;
-            let _ = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
+            if let Err(err) = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
                 .bind(log_id)
                 .execute(&state.db)
-                .await;
+                .await
+            {
+                debug!("清理无变化同步日志 id={} 失败: {:#}", log_id, err);
+            }
             return Ok(());
         }
         Ok(FetchedSource::Bytes { data, etag }) => (data, etag),
         Err(e) => {
             let err_msg = format!("{:#}", e);
-            let _ = sqlx::query(
+            if let Err(log_err) = sqlx::query(
                 "UPDATE sync_logs SET finished_at = $1, duration_ms = $2, status = 'failed', error_message = $3 WHERE id = $4",
             )
             .bind(Utc::now())
@@ -483,7 +502,10 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             .bind(&err_msg)
             .bind(log_id)
             .execute(&state.db)
-            .await;
+            .await
+            {
+                error!("记录同步下载失败状态失败 log_id={}: {:#}", log_id, log_err);
+            }
             return Err(e);
         }
     };
@@ -504,10 +526,13 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         if let Some(ref etag) = new_etag {
             save_persisted_cursor(state, "sync.last_etag", etag, "最近一次同步远程索引 ETag").await;
         }
-        let _ = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
+        if let Err(err) = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
             .bind(log_id)
             .execute(&state.db)
-            .await;
+            .await
+        {
+            debug!("清理未变更同步日志 id={} 失败: {:#}", log_id, err);
+        }
         return Ok(());
     }
 
@@ -515,14 +540,16 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         let txt_bytes = if is_zip_payload(&source, &raw_bytes) {
             set_sync_progress(
                 state,
-                log_id,
-                started_at,
-                "extracting",
-                2,
-                25,
-                "正在解压 .zip 压缩索引…",
-                0,
-                0,
+                SyncProgressUpdate {
+                    log_id,
+                    started_at,
+                    stage: "extracting",
+                    step: 2,
+                    percent: 25,
+                    message: "正在解压 .zip 压缩索引…".to_string(),
+                    scanned_lines: 0,
+                    valid_records: 0,
+                },
             )
             .await;
             info!("检测到 .zip 压缩索引源，正在内存中解压...");
@@ -533,14 +560,16 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
         set_sync_progress(
             state,
-            log_id,
-            started_at,
-            "parsing",
-            3,
-            35,
-            "正在逐行解析索引内容…",
-            0,
-            0,
+            SyncProgressUpdate {
+                log_id,
+                started_at,
+                stage: "parsing",
+                step: 3,
+                percent: 35,
+                message: "正在逐行解析索引内容…".to_string(),
+                scanned_lines: 0,
+                valid_records: 0,
+            },
         )
         .await;
 
@@ -572,18 +601,20 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
                 let pct = (35 + ((total_lines / 20_000).min(25) as u8)).min(60);
                 set_sync_progress(
                     state,
-                    log_id,
-                    started_at,
-                    "parsing",
-                    3,
-                    pct,
-                    format!(
-                        "正在解析索引行（已扫描 {} 行，命中 {} 条视频）…",
-                        total_lines,
-                        parsed_records.len()
-                    ),
-                    total_lines,
-                    parsed_records.len() as i32,
+                    SyncProgressUpdate {
+                        log_id,
+                        started_at,
+                        stage: "parsing",
+                        step: 3,
+                        percent: pct,
+                        message: format!(
+                            "正在解析索引行（已扫描 {} 行，命中 {} 条视频）…",
+                            total_lines,
+                            parsed_records.len()
+                        ),
+                        scanned_lines: total_lines,
+                        valid_records: parsed_records.len() as i32,
+                    },
                 )
                 .await;
             }
@@ -597,14 +628,16 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
         set_sync_progress(
             state,
-            log_id,
-            started_at,
-            "deduplicating",
-            4,
-            68,
-            format!("正在对 {} 条视频源择优去重…", parsed_records.len()),
-            total_lines,
-            parsed_records.len() as i32,
+            SyncProgressUpdate {
+                log_id,
+                started_at,
+                stage: "deduplicating",
+                step: 4,
+                percent: 68,
+                message: format!("正在对 {} 条视频源择优去重…", parsed_records.len()),
+                scanned_lines: total_lines,
+                valid_records: parsed_records.len() as i32,
+            },
         )
         .await;
 
@@ -612,14 +645,16 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
         set_sync_progress(
             state,
-            log_id,
-            started_at,
-            "writing_db",
-            5,
-            82,
-            format!("正在增量比对并写入数据库（去重后 {} 条）…", deduped.len()),
-            total_lines,
-            deduped.len() as i32,
+            SyncProgressUpdate {
+                log_id,
+                started_at,
+                stage: "writing_db",
+                step: 5,
+                percent: 82,
+                message: format!("正在增量比对并写入数据库（去重后 {} 条）…", deduped.len()),
+                scanned_lines: total_lines,
+                valid_records: deduped.len() as i32,
+            },
         )
         .await;
 
@@ -690,7 +725,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         }
         Err(e) => {
             let err_msg = format!("{:#}", e);
-            let _ = sqlx::query(
+            if let Err(log_err) = sqlx::query(
                 "UPDATE sync_logs SET finished_at = $1, duration_ms = $2, status = 'failed', error_message = $3 WHERE id = $4",
             )
             .bind(finished_at)
@@ -698,7 +733,10 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             .bind(&err_msg)
             .bind(log_id)
             .execute(&state.db)
-            .await;
+            .await
+            {
+                error!("记录同步失败状态失败 log_id={}: {:#}", log_id, log_err);
+            }
             Err(e)
         }
     }
@@ -707,7 +745,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_next_run_at, remaining_wait_secs, schedule_after_sync, SYNC_ERROR_RETRY_SEC,
+        SYNC_ERROR_RETRY_SEC, compute_next_run_at, remaining_wait_secs, schedule_after_sync,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;

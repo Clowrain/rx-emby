@@ -1,11 +1,11 @@
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
     Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -159,19 +159,38 @@ pub(super) async fn authenticate_by_name(
 }
 
 fn extract_emby_auth_field(auth_header: &str, key: &str) -> Option<String> {
-    let needle = format!("{}=", key);
-    let idx = auth_header.find(&needle)?;
-    let rest = &auth_header[idx + needle.len()..];
-    if let Some(after_quote) = rest.strip_prefix('"') {
-        let end = after_quote.find('"')?;
-        let val = after_quote[..end].trim();
-        return (!val.is_empty()).then(|| val.to_string());
+    let header_lower = auth_header.to_ascii_lowercase();
+    let key_lower = key.to_ascii_lowercase();
+    for (index, _) in header_lower.match_indices(&key_lower) {
+        let before = auth_header[..index].chars().next_back();
+        if before.is_some_and(|ch| !ch.is_ascii_whitespace() && ch != ',') {
+            continue;
+        }
+        let after_key = index + key.len();
+        let tail = auth_header[after_key..].trim_start();
+        let Some(value) = tail.strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
+        let (value, quoted) = if let Some(quoted) = value.strip_prefix('"') {
+            let end = quoted.find('"')?;
+            (&quoted[..end], true)
+        } else {
+            (value.split(',').next().unwrap_or_default().trim(), false)
+        };
+        let value = if quoted {
+            value
+        } else {
+            value.trim_matches('"').trim()
+        };
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
     }
-    let val = rest.split(',').next().unwrap_or("").trim();
-    (!val.is_empty()).then(|| val.to_string())
+    None
 }
 
-fn parse_emby_client_identity(headers: &HeaderMap) -> (String, String, String) {
+pub(super) fn parse_emby_client_identity(headers: &HeaderMap) -> (String, String, String) {
     let auth_header = headers
         .get("x-emby-authorization")
         .or_else(|| headers.get(header::AUTHORIZATION))
@@ -275,9 +294,9 @@ pub(super) fn extract_emby_token(headers: &HeaderMap, api_key: Option<&str>) -> 
         }
         let trimmed = auth.trim();
         if let Some(tok) = trimmed
-            .strip_prefix("Bearer ")
-            .or_else(|| trimmed.strip_prefix("bearer "))
-            .map(str::trim)
+            .split_once(' ')
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, token)| token.trim())
             .filter(|s| !s.is_empty())
         {
             return Some(tok.to_string());
@@ -392,6 +411,48 @@ mod cache_tests {
     use axum::http::{HeaderMap, HeaderValue};
     use moka::future::Cache;
     use std::sync::Arc;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("bEaReR my-token"),
+        )]);
+        assert_eq!(
+            extract_emby_token(&headers, None).as_deref(),
+            Some("my-token")
+        );
+    }
+
+    #[test]
+    fn auth_fields_require_token_boundary_and_match_key_case_insensitively() {
+        assert_eq!(
+            super::extract_emby_auth_field("MediaBrowser client=Infuse, tOkEn=abc", "Token")
+                .as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            super::extract_emby_auth_field("MediaBrowser NotToken=wrong, Client=Infuse", "Token"),
+            None
+        );
+        assert_eq!(
+            super::extract_emby_auth_field("DeviceId=phone-1, device=Phone", "DeviceId").as_deref(),
+            Some("phone-1")
+        );
+        assert_eq!(
+            super::extract_emby_auth_field("MediaBrowser token=first, TOKEN=second", "Token")
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            super::extract_emby_auth_field("NotDeviceId=wrong", "DeviceId"),
+            None
+        );
+        assert_eq!(
+            super::extract_emby_auth_field("Token=\"abc,def\"", "Token").as_deref(),
+            Some("abc,def")
+        );
+    }
 
     #[test]
     fn detail_token_extraction_supports_emby_authorization_and_api_key() {

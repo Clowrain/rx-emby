@@ -162,7 +162,7 @@ pub async fn get_next_up_items(
         SELECT work_id, tmdb_id, media_type, season_number, episode_number,
                position_ticks, duration_ticks, is_played
         FROM (
-            SELECT DISTINCT ON (COALESCE(ph.tmdb_id::text, ph.work_id::text))
+            SELECT DISTINCT ON (COALESCE('t:' || ph.tmdb_id::text, 'w:' || ph.work_id::text))
                 ph.work_id, ph.tmdb_id, ph.media_type, ph.season_number, ph.episode_number,
                 ph.position_ticks, ph.duration_ticks, ph.is_played, ph.last_played_at
             FROM play_histories ph
@@ -176,16 +176,16 @@ pub async fn get_next_up_items(
             ) m ON TRUE
             WHERE ph.user_id = $1 AND ph.media_type = 'tv' AND m.media_type = 'tv'
               AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)
-              AND (m.media_type = 'movie' OR EXISTS (
+              AND EXISTS (
                   SELECT 1 FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id
                   WHERE f.work_id = m.id AND f.is_ignored = FALSE
                     AND sf.season_number = ph.season_number AND sf.episode_number = ph.episode_number
-              ))
+              )
         "#,
     );
     history_sql.bind(user_id.clone())?;
     access_scope.push_sql_predicate(&mut history_sql)?;
-    history_sql.push(") t ORDER BY last_played_at DESC LIMIT ");
+    history_sql.push(" ORDER BY COALESCE('t:' || ph.tmdb_id::text, 'w:' || ph.work_id::text), ph.last_played_at DESC) t ORDER BY last_played_at DESC LIMIT ");
     history_sql.bind(limit)?;
     history_sql.push(" OFFSET ");
     history_sql.bind(q.start_index.max(0))?;
@@ -413,6 +413,17 @@ async fn batch_build_history_items(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn next_up_deduplicates_by_resolved_work_and_orders_distinct_selection() {
+        let source = include_str!("history.rs");
+        let next_up = source.find("pub async fn get_next_up_items").unwrap();
+        let sql = &source[next_up..source.find("async fn batch_build_history_items").unwrap()];
+        let dedup_key = "COALESCE('t:' || ph.tmdb_id::text, 'w:' || ph.work_id::text)";
+        assert!(sql.contains(&format!("DISTINCT ON ({dedup_key})")));
+        assert!(sql.contains(&format!("ORDER BY {dedup_key}, ph.last_played_at DESC")));
+        assert!(!sql.contains("m.media_type = 'movie'"));
+    }
+
     #[test]
     fn resume_and_next_up_apply_access_scope_before_limit() {
         let source = include_str!("history.rs");

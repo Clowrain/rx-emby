@@ -3,19 +3,19 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use governor::{
+    Quota, RateLimiter,
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter,
 };
 use moka::future::Cache;
 use reqwest::{Client, Proxy};
 use sqlx::PgPool;
 use std::{
     num::NonZeroU32,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -131,6 +131,7 @@ pub struct CacheLayer {
 pub struct PlaybackSession {
     pub session_id: String,
     pub user_id: String,
+    pub device_id: String,
     pub device_name: String,
     pub client_name: String,
     pub current_episode_id: Option<i64>,

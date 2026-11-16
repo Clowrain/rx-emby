@@ -1,26 +1,26 @@
-pub(super) use crate::smart_views::{can_access_view, VirtualLibraryRule};
+pub(super) use crate::smart_views::{VirtualLibraryRule, can_access_view};
 pub(super) use crate::state::{AppState, ScrapeTask};
 pub(super) use crate::web::emby_api::auth::{extract_emby_token, resolve_valid_user_id_with_query};
 pub(super) use crate::web::emby_api::ids::{
     build_search_pattern, numeric_tmdb_id, parse_episode_id, parse_season_id, parse_work_id,
 };
 pub(super) use crate::web::emby_api::playback::{
-    build_media_sources_for_episode, build_media_sources_for_movie, PlaybackQuery,
+    PlaybackQuery, build_media_sources_for_episode, build_media_sources_for_movie,
 };
 pub(super) use crate::web::emby_api::sessions::{
     is_media_favorited, load_media_episode_histories, load_user_favorite_keys,
 };
 pub(super) use crate::web::emby_api::views::{
-    get_user_allowed_categories, user_access_scope, UserAccessScope,
+    UserAccessScope, get_user_allowed_categories, user_access_scope,
 };
 pub(super) use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
     Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
 };
 pub(super) use serde::Deserialize;
 pub(super) use serde_json::Value;
-pub(super) use sqlx::{postgres::PgArguments, Arguments, Encode, Postgres};
+pub(super) use sqlx::{Arguments, Encode, Postgres, postgres::PgArguments};
 pub(super) use std::{collections::HashSet, sync::Arc};
 pub(super) use uuid::Uuid;
 
@@ -121,6 +121,9 @@ impl UserAccessScope {
         &self,
         sql: &mut DynSql,
     ) -> Result<(), (StatusCode, String)> {
+        let Some(categories) = &self.allowed_categories else {
+            return Ok(());
+        };
         let mut rules = Vec::with_capacity(self.virtual_libraries.len());
         for library in &self.virtual_libraries {
             let rule: VirtualLibraryRule = serde_json::from_value(library.filter_rules.clone())
@@ -129,9 +132,6 @@ impl UserAccessScope {
                 .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
             rules.push((library.filter_rules.clone(), rule));
         }
-        let Some(categories) = &self.allowed_categories else {
-            return Ok(());
-        };
         let category_param = sql.bind(categories.clone())?;
         let mut predicates = vec![format!("m.category = ANY({category_param})")];
         for (rules_json, rule) in rules {
@@ -170,7 +170,7 @@ pub(super) fn push_media_filters(
             " AND (m.title ILIKE {pat} OR m.original_title ILIKE {pat} OR m.sort_title ILIKE {pat}"
         );
         pred.push_str(&format!(
-            " OR EXISTS (SELECT 1 FROM sync_folders sf2 WHERE sf2.work_id = m.id AND (sf2.clean_title ILIKE {pat} OR sf2.raw_folder_name ILIKE {pat}))"
+            " OR EXISTS (SELECT 1 FROM sync_folders sf2 WHERE sf2.work_id = m.id AND sf2.is_ignored = FALSE AND (sf2.clean_title ILIKE {pat} OR sf2.raw_folder_name ILIKE {pat}))"
         ));
         if let Some(tid) = f.search_tmdb {
             let tid_param = sql.bind(tid)?;
@@ -188,19 +188,26 @@ pub(super) fn push_media_filters(
         sql.push_bind_push(" AND m.id = ANY(", ids.to_vec(), ")")?;
     }
 
-    // user_id 只绑定一次，收藏/已看/未看三个 EXISTS 复用同一占位符
-    let uid = sql.bind(f.user_id.to_string())?;
+    // 仅在需要用户状态过滤时绑定 user_id，并在这些 EXISTS 中复用。
+    let uid = if f.only_favorite || f.only_played || f.only_unplayed {
+        Some(sql.bind(f.user_id.to_string())?)
+    } else {
+        None
+    };
     if f.only_favorite {
+        let uid = uid.as_deref().expect("favorite filter binds user_id");
         sql.push(&format!(
             " AND EXISTS (SELECT 1 FROM user_favorites uf WHERE uf.user_id = {uid} AND ((uf.tmdb_id IS NOT NULL AND uf.tmdb_id = m.tmdb_id AND uf.media_type = m.media_type) OR uf.work_id = m.id))"
         ));
     }
     if f.only_played {
+        let uid = uid.as_deref().expect("played filter binds user_id");
         sql.push(&format!(
             " AND EXISTS (SELECT 1 FROM play_histories ph WHERE ph.user_id = {uid} AND ph.is_played = TRUE AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id))"
         ));
     }
     if f.only_unplayed {
+        let uid = uid.as_deref().expect("unplayed filter binds user_id");
         sql.push(&format!(
             " AND NOT EXISTS (SELECT 1 FROM play_histories ph WHERE ph.user_id = {uid} AND ph.is_played = TRUE AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id))"
         ));
@@ -309,7 +316,48 @@ mod tests {
     }
 
     #[test]
-    fn list_access_sql_combines_categories_and_accessible_virtual_libraries() {
+    fn folder_name_search_excludes_ignored_folders() {
+        let mut sql = DynSql::new("SELECT m.id FROM media_works m WHERE TRUE");
+        let filters = MediaListFilters {
+            user_id: "user",
+            access_scope: &UserAccessScope {
+                allowed_categories: None,
+                virtual_libraries: vec![],
+            },
+            category_filter: None,
+            media_type_filter: None,
+            search_pattern: Some("%term%"),
+            search_tmdb: None,
+            explicit_ids: None,
+            only_favorite: false,
+            only_played: false,
+            only_unplayed: false,
+            rule_json: None,
+            rule: None,
+        };
+        push_media_filters(&mut sql, &filters).unwrap();
+        assert!(sql.sql.contains("sf2.is_ignored = FALSE"));
+        assert_eq!(
+            sql.n, 1,
+            "user_id is not bound when user-state filters are off"
+        );
+    }
+
+    #[test]
+    fn no_category_scope_skips_virtual_library_rule_validation() {
+        let scope = UserAccessScope {
+            allowed_categories: None,
+            virtual_libraries: vec![AccessibleVirtualLibrary {
+                filter_rules: serde_json::json!({"unknown_rule": true}),
+            }],
+        };
+        let mut sql = DynSql::new("SELECT m.id FROM media_works m WHERE TRUE");
+        scope.push_sql_predicate(&mut sql).unwrap();
+        assert_eq!(sql.n, 0);
+    }
+
+    #[test]
+    fn list_access_sql_combines_categories_and_virtual_library_rules() {
         let scope = Arc::new(UserAccessScope {
             allowed_categories: Some(vec!["电影".to_string()]),
             virtual_libraries: vec![AccessibleVirtualLibrary {
@@ -333,7 +381,7 @@ mod tests {
         let mut sql = DynSql::new("SELECT m.id FROM media_works m WHERE ");
         push_media_filters(&mut sql, &filters).unwrap();
         let query = sql.sql;
-        assert!(query.contains("m.category = ANY($2)"), "{query}");
+        assert!(query.contains("m.category = ANY($1)"), "{query}");
         assert!(query.contains(" OR (m.rating >="), "{query}");
         assert!(query.contains("f.work_id = m.id"), "{query}");
     }

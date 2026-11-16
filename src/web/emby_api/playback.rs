@@ -3,13 +3,13 @@ use super::ids::parse_episode_id;
 use super::items::ensure_media_accessible;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::Response,
     Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -162,35 +162,62 @@ async fn get_playback_info_inner(
     };
 
     if q.is_playback.unwrap_or(true) {
-        let target_src_id = q
+        let requested_source = q
             .media_source_id
             .as_deref()
-            .and_then(|s| s.strip_prefix("src_").or(Some(s)))
-            .and_then(|s| s.parse::<i64>().ok())
-            .or_else(|| {
-                sources
-                    .first()
-                    .and_then(|v| v.get("Id"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.strip_prefix("src_"))
-                    .and_then(|s| s.parse::<i64>().ok())
-            });
+            .map(|value| value.strip_prefix("src_").unwrap_or(value));
+        let target_src_id = if let Some(source_id) = requested_source {
+            Some(
+                source_id
+                    .parse::<i64>()
+                    .map_err(|_| (StatusCode::BAD_REQUEST, "无效的媒体源 ID".to_string()))?,
+            )
+        } else {
+            sources
+                .first()
+                .and_then(|source| source.get("Id"))
+                .and_then(Value::as_str)
+                .and_then(|source_id| source_id.strip_prefix("src_"))
+                .and_then(|source_id| source_id.parse::<i64>().ok())
+        };
 
         if let Some(src_id) = target_src_id {
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                if let Ok(Some((alist_path, path_hash))) = sqlx::query_as::<_, (String, i64)>(
-                    "SELECT alist_path, path_hash FROM sync_files WHERE id = $1",
-                )
-                .bind(src_id)
-                .fetch_optional(&state_clone.db)
-                .await
-                {
+            let returned_source = sources.iter().any(|source| {
+                source
+                    .get("Id")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.strip_prefix("src_"))
+                    .and_then(|value| value.parse::<i64>().ok())
+                    == Some(src_id)
+            });
+            if requested_source.is_some() && !returned_source {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "指定的媒体源不属于当前条目或已被屏蔽".to_string(),
+                ));
+            }
+            let prewarm_source: Option<(i64, String, i64)> = sqlx::query_as(
+                "SELECT f.work_id, sf.alist_path, sf.path_hash FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.id = $1 AND f.work_id IS NOT NULL AND f.is_ignored = FALSE",
+            )
+            .bind(src_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if requested_source.is_some() && prewarm_source.is_none() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "指定的媒体源不属于当前条目或已被屏蔽".to_string(),
+                ));
+            }
+            if let Some((source_work_id, alist_path, path_hash)) = prewarm_source {
+                ensure_media_accessible(&state, &user_id, source_work_id).await?;
+                let state_clone = state.clone();
+                tokio::spawn(async move {
                     let _ = state_clone
                         .resolve_playback_url(path_hash, &alist_path, &client_ua)
                         .await;
-                }
-            });
+                });
+            }
         }
     }
 
@@ -394,9 +421,11 @@ pub(super) async fn stream_video(
         msid.strip_prefix("src_")
             .unwrap_or(msid)
             .parse::<i64>()
-            .unwrap_or(0)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的源 ID".to_string()))?
     } else if let Some(raw_sid) = item_id.strip_prefix("src_") {
-        raw_sid.parse::<i64>().unwrap_or(0)
+        raw_sid
+            .parse::<i64>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的源 ID".to_string()))?
     } else if item_id.starts_with("ep_") {
         let (wid, snum, epnum) = parse_episode_id(&item_id)
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的分集 ID".to_string()))?;
@@ -425,7 +454,9 @@ pub(super) async fn stream_video(
         .strip_prefix("work_")
         .or_else(|| item_id.strip_prefix("media_"))
     {
-        let wid = raw_wid.parse::<i64>().unwrap_or(0);
+        let wid = raw_wid
+            .parse::<i64>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的作品 ID".to_string()))?;
         sqlx::query_scalar(
             r#"
             SELECT sf.id
@@ -444,8 +475,12 @@ pub(super) async fn stream_video(
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
         })?
         .unwrap_or(0)
+    } else if item_id.chars().all(|c| c.is_ascii_digit()) {
+        item_id
+            .parse::<i64>()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "无效的源 ID".to_string()))?
     } else {
-        item_id.parse::<i64>().unwrap_or(0)
+        return Err((StatusCode::BAD_REQUEST, "无效的媒体或源 ID".to_string()));
     };
 
     let row: Option<(i64, String, i64)> = sqlx::query_as(
@@ -504,14 +539,19 @@ fn indexed_path_work_id(row: Option<(Option<i64>, bool)>) -> Result<i64, (Status
 }
 
 fn canonicalize_alist_path(path: &str) -> Result<String, (StatusCode, String)> {
-    let normalized = format!("/{}", path.trim_start_matches('/'));
-    if normalized
+    let parts: Vec<&str> = path
+        .trim()
         .split('/')
-        .any(|segment| segment == "." || segment == "..")
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|segment| *segment == "." || *segment == "..")
     {
         return Err((StatusCode::BAD_REQUEST, "非法播放路径".to_string()));
     }
-    Ok(normalized)
+    Ok(format!("/{}", parts.join("/")))
 }
 
 /// 兼容按 `/d/*alist_path` 逻辑路径直接请求播放，内部换链并 302 跳转真实网盘直链
@@ -528,14 +568,16 @@ pub(super) async fn stream_by_d_path(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let decoded = crate::sync::parser::lossy_url_decode(&raw_path);
-    let alist_path = canonicalize_alist_path(&decoded)?;
+    // Axum has already percent-decoded Path captures. Decoding again would turn
+    // a stored literal "%2e%2e" segment into traversal after validation.
+    let alist_path = canonicalize_alist_path(&raw_path)?;
     let path_hash = xxhash_rust::xxh3::xxh3_64(alist_path.as_bytes()) as i64;
 
     let path_row = sqlx::query_as::<_, (Option<i64>, bool)>(
-        "SELECT f.work_id, f.is_ignored FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.path_hash = $1 LIMIT 1",
+        "SELECT f.work_id, f.is_ignored FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.path_hash = $1 AND sf.alist_path = $2 LIMIT 1",
     )
     .bind(path_hash)
+    .bind(&alist_path)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -575,7 +617,7 @@ pub(super) async fn get_media_segments() -> Json<Value> {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{canonicalize_alist_path, indexed_path_work_id, StatusCode};
+    use super::{StatusCode, canonicalize_alist_path, indexed_path_work_id};
 
     #[test]
     fn d_path_rejects_missing_ignored_and_unindexed_sources() {
@@ -595,10 +637,41 @@ mod path_tests {
     }
 
     #[test]
+    fn canonical_path_rejects_encoded_traversal_without_decoding_twice() {
+        assert_eq!(
+            canonicalize_alist_path("Movies/../secret.mkv")
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            canonicalize_alist_path("Movies/%2e%2e/secret.mkv").unwrap(),
+            "/Movies/%2e%2e/secret.mkv"
+        );
+    }
+
+    #[test]
     fn canonical_path_rejects_dot_segments_and_normalizes_leading_slashes() {
         assert_eq!(
-            canonicalize_alist_path("//Movies/a.mkv").unwrap(),
+            canonicalize_alist_path("//Movies///a.mkv").unwrap(),
             "/Movies/a.mkv"
+        );
+        assert_eq!(
+            canonicalize_alist_path("/电影/庆余年 S01 E01.mkv").unwrap(),
+            "/电影/庆余年 S01 E01.mkv"
+        );
+        // Axum decodes %2520 once to the literal text %20; do not decode again.
+        assert_eq!(
+            canonicalize_alist_path("/Movies/100%20real.mkv").unwrap(),
+            "/Movies/100%20real.mkv"
+        );
+        assert_eq!(
+            canonicalize_alist_path("/Movies/100%2520name.mkv").unwrap(),
+            "/Movies/100%2520name.mkv"
+        );
+        assert_eq!(
+            canonicalize_alist_path("/Movies/literal%XX.mkv").unwrap(),
+            "/Movies/literal%XX.mkv"
         );
         assert_eq!(
             canonicalize_alist_path("Movies/../secret.mkv")

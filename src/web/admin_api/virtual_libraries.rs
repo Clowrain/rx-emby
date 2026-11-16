@@ -1,16 +1,16 @@
 use crate::{
     state::AppState,
     web::emby_api::{
-        count_virtual_library_matches, resolve_virtual_library_cover_key, VirtualLibraryRule,
+        VirtualLibraryRule, count_virtual_library_matches, resolve_virtual_library_cover_key,
     },
 };
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
-    Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 type EnabledVlibsCache = moka::future::Cache<String, Vec<(i32, String, Value)>>;
@@ -338,10 +338,7 @@ pub(super) async fn delete_virtual_library(
     sqlx::query(
         r#"
         UPDATE users
-        SET allowed_categories = CASE
-            WHEN COALESCE(array_length(array_remove(allowed_categories, $1), 1), 0) = 0 THEN ARRAY['*']::text[]
-            ELSE array_remove(allowed_categories, $1)
-        END
+        SET allowed_categories = array_remove(allowed_categories, $1)
         WHERE $1 = ANY(allowed_categories)
         "#,
     )
@@ -352,6 +349,7 @@ pub(super) async fn delete_virtual_library(
     tx.commit()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.caches.user_categories_cache.invalidate_all();
 
     let covers_dir = state.config.load().image_cache_dir.join("covers");
     let prefix = format!("vlib_{}", id);
@@ -489,19 +487,31 @@ pub(super) async fn smart_view_options(
         return Ok(Json(cached));
     }
     let mut result = json!({});
-    for (key,expr) in [
+    for (key, expr) in [
         ("networks", "m.tmdb_metadata->'networks'"),
         ("companies", "m.tmdb_metadata->'production_companies'"),
-        ("collections", "CASE WHEN m.tmdb_metadata->'collection'->>'id' IS NOT NULL THEN jsonb_build_array(m.tmdb_metadata->'collection') ELSE '[]'::jsonb END"),
+        (
+            "collections",
+            "CASE WHEN m.tmdb_metadata->'collection'->>'id' IS NOT NULL THEN jsonb_build_array(m.tmdb_metadata->'collection') ELSE '[]'::jsonb END",
+        ),
         ("keywords", "m.tmdb_metadata->'keyword_items'"),
         ("directors", "m.tmdb_metadata->'directors'"),
         ("cast", "m.tmdb_metadata->'cast'"),
         ("watch_providers", "m.tmdb_metadata->'watch_providers'"),
     ] {
-        let sql = format!("SELECT DISTINCT (v->>'id')::int AS id, v->>'name' AS name FROM media_works m CROSS JOIN LATERAL jsonb_array_elements(COALESCE({},'[]')) v WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE) AND m.metadata_version >= 2 AND v->>'id' IS NOT NULL ORDER BY name,id LIMIT 500",expr);
-        let rows: Vec<(i32,String)> = sqlx::query_as(&sql).fetch_all(&state.db).await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
-        result[key] = json!(rows.into_iter().map(|(id,name)|json!({"id":id,"name":name})).collect::<Vec<_>>());
+        let sql = format!(
+            "SELECT DISTINCT (v->>'id')::int AS id, v->>'name' AS name FROM media_works m CROSS JOIN LATERAL jsonb_array_elements(COALESCE({},'[]')) v WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE) AND m.metadata_version >= 2 AND v->>'id' IS NOT NULL ORDER BY name,id LIMIT 500",
+            expr
+        );
+        let rows: Vec<(i32, String)> = sqlx::query_as(&sql)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        result[key] = json!(
+            rows.into_iter()
+                .map(|(id, name)| json!({"id":id,"name":name}))
+                .collect::<Vec<_>>()
+        );
     }
     let stats: (i64,i64,i64,i64) = sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER(WHERE m.metadata_version>=2), COUNT(*) FILTER(WHERE m.metadata_refresh_requested), COUNT(*) FILTER(WHERE m.metadata_refresh_requested AND m.metadata_retry_count>=3) FROM media_works m WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)")
         .fetch_one(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;

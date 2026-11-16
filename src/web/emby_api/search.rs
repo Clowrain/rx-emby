@@ -7,12 +7,12 @@ use super::items::DynSql;
 use super::views::user_access_scope;
 use crate::state::AppState;
 use axum::{
+    Json,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Deserialize, Default)]
@@ -115,20 +115,22 @@ pub(super) async fn get_search_hints(
         FROM work_episodes we
         JOIN media_works m ON m.id = we.work_id
         WHERE $3::boolean
-          AND (EXISTS (
-            SELECT 1 FROM sync_files sf
-            JOIN sync_folders f ON f.id = sf.folder_id
-            WHERE f.work_id = m.id AND f.is_ignored = FALSE
-              AND sf.season_number = we.season_number AND sf.episode_number = we.episode_number
-              AND (we.title ILIKE $1 OR m.title ILIKE $1 OR m.original_title ILIKE $1 OR m.sort_title ILIKE $1)
+          AND (
+            ((we.title ILIKE $1 OR m.title ILIKE $1 OR m.original_title ILIKE $1 OR m.sort_title ILIKE $1)
+             AND EXISTS (
+                SELECT 1 FROM sync_files sf
+                JOIN sync_folders f ON f.id = sf.folder_id
+                WHERE f.work_id = m.id AND f.is_ignored = FALSE
+                  AND sf.season_number = we.season_number AND sf.episode_number = we.episode_number
+             ))
+            OR EXISTS (
+                SELECT 1 FROM sync_files sf
+                JOIN sync_folders f ON f.id = sf.folder_id
+                WHERE f.work_id = m.id AND f.is_ignored = FALSE
+                  AND sf.season_number = we.season_number AND sf.episode_number = we.episode_number
+                  AND sf.file_name ILIKE $1
+            )
           )
-          OR EXISTS (
-            SELECT 1 FROM sync_files sf
-            JOIN sync_folders f ON f.id = sf.folder_id
-            WHERE f.work_id = m.id AND f.is_ignored = FALSE
-              AND sf.season_number = we.season_number AND sf.episode_number = we.episode_number
-              AND sf.file_name ILIKE $1
-          ))
         "#,
     );
     episode_sql.bind(p.clone())?;
@@ -219,7 +221,7 @@ fn main_item_search_predicate(pattern_param: &str, tmdb_param: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::views::{AccessibleVirtualLibrary, UserAccessScope};
-    use super::{main_item_search_predicate, parse_type_filter, DynSql};
+    use super::{DynSql, main_item_search_predicate, parse_type_filter};
 
     #[test]
     fn search_type_filters_normalize_supported_media_types() {

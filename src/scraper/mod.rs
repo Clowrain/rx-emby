@@ -254,19 +254,31 @@ fn titles_similar(local_title: &str, tmdb_title: &str, tmdb_orig: Option<&str>) 
     false
 }
 
-/// 4 维度交叉校验：基本类型、片名相似度（含原名）、发行年份容差、本地多集结构
-#[allow(clippy::too_many_arguments)]
-fn verify_tmdb_match(
-    clean_title: &str,
+struct TmdbMatch<'a> {
+    clean_title: &'a str,
     local_year: Option<i32>,
     ep_count: i64,
     max_season: i32,
     strict_title_check: bool,
-    tmdb_media_type: &str,
-    tmdb_title: &str,
-    tmdb_orig: Option<&str>,
-    tmdb_year: Option<i32>,
-) -> std::result::Result<(), String> {
+    media_type: &'a str,
+    title: &'a str,
+    original_title: Option<&'a str>,
+    year: Option<i32>,
+}
+
+/// 4 维度交叉校验：基本类型、片名相似度（含原名）、发行年份容差、本地多集结构
+fn verify_tmdb_match(candidate: TmdbMatch<'_>) -> std::result::Result<(), String> {
+    let TmdbMatch {
+        clean_title,
+        local_year,
+        ep_count,
+        max_season,
+        strict_title_check,
+        media_type: tmdb_media_type,
+        title: tmdb_title,
+        original_title: tmdb_orig,
+        year: tmdb_year,
+    } = candidate;
     if (ep_count > 1 || max_season > 0) && tmdb_media_type != "tv" {
         return Err(format!(
             "类型冲突：本地包含多集/季({}集, S{})，TMDB 返回电影《{}》",
@@ -452,17 +464,17 @@ pub async fn scrape_single_folder_with_mode(
         .await?;
 
         if let Some(work) = cached_work {
-            if verify_tmdb_match(
-                &folder.clean_title,
-                folder.year,
+            if verify_tmdb_match(TmdbMatch {
+                clean_title: &folder.clean_title,
+                local_year: folder.year,
                 ep_count,
                 max_season,
-                true,
-                &work.media_type,
-                &work.title,
-                work.original_title.as_deref(),
-                work.year,
-            )
+                strict_title_check: true,
+                media_type: &work.media_type,
+                title: &work.title,
+                original_title: work.original_title.as_deref(),
+                year: work.year,
+            })
             .is_ok()
             {
                 sqlx::query(
@@ -496,17 +508,17 @@ pub async fn scrape_single_folder_with_mode(
             .await
         {
             Ok(meta) => {
-                match verify_tmdb_match(
-                    &folder.clean_title,
-                    folder.year,
+                match verify_tmdb_match(TmdbMatch {
+                    clean_title: &folder.clean_title,
+                    local_year: folder.year,
                     ep_count,
                     max_season,
-                    true,
-                    &meta.media_type,
-                    &meta.title,
-                    meta.original_title.as_deref(),
-                    meta.year,
-                ) {
+                    strict_title_check: true,
+                    media_type: &meta.media_type,
+                    title: &meta.title,
+                    original_title: meta.original_title.as_deref(),
+                    year: meta.year,
+                }) {
                     Ok(()) => Ok(Ok(meta)),
                     Err(reason) => {
                         debug!(
@@ -523,17 +535,17 @@ pub async fn scrape_single_folder_with_mode(
                             .await
                         {
                             Ok(fb) => {
-                                match verify_tmdb_match(
-                                    &folder.clean_title,
-                                    folder.year,
+                                match verify_tmdb_match(TmdbMatch {
+                                    clean_title: &folder.clean_title,
+                                    local_year: folder.year,
                                     ep_count,
                                     max_season,
-                                    false,
-                                    &fb.media_type,
-                                    &fb.title,
-                                    fb.original_title.as_deref(),
-                                    fb.year,
-                                ) {
+                                    strict_title_check: false,
+                                    media_type: &fb.media_type,
+                                    title: &fb.title,
+                                    original_title: fb.original_title.as_deref(),
+                                    year: fb.year,
+                                }) {
                                     Ok(()) => Ok(Ok(fb)),
                                     Err(fb_reason) => Ok(Err(fb_reason)),
                                 }
@@ -551,17 +563,17 @@ pub async fn scrape_single_folder_with_mode(
             .await
         {
             Ok(meta) => {
-                match verify_tmdb_match(
-                    &folder.clean_title,
-                    folder.year,
+                match verify_tmdb_match(TmdbMatch {
+                    clean_title: &folder.clean_title,
+                    local_year: folder.year,
                     ep_count,
                     max_season,
-                    false,
-                    &meta.media_type,
-                    &meta.title,
-                    meta.original_title.as_deref(),
-                    meta.year,
-                ) {
+                    strict_title_check: false,
+                    media_type: &meta.media_type,
+                    title: &meta.title,
+                    original_title: meta.original_title.as_deref(),
+                    year: meta.year,
+                }) {
                     Ok(()) => Ok(Ok(meta)),
                     Err(reason) => Ok(Err(reason)),
                 }
@@ -691,13 +703,16 @@ pub async fn scrape_work_seasons_by_id(state: &AppState, work_id: i64, is_p0: bo
             }
             Err(e) => {
                 let retries = work.metadata_retry_count.saturating_add(1);
-                let _ = sqlx::query(
+                if let Err(update_err) = sqlx::query(
                     "UPDATE media_works SET metadata_retry_count = $2, metadata_retry_at = NOW() + INTERVAL '1 day' WHERE id = $1",
                 )
                 .bind(work.id)
                 .bind(retries)
                 .execute(&state.db)
-                .await;
+                .await
+                {
+                    error!("更新作品元数据重试状态失败 work_id={}: {:#}", work.id, update_err);
+                }
                 return Err(e);
             }
         }
@@ -918,7 +933,11 @@ pub async fn scrape_tv_seasons(
 
                 info!(
                     "📺 [SeasonScraper] 剧集 work_id={} (tmdb_id={}) S{:02} 分集刮削完成 (TMDB集数={}, 尝试={}/5)",
-                    work_id, tmdb_id, season_num, ep_nums.len(), next_attempt
+                    work_id,
+                    tmdb_id,
+                    season_num,
+                    ep_nums.len(),
+                    next_attempt
                 );
             }
             Ok(None) => {

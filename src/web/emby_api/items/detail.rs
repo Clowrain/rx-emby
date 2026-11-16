@@ -1,4 +1,4 @@
-use super::episode_json::{build_episode_item_json, EpisodeJsonInput};
+use super::episode_json::{EpisodeJsonInput, build_episode_item_json};
 use super::sql::*;
 use serde_json::json;
 pub async fn get_item_detail(
@@ -14,12 +14,6 @@ pub async fn get_item_detail(
         q.api_key.as_deref(),
     )
     .await?;
-    // 零转存浪费：进入详情页时后台对小雅父目录执行只读 fs/list 寻址预热并回填体积
-    if let Some((wid, _)) = parse_season_id(&item_id) {
-        state.spawn_prewarm_media_dirs(wid, None);
-    } else if let Some(wid) = parse_work_id(&item_id) {
-        state.spawn_prewarm_media_dirs(wid, None);
-    }
     Ok(Json(
         get_item_detail_inner(&state, &user_id, &headers, &q, &item_id).await?,
     ))
@@ -34,11 +28,6 @@ pub async fn get_item_detail_unscoped(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let user_id =
         resolve_valid_user_id_with_query(&state, None, &headers, q.api_key.as_deref()).await?;
-    if let Some((wid, _)) = parse_season_id(&item_id) {
-        state.spawn_prewarm_media_dirs(wid, None);
-    } else if let Some(wid) = parse_work_id(&item_id) {
-        state.spawn_prewarm_media_dirs(wid, None);
-    }
     Ok(Json(
         get_item_detail_inner(&state, &user_id, &headers, &q, &item_id).await?,
     ))
@@ -60,7 +49,7 @@ type SeasonMetadata = (
 );
 
 async fn get_item_detail_inner(
-    state: &AppState,
+    state: &Arc<AppState>,
     user_id: &str,
     headers: &HeaderMap,
     q: &PlaybackQuery,
@@ -89,6 +78,7 @@ async fn get_item_detail_inner(
             .map_err(|_| (StatusCode::BAD_REQUEST, "无效的 work_id".to_string()))?;
 
         ensure_media_accessible(state, user_id, wid).await?;
+        state.spawn_prewarm_media_dirs(wid, None);
 
         let row: Option<WorkDetailRow> = sqlx::query_as(
             r#"
@@ -265,13 +255,14 @@ async fn get_item_detail_inner(
 
 /// `season_{wid}_{snum}` 详情（季号 0 = 特别篇）
 async fn get_season_detail(
-    state: &AppState,
+    state: &Arc<AppState>,
     user_id: &str,
     wid: i64,
     snum: i32,
 ) -> Result<Value, (StatusCode, String)> {
     let cfg = state.config.load();
     ensure_media_accessible(state, user_id, wid).await?;
+    state.spawn_prewarm_media_dirs(wid, None);
 
     let row: Option<SeasonMetadata> = sqlx::query_as(
         r#"
@@ -414,7 +405,7 @@ async fn get_view_detail(
 
 #[cfg(test)]
 mod access_tests {
-    use super::{ensure_base_library_access, StatusCode};
+    use super::{StatusCode, ensure_base_library_access};
 
     #[test]
     fn forbidden_for_base_library_outside_allowed_categories() {

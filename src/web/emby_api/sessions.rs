@@ -2,12 +2,12 @@ use super::auth::resolve_valid_user_id_with_query;
 use super::ids::{parse_episode_id, parse_season_id, parse_work_id};
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
     Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -21,6 +21,22 @@ async fn ensure_media_accessible(
     super::items::ensure_media_accessible(state, user_id, work_id)
         .await
         .map(|_| ())
+}
+
+fn favorite_conflict_clause(tmdb_id: Option<i32>) -> &'static str {
+    if tmdb_id.is_some() {
+        "ON CONFLICT (user_id, tmdb_id, media_type) WHERE tmdb_id IS NOT NULL DO UPDATE"
+    } else {
+        "ON CONFLICT (user_id, work_id) WHERE tmdb_id IS NULL AND work_id IS NOT NULL DO UPDATE"
+    }
+}
+
+fn history_conflict_clause(tmdb_id: Option<i32>) -> &'static str {
+    if tmdb_id.is_some() {
+        "ON CONFLICT (user_id, tmdb_id, media_type, season_number, episode_number) WHERE tmdb_id IS NOT NULL DO UPDATE"
+    } else {
+        "ON CONFLICT (user_id, work_id, season_number, episode_number) WHERE tmdb_id IS NULL AND work_id IS NOT NULL DO UPDATE"
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -89,9 +105,14 @@ async fn set_item_played_state(
     set_play_history_scope(state, &user_id, &media, scope, played)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let history = query_play_history_summary(state, &user_id, &media, item_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let history = query_play_history_summary(
+        state,
+        &user_id,
+        &media,
+        played_scope_for_target(item_id, &target),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let favorite: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM user_favorites WHERE user_id = $1 AND (work_id = $2 OR ($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4)))",
     ).bind(&user_id).bind(target.work_id).bind(target.tmdb_id).bind(&target.media_type).fetch_one(&state.db).await
@@ -157,38 +178,43 @@ async fn set_item_favorite_state(
     ensure_media_accessible(state, &user_id, target.work_id).await?;
     let wid = target.work_id;
     let tmdb_id = target.tmdb_id;
-    let mtype = target.media_type;
+    let mtype = target.media_type.clone();
     {
         if is_fav {
-            let updated = sqlx::query(
-                r#"
-                UPDATE user_favorites
-                SET work_id = $2, tmdb_id = COALESCE($3, tmdb_id)
-                WHERE user_id = $1
-                  AND (($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4) OR work_id = $2)
-                "#,
-            )
-            .bind(&user_id)
-            .bind(wid)
-            .bind(tmdb_id)
-            .bind(&mtype)
-            .execute(&state.db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .rows_affected();
-
-            if updated == 0 {
+            let mut tx = state
+                .db
+                .begin()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if let Some(tmdb_id) = tmdb_id {
+                // Remove a legacy work-only duplicate before changing the canonical TMDB row's
+                // work_id, otherwise both partial unique indexes can reject the same update.
                 sqlx::query(
-                    "INSERT INTO user_favorites (user_id, work_id, tmdb_id, media_type) VALUES ($1, $2, $3, $4)",
+                    "DELETE FROM user_favorites legacy WHERE legacy.user_id = $1 AND legacy.work_id = $2 AND legacy.tmdb_id IS NULL AND EXISTS (SELECT 1 FROM user_favorites canonical WHERE canonical.user_id = $1 AND canonical.tmdb_id = $3 AND canonical.media_type = $4)",
                 )
                 .bind(&user_id)
                 .bind(wid)
                 .bind(tmdb_id)
                 .bind(&mtype)
-                .execute(&state.db)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             }
+            let conflict_clause = favorite_conflict_clause(tmdb_id);
+            let sql = format!(
+                "INSERT INTO user_favorites (user_id, work_id, tmdb_id, media_type) VALUES ($1, $2, $3, $4) {conflict_clause} SET work_id = EXCLUDED.work_id, tmdb_id = COALESCE(EXCLUDED.tmdb_id, user_favorites.tmdb_id)"
+            );
+            sqlx::query(&sql)
+                .bind(&user_id)
+                .bind(wid)
+                .bind(tmdb_id)
+                .bind(&mtype)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            tx.commit()
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         } else {
             sqlx::query(
                 r#"
@@ -212,9 +238,14 @@ async fn set_item_favorite_state(
         tmdb_id,
         media_type: mtype.clone(),
     };
-    let history = query_play_history_summary(state, &user_id, &media, item_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let history = query_play_history_summary(
+        state,
+        &user_id,
+        &media,
+        played_scope_for_target(item_id, &target),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let actual_favorite: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM user_favorites WHERE user_id = $1 AND (work_id = $2 OR ($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4)))",
     ).bind(&user_id).bind(wid).bind(tmdb_id).bind(&mtype).fetch_one(&state.db).await
@@ -275,18 +306,14 @@ pub(super) async fn session_playing(
         }
     }
 
-    let ep_id = match normalized_session_id(&state, raw_item_id).await {
+    let ep_id = match normalized_session_id(&state, raw_item_id, target.as_ref()).await {
         Ok(id) => id,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
     let sid = body
         .play_session_id
         .unwrap_or_else(|| format!("sess_{}", raw_item_id));
-    let ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("EmbyClient")
-        .to_string();
+    let (device_id, device_name, client_name) = super::auth::parse_emby_client_identity(&headers);
 
     if state
         .sessions
@@ -295,18 +322,19 @@ pub(super) async fn session_playing(
     {
         return StatusCode::NO_CONTENT;
     }
-    // 同一用户的同一客户端重新开播时，移除旧会话避免残留僵尸会话
-    state
-        .sessions
-        .retain(|k, v| k == &sid || !(v.user_id == user_id && v.client_name == ua));
+    // 同一用户同一设备重新开播时，移除旧会话避免残留僵尸会话。
+    state.sessions.retain(|key, session| {
+        key == &sid || !(session.user_id == user_id && session.device_id == device_id)
+    });
 
     state.sessions.insert(
         sid.clone(),
         crate::state::PlaybackSession {
             session_id: sid,
             user_id: user_id.clone(),
-            device_name: ua.clone(),
-            client_name: ua,
+            device_id,
+            device_name,
+            client_name,
             current_episode_id: ep_id,
             position_ticks: body.position_ticks,
             next_ep_prewarmed: false,
@@ -315,10 +343,6 @@ pub(super) async fn session_playing(
     );
 
     if body.position_ticks > 0 {
-        let target = match resolve_item_target(&state, raw_item_id).await {
-            Ok(target) => target,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-        };
         if let Some(ItemTarget {
             work_id: mid,
             tmdb_id,
@@ -385,7 +409,7 @@ pub(super) async fn session_progress(
         }
     }
 
-    let ep_id = match normalized_session_id(&state, raw_item_id).await {
+    let ep_id = match normalized_session_id(&state, raw_item_id, target.as_ref()).await {
         Ok(id) => id,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -404,6 +428,7 @@ pub(super) async fn session_progress(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    let (device_id, device_name, client_name) = super::auth::parse_emby_client_identity(&headers);
 
     // 1. 判定是否已达 85%（触发下一集预热）与 90%（自动标记已看完并推进下一集）
     let ratio = if body.run_time_ticks > 0 {
@@ -420,17 +445,13 @@ pub(super) async fn session_progress(
 
     // 2. 持久化播放进度到 play_histories 表
     if body.position_ticks > 0 {
-        let target = match resolve_item_target(&state, raw_item_id).await {
-            Ok(target) => target,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-        };
         if let Some(ItemTarget {
             work_id: mid,
             tmdb_id,
             media_type: mtype,
             season_number: snum,
             episode_number: epnum,
-        }) = target
+        }) = target.clone()
         {
             let saved_pos = if auto_completed {
                 0
@@ -470,8 +491,9 @@ pub(super) async fn session_progress(
                 .or_insert_with(|| crate::state::PlaybackSession {
                     session_id: sid.clone(),
                     user_id: user_id.clone(),
-                    device_name: client_ua.clone(),
-                    client_name: client_ua.clone(),
+                    device_id,
+                    device_name,
+                    client_name,
                     current_episode_id: ep_id,
                     position_ticks: body.position_ticks,
                     next_ep_prewarmed: false,
@@ -490,9 +512,10 @@ pub(super) async fn session_progress(
 
     if should_prewarm_next {
         let state_clone = state.clone();
+        let target = target.clone();
         let raw_item_clone = raw_item_id.clone();
         tokio::spawn(async move {
-            if let Ok(Some(target)) = resolve_item_target(&state_clone, &raw_item_clone).await {
+            if let Some(target) = target {
                 let ItemTarget {
                     work_id: wid,
                     media_type: mtype,
@@ -571,61 +594,58 @@ pub(super) async fn session_stopped(
             return StatusCode::NO_CONTENT;
         }
     }
-    if let Some(ref raw_item_id) = body.item_id {
-        match resolve_item_target(&state, raw_item_id).await {
-            Ok(Some(target)) => {
-                if let Err((status, _)) =
-                    ensure_media_accessible(&state, authenticated_uid, target.work_id).await
-                {
-                    return status;
-                }
-            }
-            Ok(None) => {}
+    let target = if let Some(raw_item_id) = body.item_id.as_deref() {
+        let target = match resolve_item_target(&state, raw_item_id).await {
+            Ok(target) => target,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        if let Some(target) = &target {
+            if let Err((status, _)) =
+                ensure_media_accessible(&state, authenticated_uid, target.work_id).await
+            {
+                return status;
+            }
         }
-    }
-    if let Some(ref raw_item_id) = body.item_id {
-        if body.position_ticks > 0 {
-            if let Some(ref user_id) = resolved_uid {
-                let target = match resolve_item_target(&state, raw_item_id).await {
-                    Ok(target) => target,
-                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        target
+    } else {
+        None
+    };
+    if body.item_id.is_some() && body.position_ticks > 0 {
+        if let Some(ref user_id) = resolved_uid {
+            if let Some(ItemTarget {
+                work_id: mid,
+                tmdb_id,
+                media_type: mtype,
+                season_number: snum,
+                episode_number: epnum,
+            }) = target.clone()
+            {
+                let auto_completed = body.run_time_ticks > 0
+                    && (body.position_ticks as f64 / body.run_time_ticks as f64) >= 0.90;
+                let saved_pos = if auto_completed {
+                    0
+                } else {
+                    body.position_ticks
                 };
-                if let Some(ItemTarget {
-                    work_id: mid,
-                    tmdb_id,
-                    media_type: mtype,
-                    season_number: snum,
-                    episode_number: epnum,
-                }) = target
+                if upsert_play_history(
+                    &state,
+                    PlayHistoryUpsert {
+                        user_id,
+                        work_id: mid,
+                        tmdb_id,
+                        media_type: &mtype,
+                        season_number: snum,
+                        episode_number: epnum,
+                        position_ticks: saved_pos,
+                        duration_ticks: body.run_time_ticks,
+                        is_played: auto_completed,
+                        overwrite_played: false,
+                    },
+                )
+                .await
+                .is_err()
                 {
-                    let auto_completed = body.run_time_ticks > 0
-                        && (body.position_ticks as f64 / body.run_time_ticks as f64) >= 0.90;
-                    let saved_pos = if auto_completed {
-                        0
-                    } else {
-                        body.position_ticks
-                    };
-                    if upsert_play_history(
-                        &state,
-                        PlayHistoryUpsert {
-                            user_id,
-                            work_id: mid,
-                            tmdb_id,
-                            media_type: &mtype,
-                            season_number: snum,
-                            episode_number: epnum,
-                            position_ticks: saved_pos,
-                            duration_ticks: body.run_time_ticks,
-                            is_played: auto_completed,
-                            overwrite_played: false,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return StatusCode::INTERNAL_SERVER_ERROR;
-                    }
+                    return StatusCode::INTERNAL_SERVER_ERROR;
                 }
             }
         }
@@ -652,10 +672,11 @@ pub(super) async fn session_stopped(
             state.sessions.remove(&fallback_sid);
         }
         if let Some(ref uid) = resolved_uid {
-            let matching_ids = match matching_session_ids(&state, raw_item_id).await {
-                Ok(ids) => ids,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-            };
+            let matching_ids =
+                match matching_session_ids(&state, raw_item_id, target.as_ref()).await {
+                    Ok(ids) => ids,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+                };
             state.sessions.retain(|key, session| {
                 if session.user_id != uid.as_str() {
                     return true;
@@ -716,14 +737,18 @@ fn session_item_matches(left: &str, right: &str) -> bool {
 async fn matching_session_ids(
     state: &AppState,
     item_id: &str,
+    target: Option<&ItemTarget>,
 ) -> Result<HashSet<i64>, sqlx::Error> {
     let mut ids = HashSet::new();
-    let Some(target) = resolve_item_target(state, item_id).await? else {
+    let Some(target) = target else {
+        if let Some(work_id) = parse_work_id(item_id) {
+            ids.insert(-work_id);
+        }
         return Ok(ids);
     };
     let wid = target.work_id;
     ids.insert(-wid);
-    let scope = item_history_scope(item_id).unwrap_or(PlayedHistoryScope::Work);
+    let scope = played_scope_for_target(item_id, target);
     let (scope_sql, season, episode) = match scope {
         PlayedHistoryScope::Work => ("TRUE", None, None),
         PlayedHistoryScope::Season(season) => ("sf.season_number = $2", Some(season), None),
@@ -733,7 +758,9 @@ async fn matching_session_ids(
             Some(episode),
         ),
     };
-    let sql = format!("SELECT sf.id FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $1 AND ({scope_sql})");
+    let sql = format!(
+        "SELECT sf.id FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $1 AND f.is_ignored = FALSE AND ({scope_sql})"
+    );
     let mut query = sqlx::query_scalar(&sql).bind(wid);
     if let Some(season) = season {
         query = query.bind(season);
@@ -749,12 +776,17 @@ async fn matching_session_ids(
 async fn normalized_session_id(
     state: &AppState,
     item_id: &str,
+    target: Option<&ItemTarget>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    let Some(target) = resolve_item_target(state, item_id).await? else {
-        return Ok(parse_work_id(item_id).map(|wid| -wid));
+    let Some(target) = target else {
+        return Ok(parse_work_id(item_id).map(|work_id| -work_id));
     };
+    if item_id.starts_with("src_") {
+        // resolve_item_target has already validated this exact source as linked and non-ignored.
+        return Ok(item_id.strip_prefix("src_").and_then(|id| id.parse().ok()));
+    }
     let wid = target.work_id;
-    let scope = item_history_scope(item_id).unwrap_or(PlayedHistoryScope::Work);
+    let scope = played_scope_for_target(item_id, target);
     let (scope_sql, season, episode) = match scope {
         PlayedHistoryScope::Work => ("TRUE", None, None),
         PlayedHistoryScope::Season(season) => ("sf.season_number = $2", Some(season), None),
@@ -764,7 +796,9 @@ async fn normalized_session_id(
             Some(episode),
         ),
     };
-    let sql = format!("SELECT sf.id FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $1 AND f.is_ignored = FALSE AND ({scope_sql}) ORDER BY COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC LIMIT 1");
+    let sql = format!(
+        "SELECT sf.id FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $1 AND f.is_ignored = FALSE AND ({scope_sql}) ORDER BY COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC LIMIT 1"
+    );
     let mut query = sqlx::query_scalar(&sql).bind(wid);
     if let Some(season) = season {
         query = query.bind(season);
@@ -880,16 +914,17 @@ async fn query_play_history_summary(
     state: &AppState,
     user_id: &str,
     media: &PlayedHistoryMedia,
-    item_id: &str,
+    scope: PlayedHistoryScope,
 ) -> Result<(i64, bool), sqlx::Error> {
-    let scope = item_history_scope(item_id).unwrap_or(PlayedHistoryScope::Work);
     let scope_sql = match scope {
         PlayedHistoryScope::Work if media.media_type == "tv" => "TRUE",
         PlayedHistoryScope::Work => "season_number = 0 AND episode_number = 1",
         PlayedHistoryScope::Season(_) => "season_number = $5",
         PlayedHistoryScope::Episode(_, _) => "season_number = $5 AND episode_number = $6",
     };
-    let sql = format!("SELECT COALESCE(MAX(position_ticks), 0), COALESCE(BOOL_AND(is_played), FALSE) FROM play_histories WHERE user_id = $1 AND (work_id = $2 OR ($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4)) AND ({scope_sql})");
+    let sql = format!(
+        "SELECT COALESCE(MAX(position_ticks), 0), COALESCE(BOOL_AND(is_played), FALSE) FROM play_histories WHERE user_id = $1 AND (work_id = $2 OR ($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4)) AND ({scope_sql})"
+    );
     let mut query = sqlx::query_as(&sql)
         .bind(user_id)
         .bind(media.work_id)
@@ -939,9 +974,13 @@ async fn set_play_history_scope(
     ).bind(user_id).bind(media.work_id).bind(media.tmdb_id).bind(&media.media_type).bind(played).bind(season_filter).bind(matches!(scope, PlayedHistoryScope::Work)).execute(&state.db).await?;
 
     let pair_scope = match scope {
-        PlayedHistoryScope::Work if media.media_type == "tv" => "SELECT 0::int4 AS season_number, 1::int4 AS episode_number UNION SELECT DISTINCT sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $2 AND f.is_ignored = FALSE",
+        PlayedHistoryScope::Work if media.media_type == "tv" => {
+            "SELECT 0::int4 AS season_number, 1::int4 AS episode_number UNION SELECT DISTINCT sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $2 AND f.is_ignored = FALSE"
+        }
         PlayedHistoryScope::Work => "SELECT 0::int4 AS season_number, 1::int4 AS episode_number",
-        PlayedHistoryScope::Season(_) => "SELECT $6::int4 AS season_number, 0::int4 AS episode_number UNION SELECT DISTINCT sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $2 AND f.is_ignored = FALSE AND sf.season_number = $6",
+        PlayedHistoryScope::Season(_) => {
+            "SELECT $6::int4 AS season_number, 0::int4 AS episode_number UNION SELECT DISTINCT sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $2 AND f.is_ignored = FALSE AND sf.season_number = $6"
+        }
         PlayedHistoryScope::Episode(_, _) => unreachable!(),
     };
     let insert_sql = format!(
@@ -990,44 +1029,50 @@ async fn upsert_play_history(
         is_played,
         overwrite_played,
     } = input;
-    let updated = sqlx::query(
-        r#"
-        UPDATE play_histories
-        SET work_id = $2,
-            tmdb_id = COALESCE($3, tmdb_id),
-            position_ticks = $7,
-            duration_ticks = CASE WHEN $8 > 0 THEN $8 ELSE duration_ticks END,
-            is_played = CASE WHEN $10 THEN $9 ELSE ($9 OR is_played) END,
-            last_played_at = NOW()
-        WHERE user_id = $1
-          AND season_number = $5
-          AND episode_number = $6
-          AND (
-              ($3::int4 IS NOT NULL AND tmdb_id = $3 AND media_type = $4)
-              OR work_id = $2
-          )
-        "#,
-    )
-    .bind(user_id)
-    .bind(work_id)
-    .bind(tmdb_id)
-    .bind(media_type)
-    .bind(season_number)
-    .bind(episode_number)
-    .bind(position_ticks)
-    .bind(duration_ticks)
-    .bind(is_played)
-    .bind(overwrite_played)
-    .execute(&state.db)
-    .await?
-    .rows_affected();
-
-    if updated == 0 {
-        let conflict_clause = if tmdb_id.is_some() {
-            "ON CONFLICT (user_id, tmdb_id, media_type, season_number, episode_number) WHERE tmdb_id IS NOT NULL DO UPDATE"
-        } else {
-            "ON CONFLICT (user_id, work_id, season_number, episode_number) WHERE tmdb_id IS NULL AND work_id IS NOT NULL DO UPDATE"
-        };
+    {
+        let mut tx = state.db.begin().await?;
+        if let Some(tmdb_id) = tmdb_id {
+            // Reconcile an old work-only row before promoting its identity. When both
+            // identities exist, preserve the richer history on the canonical TMDB row.
+            sqlx::query(
+                "UPDATE play_histories canonical SET position_ticks = GREATEST(canonical.position_ticks, legacy.position_ticks), duration_ticks = GREATEST(canonical.duration_ticks, legacy.duration_ticks), is_played = canonical.is_played OR legacy.is_played, last_played_at = GREATEST(canonical.last_played_at, legacy.last_played_at) FROM play_histories legacy WHERE canonical.user_id = $1 AND canonical.tmdb_id = $3 AND canonical.media_type = $4 AND canonical.season_number = $5 AND canonical.episode_number = $6 AND legacy.user_id = $1 AND legacy.work_id = $2 AND legacy.tmdb_id IS NULL AND legacy.season_number = $5 AND legacy.episode_number = $6",
+            )
+            .bind(user_id)
+            .bind(work_id)
+            .bind(tmdb_id)
+            .bind(media_type)
+            .bind(season_number)
+            .bind(episode_number)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM play_histories legacy WHERE legacy.user_id = $1 AND legacy.work_id = $2 AND legacy.tmdb_id IS NULL AND legacy.season_number = $5 AND legacy.episode_number = $6 AND EXISTS (SELECT 1 FROM play_histories canonical WHERE canonical.user_id = $1 AND canonical.tmdb_id = $3 AND canonical.media_type = $4 AND canonical.season_number = $5 AND canonical.episode_number = $6)",
+            )
+            .bind(user_id)
+            .bind(work_id)
+            .bind(tmdb_id)
+            .bind(media_type)
+            .bind(season_number)
+            .bind(episode_number)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE play_histories SET tmdb_id = $3, media_type = $4, position_ticks = CASE WHEN $10 THEN $7 ELSE GREATEST(position_ticks, $7) END, duration_ticks = GREATEST(duration_ticks, $8), is_played = CASE WHEN $10 THEN $9 ELSE (is_played OR $9) END, last_played_at = NOW() WHERE user_id = $1 AND work_id = $2 AND tmdb_id IS NULL AND season_number = $5 AND episode_number = $6 AND NOT EXISTS (SELECT 1 FROM play_histories canonical WHERE canonical.user_id = $1 AND canonical.tmdb_id = $3 AND canonical.media_type = $4 AND canonical.season_number = $5 AND canonical.episode_number = $6)",
+            )
+            .bind(user_id)
+            .bind(work_id)
+            .bind(tmdb_id)
+            .bind(media_type)
+            .bind(season_number)
+            .bind(episode_number)
+            .bind(position_ticks)
+            .bind(duration_ticks)
+            .bind(is_played)
+            .bind(overwrite_played)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let conflict_clause = history_conflict_clause(tmdb_id);
         let insert_sql = format!(
             "INSERT INTO play_histories (user_id, work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played, last_played_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) {conflict_clause} SET work_id = EXCLUDED.work_id, tmdb_id = COALESCE(EXCLUDED.tmdb_id, play_histories.tmdb_id), position_ticks = EXCLUDED.position_ticks, duration_ticks = CASE WHEN EXCLUDED.duration_ticks > 0 THEN EXCLUDED.duration_ticks ELSE play_histories.duration_ticks END, is_played = CASE WHEN $10 THEN EXCLUDED.is_played ELSE (EXCLUDED.is_played OR play_histories.is_played) END, last_played_at = NOW()"
         );
@@ -1042,8 +1087,9 @@ async fn upsert_play_history(
             .bind(duration_ticks)
             .bind(is_played)
             .bind(overwrite_played)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
     }
 
     Ok(())
@@ -1083,7 +1129,11 @@ pub(super) fn is_media_favorited(
         return true;
     }
     if let Some(tid) = tmdb_id {
-        if fav_keys.1.contains(&(tid, media_type.to_string())) {
+        if fav_keys
+            .1
+            .iter()
+            .any(|(favorite_id, favorite_type)| *favorite_id == tid && favorite_type == media_type)
+        {
             return true;
         }
     }
@@ -1126,6 +1176,22 @@ pub(super) async fn load_media_episode_histories(
 #[cfg(test)]
 mod session_fix_tests {
     use super::*;
+
+    #[test]
+    fn partial_unique_conflict_clauses_match_migration_indexes() {
+        assert!(favorite_conflict_clause(Some(1)).contains("WHERE tmdb_id IS NOT NULL"));
+        assert!(
+            favorite_conflict_clause(None)
+                .contains("WHERE tmdb_id IS NULL AND work_id IS NOT NULL")
+        );
+        assert!(
+            history_conflict_clause(Some(1))
+                .contains("season_number, episode_number) WHERE tmdb_id IS NOT NULL")
+        );
+        assert!(history_conflict_clause(None).contains(
+            "season_number, episode_number) WHERE tmdb_id IS NULL AND work_id IS NOT NULL"
+        ));
+    }
 
     #[test]
     fn source_ids_use_episode_scope_for_tv_and_work_scope_for_movies() {

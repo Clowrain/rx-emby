@@ -209,7 +209,11 @@ fn extract_clean_alist_path(raw_url: &str) -> Option<String> {
 
     // 归一化多余斜杠，如 //电视剧///庆余年 -> /电视剧/庆余年
     let parts: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|segment| *segment == "." || *segment == "..")
+    {
         return None;
     }
     Some(format!("/{}", parts.join("/")))
@@ -797,6 +801,13 @@ mod tests {
         assert_eq!(versions[0].0, "4K · WEB-DL · 杜比视界 · FLAC");
         assert_eq!(versions[1].0, "4K · WEB-DL · 杜比视界 · DDP5.1 · HiveWeb");
         assert_eq!(versions[2].0, "4K · WEB-DL · 60FPS · SDR · FLAC");
+    }
+
+    #[test]
+    fn rejects_decoded_parent_segments_before_hashing_paths() {
+        assert!(
+            parse_strm_line("电影/作品/影片.strm#http://host/d/电影/%2e%2e/secret.mkv").is_none()
+        );
     }
 
     #[test]

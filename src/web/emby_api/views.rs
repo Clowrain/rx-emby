@@ -1,14 +1,14 @@
 use super::auth::resolve_valid_user_id_with_query;
 use super::images::compute_cover_image_tag;
 use super::playback::PlaybackQuery;
-use crate::smart_views::{can_access_view, VirtualLibraryRule};
+use crate::smart_views::{VirtualLibraryRule, can_access_view};
 use crate::state::AppState;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::HeaderMap,
-    Json,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -97,10 +97,10 @@ pub(super) async fn get_user_views(
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_else(|e| {
+    .map_err(|e| {
         tracing::warn!("查询基础库封面配置失败: {}", e);
-        Vec::new()
-    });
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
     let base_cover_map: HashMap<String, (String, i64)> = base_cover_rows
         .into_iter()
         .filter_map(|(k, v, updated_at)| {
@@ -141,9 +141,8 @@ pub(super) async fn get_user_views(
     .await
     .map_err(|e| {
         tracing::warn!("查询虚拟媒体库列表失败: {}", e);
-        Vec::<(i32, String, String, Option<String>, i64)>::new()
-    })
-    .unwrap_or_default();
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     for (vid, vname, icon_type, cover_image, revision) in vlibs {
         let view_id = format!("lib_vlib_{}", vid);
@@ -246,22 +245,28 @@ mod access_scope_tests {
 
     #[test]
     fn empty_restricted_categories_and_no_libraries_means_no_access() {
-        assert!(UserAccessScope {
-            allowed_categories: Some(vec![]),
-            virtual_libraries: vec![],
-        }
-        .has_no_access());
-        assert!(!UserAccessScope {
-            allowed_categories: None,
-            virtual_libraries: vec![],
-        }
-        .has_no_access());
-        assert!(!UserAccessScope {
-            allowed_categories: Some(vec![]),
-            virtual_libraries: vec![AccessibleVirtualLibrary {
-                filter_rules: serde_json::json!({"media_type":"movie"}),
-            }],
-        }
-        .has_no_access());
+        assert!(
+            UserAccessScope {
+                allowed_categories: Some(vec![]),
+                virtual_libraries: vec![],
+            }
+            .has_no_access()
+        );
+        assert!(
+            !UserAccessScope {
+                allowed_categories: None,
+                virtual_libraries: vec![],
+            }
+            .has_no_access()
+        );
+        assert!(
+            !UserAccessScope {
+                allowed_categories: Some(vec![]),
+                virtual_libraries: vec![AccessibleVirtualLibrary {
+                    filter_rules: serde_json::json!({"media_type":"movie"}),
+                }],
+            }
+            .has_no_access()
+        );
     }
 }
