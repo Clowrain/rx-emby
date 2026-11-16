@@ -84,7 +84,7 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         .collect();
 
     if filter_set.contains("IsResumable") {
-        return get_resume_items_inner(state, user_id, limit).await;
+        return get_resume_items_inner(state, user_id, limit, q).await;
     }
 
     // 2. 解析 IncludeItemTypes 参数（如 Series, Movie, Episode, Season, Video）
@@ -142,7 +142,7 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
 
     // 视图授权独立于基础分类；获得某个视图权限即可访问其匹配内容。
     let access_scope = crate::web::emby_api::views::user_access_scope(state, user_id).await?;
-    let allowed_user_cats = access_scope.allowed_categories.clone();
+    let allowed_user_cats = access_scope.allowed_categories.as_deref();
     let mut vlib_rule: Option<VirtualLibraryRule> = None;
     if let Some(pid) = q
         .parent_id
@@ -163,7 +163,7 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         let Some((name, rules)) = row else {
             return Err((StatusCode::NOT_FOUND, "智能视图不存在或已停用".into()));
         };
-        if !can_access_view(allowed_user_cats.as_deref(), pid, &name) {
+        if !can_access_view(allowed_user_cats, pid, &name) {
             return Err((StatusCode::FORBIDDEN, "没有该智能视图的访问权限".into()));
         }
         let rule: VirtualLibraryRule = serde_json::from_value(rules).map_err(|e| {
@@ -243,18 +243,18 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         .any(|f| f.trim().eq_ignore_ascii_case("Popularity"));
 
     let filters = MediaListFilters {
-        user_id: user_id.to_string(),
-        access_scope: access_scope.clone(),
-        category_filter: category_filter.map(str::to_string),
-        media_type_filter: media_type_filter.map(str::to_string),
-        search_pattern: search_pattern.clone(),
+        user_id,
+        access_scope: access_scope.as_ref(),
+        category_filter,
+        media_type_filter,
+        search_pattern: search_pattern.as_deref(),
         search_tmdb,
-        explicit_ids: explicit_ids.clone(),
+        explicit_ids: explicit_ids.as_deref(),
         only_favorite,
         only_played,
         only_unplayed,
-        rule_json: rule_json.clone(),
-        rule: vlib_rule.clone(),
+        rule_json: rule_json.as_ref(),
+        rule: vlib_rule.as_ref(),
     };
 
     // 仅按 Popularity 排序时才解压 tmdb_metadata（避免每行 TOAST 解压热度字段）
@@ -268,8 +268,8 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
     sql.push(&format!(
         r#"SELECT m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.premiered_at, m.overview,
                   m.rating, m.poster_path, m.backdrop_path, m.created_at,
-                  (m.tmdb_metadata->>'number_of_seasons')::int AS num_seasons,
-                  (m.tmdb_metadata->>'number_of_episodes')::int AS num_episodes{popularity_select}
+                  CASE WHEN m.media_type = 'tv' THEN (m.tmdb_metadata->>'number_of_seasons')::int END AS num_seasons,
+                  CASE WHEN m.media_type = 'tv' THEN (m.tmdb_metadata->>'number_of_episodes')::int END AS num_episodes{popularity_select}
            FROM media_works m
            WHERE "#,
         popularity_select = popularity_select
@@ -282,14 +282,14 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
     let (order_clause, user_uses) =
         build_emby_order_clause(sort_key, q.sort_order.as_deref(), Some(&user_param));
     sql.push(&order_clause);
-    for _ in 0..user_uses {
-        let _ = sql.bind(user_id.to_string());
+    if user_uses > 0 {
+        let _ = sql.bind(user_id.to_string())?;
     }
 
     sql.push(" LIMIT ");
-    let _ = sql.bind(limit);
+    let _ = sql.bind(limit)?;
     sql.push(" OFFSET ");
-    let _ = sql.bind(offset);
+    let _ = sql.bind(offset)?;
 
     let rows: Vec<MediaListRow> =
         sqlx::query_as_with::<Postgres, MediaListRow, _>(&sql.sql, sql.args)
@@ -585,7 +585,7 @@ fn build_emby_order_clause(
 mod tests {
     use super::{
         build_emby_order_clause, favorite_filter_has_no_supported_media_type,
-        parse_explicit_work_ids,
+        parse_explicit_work_ids, DynSql,
     };
     use std::collections::HashSet;
 
@@ -648,6 +648,23 @@ mod tests {
         let (clause, uses) = build_emby_order_clause("DatePlayed,PlayCount", None, Some("$7"));
         assert!(clause.contains("ph.user_id = $7"));
         assert_eq!(uses, 2);
+    }
+
+    #[test]
+    fn date_played_and_play_count_share_one_user_bind() {
+        let mut sql = DynSql::new("SELECT m.id FROM media_works m ORDER BY ");
+        let user_param = sql.next_param();
+        let (order, user_uses) =
+            build_emby_order_clause("DatePlayed,PlayCount", None, Some(&user_param));
+        sql.push(&order);
+        if user_uses > 0 {
+            sql.bind("user-a".to_string()).unwrap();
+        }
+        sql.push(" LIMIT ");
+        sql.bind(20_i64).unwrap();
+        assert_eq!(user_uses, 2);
+        assert_eq!(sql.n, 2);
+        assert_eq!(sql.sql.matches("ph.user_id = $1").count(), 2);
     }
 
     #[test]

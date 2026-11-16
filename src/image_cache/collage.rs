@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use image::{
     codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, GenericImageView, Rgba,
     RgbaImage,
@@ -40,7 +41,7 @@ impl CollageStyle {
 /// 根据输入的多张海报/剧照字节流，在阻塞线程池安全地合成 960x540 质感封面图（JPEG）
 pub fn render_collage(
     style: CollageStyle,
-    posters: &[Vec<u8>],
+    posters: &[Bytes],
     backdrop: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let decoded_posters: Vec<DynamicImage> = posters

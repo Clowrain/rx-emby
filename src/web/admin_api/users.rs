@@ -47,15 +47,16 @@ pub(super) async fn list_users_and_sessions(
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(&state.db)
         .await
-        .unwrap_or(0);
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if count == 0 {
         let new_id = Uuid::new_v4().simple().to_string()[..16].to_string();
-        let _ = sqlx::query(
+        sqlx::query(
             "INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, 'admin', '', TRUE) ON CONFLICT DO NOTHING",
         )
         .bind(&new_id)
         .execute(&state.db)
-        .await;
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
     let users: Vec<AdminUserRow> = sqlx::query_as(
@@ -84,13 +85,17 @@ pub(super) async fn list_users_and_sessions(
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.prune_stale_sessions();
 
+    let sessions: Vec<_> = state
+        .sessions
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect();
     let mut active_sessions = Vec::new();
-    for entry in state.sessions.iter() {
-        let s = entry.value().clone();
+    for s in sessions {
         let idle_sec = s.last_activity.elapsed().as_secs();
         let ep_label: Option<String> = match s.current_episode_id {
             Some(fid) if fid > 0 => {
@@ -106,14 +111,14 @@ pub(super) async fn list_users_and_sessions(
                 .bind(fid)
                 .fetch_optional(&state.db)
                 .await
-                .unwrap_or(None)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             }
             Some(neg_wid) if neg_wid < 0 => {
                 sqlx::query_scalar("SELECT title FROM media_works WHERE id = $1")
                     .bind(-neg_wid)
                     .fetch_optional(&state.db)
                     .await
-                    .unwrap_or(None)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             }
             _ => None,
         };
@@ -222,7 +227,7 @@ pub(super) async fn delete_user(
         .bind(&uid)
         .fetch_optional(&state.db)
         .await
-        .unwrap_or(None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .unwrap_or(false);
 
     if is_target_admin {
@@ -230,7 +235,7 @@ pub(super) async fn delete_user(
             sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
                 .fetch_one(&state.db)
                 .await
-                .unwrap_or(1);
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if admin_count <= 1 {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -239,9 +244,17 @@ pub(super) async fn delete_user(
         }
     }
 
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(&uid)
-        .execute(&state.db)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

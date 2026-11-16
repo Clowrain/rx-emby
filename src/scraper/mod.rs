@@ -353,6 +353,7 @@ async fn upsert_media_work(state: &AppState, meta: &ScrapedMetadata) -> Result<i
     .fetch_one(&state.db)
     .await?;
 
+    state.caches.image_meta_cache.invalidate_all();
     Ok(wid)
 }
 
@@ -789,6 +790,7 @@ pub async fn scrape_tv_seasons(
     .await?;
 
     if pending_seasons.is_empty() {
+        state.caches.image_meta_cache.invalidate_all();
         return Ok(());
     }
 
@@ -960,6 +962,7 @@ pub async fn scrape_tv_seasons(
         }
     }
 
+    state.caches.image_meta_cache.invalidate_all();
     Ok(())
 }
 

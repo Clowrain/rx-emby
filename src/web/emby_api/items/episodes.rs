@@ -23,63 +23,33 @@ pub(in crate::web::emby_api) async fn get_seasons_for_media(
             .flatten();
 
     let search_pattern = build_search_pattern(search_term);
-    let season_rows: Vec<SeasonListRow> = if let Some(ref p) = search_pattern {
-        sqlx::query_as(
-            r#"
-            SELECT
-                ep_s.season_number,
-                ws.name,
-                ws.overview,
-                ws.poster_path,
-                ws.air_date
-            FROM (
-                SELECT DISTINCT sf.season_number
-                FROM sync_files sf
-                JOIN sync_folders f ON f.id = sf.folder_id
-                WHERE f.work_id = $1 AND f.is_ignored = FALSE
-            ) ep_s
-            LEFT JOIN work_seasons ws
-              ON ws.work_id = $1 AND ws.season_number = ep_s.season_number
-            WHERE COALESCE(ws.name, '') ILIKE $2
-               OR EXISTS (
-                    SELECT 1 FROM sync_files sf2
-                    JOIN sync_folders f2 ON f2.id = sf2.folder_id
-                    WHERE f2.work_id = $1 AND f2.is_ignored = FALSE
-                      AND sf2.season_number = ep_s.season_number AND sf2.file_name ILIKE $2
-               )
-            ORDER BY ep_s.season_number ASC
-            "#,
-        )
-        .bind(work_id)
-        .bind(p)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        sqlx::query_as(
-            r#"
-            SELECT
-                ep_s.season_number,
-                ws.name,
-                ws.overview,
-                ws.poster_path,
-                ws.air_date
-            FROM (
-                SELECT DISTINCT sf.season_number
-                FROM sync_files sf
-                JOIN sync_folders f ON f.id = sf.folder_id
-                WHERE f.work_id = $1 AND f.is_ignored = FALSE
-            ) ep_s
-            LEFT JOIN work_seasons ws
-              ON ws.work_id = $1 AND ws.season_number = ep_s.season_number
-            ORDER BY ep_s.season_number ASC
-            "#,
-        )
-        .bind(work_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
+    let mut seasons_sql = DynSql::new(
+        r#"
+        SELECT ep_s.season_number, ws.name, ws.overview, ws.poster_path, ws.air_date
+        FROM (
+            SELECT DISTINCT sf.season_number
+            FROM sync_files sf
+            JOIN sync_folders f ON f.id = sf.folder_id
+            WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        ) ep_s
+        LEFT JOIN work_seasons ws
+          ON ws.work_id = $1 AND ws.season_number = ep_s.season_number
+        WHERE TRUE
+        "#,
+    );
+    seasons_sql.bind(work_id)?;
+    if let Some(pattern) = search_pattern {
+        let pattern_param = seasons_sql.bind(pattern)?;
+        seasons_sql.push(&format!(
+            " AND (COALESCE(ws.name, '') ILIKE {pattern_param} OR EXISTS (SELECT 1 FROM sync_files sf2 JOIN sync_folders f2 ON f2.id = sf2.folder_id WHERE f2.work_id = $1 AND f2.is_ignored = FALSE AND sf2.season_number = ep_s.season_number AND sf2.file_name ILIKE {pattern_param}))"
+        ));
+    }
+    seasons_sql.push(" ORDER BY ep_s.season_number ASC");
+    let season_rows: Vec<SeasonListRow> =
+        sqlx::query_as_with::<Postgres, SeasonListRow, _>(&seasons_sql.sql, seasons_sql.args)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<Value> = season_rows
         .into_iter()
@@ -147,92 +117,41 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
         };
     let (tmdb_id, _mtype, series_title) =
         media_meta.unwrap_or((None, "tv".to_string(), String::new()));
-    let history_map = load_media_episode_histories(state, user_id, work_id, tmdb_id, &_mtype).await;
+    let history_map =
+        load_media_episode_histories(state, user_id, work_id, tmdb_id, &_mtype).await?;
 
     let search_pattern = build_search_pattern(search_term);
-
-    let eps: Vec<EpisodeGroupRow> = if let Some(ref p) = search_pattern {
-        let base_sql = |season_clause: &str| -> String {
-            format!(
-                r#"
-                SELECT DISTINCT ON (sf.season_number, sf.episode_number)
-                    sf.season_number,
-                    sf.episode_number,
-                    we.title,
-                    we.overview,
-                    we.still_path,
-                    we.air_date,
-                    COALESCE(we.runtime, 0) AS runtime
-                FROM sync_files sf
-                JOIN sync_folders f ON f.id = sf.folder_id
-                LEFT JOIN work_episodes we
-                  ON we.work_id = $1
-                 AND we.season_number = sf.season_number
-                 AND we.episode_number = sf.episode_number
-                WHERE f.work_id = $1
-                  AND f.is_ignored = FALSE
-                  {season_clause}
-                  AND (we.title ILIKE $2 OR sf.file_name ILIKE $2)
-                ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
-                "#,
-                season_clause = season_clause
-            )
-        };
-        match season_number {
-            Some(snum) => sqlx::query_as(&base_sql("AND sf.season_number = $3"))
-                .bind(work_id)
-                .bind(p)
-                .bind(snum)
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-            None => sqlx::query_as(&base_sql(""))
-                .bind(work_id)
-                .bind(p)
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-        }
-    } else {
-        let base_sql = |season_clause: &str| -> String {
-            format!(
-                r#"
-                SELECT DISTINCT ON (sf.season_number, sf.episode_number)
-                    sf.season_number,
-                    sf.episode_number,
-                    we.title,
-                    we.overview,
-                    we.still_path,
-                    we.air_date,
-                    COALESCE(we.runtime, 0) AS runtime
-                FROM sync_files sf
-                JOIN sync_folders f ON f.id = sf.folder_id
-                LEFT JOIN work_episodes we
-                  ON we.work_id = $1
-                 AND we.season_number = sf.season_number
-                 AND we.episode_number = sf.episode_number
-                WHERE f.work_id = $1
-                  AND f.is_ignored = FALSE
-                  {season_clause}
-                ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC
-                "#,
-                season_clause = season_clause
-            )
-        };
-        match season_number {
-            Some(snum) => sqlx::query_as(&base_sql("AND sf.season_number = $2"))
-                .bind(work_id)
-                .bind(snum)
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-            None => sqlx::query_as(&base_sql(""))
-                .bind(work_id)
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-        }
-    };
+    let mut episodes_sql = DynSql::new(
+        r#"
+        SELECT DISTINCT ON (sf.season_number, sf.episode_number)
+            sf.season_number, sf.episode_number, we.title, we.overview, we.still_path,
+            we.air_date, COALESCE(we.runtime, 0) AS runtime
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        LEFT JOIN work_episodes we
+          ON we.work_id = $1
+         AND we.season_number = sf.season_number
+         AND we.episode_number = sf.episode_number
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        "#,
+    );
+    episodes_sql.bind(work_id)?;
+    if let Some(season) = season_number {
+        let season_param = episodes_sql.bind(season)?;
+        episodes_sql.push(&format!(" AND sf.season_number = {season_param}"));
+    }
+    if let Some(pattern) = search_pattern {
+        let pattern_param = episodes_sql.bind(pattern)?;
+        episodes_sql.push(&format!(
+            " AND (we.title ILIKE {pattern_param} OR sf.file_name ILIKE {pattern_param})"
+        ));
+    }
+    episodes_sql.push(" ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC");
+    let eps: Vec<EpisodeGroupRow> =
+        sqlx::query_as_with::<Postgres, EpisodeGroupRow, _>(&episodes_sql.sql, episodes_sql.args)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<Value> = eps
         .into_iter()
@@ -246,11 +165,11 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
                 work_id,
                 season_number: ep.season_number,
                 episode_number: ep.episode_number,
-                title: ep.title.clone(),
+                title: ep.title,
                 series_name: Some(series_title.clone()),
-                overview: ep.overview.clone(),
-                air_date: ep.air_date.clone(),
-                still_path: ep.still_path.clone(),
+                overview: ep.overview,
+                air_date: ep.air_date,
+                still_path: ep.still_path,
                 poster_path: None,
                 playback_position_ticks: position,
                 duration_ticks: duration,
@@ -317,7 +236,7 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
         }
         sql.push(
             r#"
-            SELECT sf.work_id, m.title AS series_title, sf.season_number, sf.episode_number,
+            SELECT sf.work_id, m.tmdb_id, m.title AS series_title, sf.season_number, sf.episode_number,
                    we.title AS episode_title, we.overview, we.still_path, we.air_date,
                    COALESCE(we.runtime, 0) AS runtime
             FROM (
@@ -338,29 +257,29 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
             "#,
         );
         if let Some(cat) = &category_filter {
-            sql.push_bind_push(" AND m.category = ", cat.clone(), "");
+            sql.push_bind_push(" AND m.category = ", cat.clone(), "")?;
         }
         push_user_access_scope(&mut sql, &access_scope)?;
         if let Some(rule) = &vlib_rule {
-            let rj = sql.bind(rule_json.clone().unwrap_or(Value::Null));
+            let rj = sql.bind(rule_json.clone().unwrap_or(Value::Null))?;
             sql.push(&format!(
                 " AND {}",
                 rule.sql_predicate(&format!("{}::jsonb", rj))
             ));
         }
         if let Some(p) = &search_pattern {
-            let pat = sql.bind(p.clone());
+            let pat = sql.bind(p.clone())?;
             sql.push(&format!(
-                " AND (we.title ILIKE {pat} OR m.title ILIKE {pat} OR m.original_title ILIKE {pat} OR m.sort_title ILIKE {pat} OR EXISTS (SELECT 1 FROM sync_folders sf_kw WHERE sf_kw.work_id = m.id AND (sf_kw.clean_title ILIKE {pat} OR sf_kw.raw_folder_name ILIKE {pat})))"
+                " AND (we.title ILIKE {pat} OR m.title ILIKE {pat} OR m.original_title ILIKE {pat} OR m.sort_title ILIKE {pat} OR EXISTS (SELECT 1 FROM sync_folders sf_kw WHERE sf_kw.work_id = m.id AND sf_kw.is_ignored = FALSE AND (sf_kw.clean_title ILIKE {pat} OR sf_kw.raw_folder_name ILIKE {pat})))"
             ));
         }
         if count_only {
             sql.push(") AS counted_episodes");
         } else {
             sql.push(" ORDER BY m.year DESC NULLS LAST, sf.work_id DESC, sf.season_number ASC, sf.episode_number ASC LIMIT ");
-            let _ = sql.bind(limit);
+            let _ = sql.bind(limit)?;
             sql.push(" OFFSET ");
-            let _ = sql.bind(offset);
+            let _ = sql.bind(offset)?;
         }
         Ok(sql)
     };
@@ -383,23 +302,53 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
     };
 
     let page_wids: Vec<i64> = rows.iter().map(|r| r.work_id).collect();
-    let episode_histories: Vec<EpisodeListingHistoryRow> =
-        sqlx::query_as("SELECT work_id, season_number, episode_number, position_ticks, duration_ticks, is_played FROM play_histories WHERE user_id=$1 AND work_id = ANY($2)")
-            .bind(user_id).bind(&page_wids).fetch_all(&state.db).await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let page_tids: Vec<i32> = rows.iter().filter_map(|r| r.tmdb_id).collect();
+    let episode_histories: Vec<EpisodeListingHistoryRow> = if page_wids.is_empty() {
+        vec![]
+    } else {
+        sqlx::query_as(
+            "SELECT work_id, tmdb_id, season_number, episode_number, position_ticks, duration_ticks, is_played FROM play_histories WHERE user_id=$1 AND (work_id = ANY($2) OR (tmdb_id IS NOT NULL AND tmdb_id = ANY($3) AND media_type = 'tv'))",
+        )
+        .bind(user_id)
+        .bind(&page_wids)
+        .bind(&page_tids)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    let episode_history_map: std::collections::HashMap<_, _> = episode_histories
+        .into_iter()
+        .map(|h| {
+            (
+                (h.work_id, h.tmdb_id, h.season_number, h.episode_number),
+                (h.position_ticks, h.duration_ticks, h.is_played),
+            )
+        })
+        .collect();
 
     let cfg = state.config.load();
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
-            let history = episode_histories
-                .iter()
-                .find(|h| {
-                    h.work_id == Some(r.work_id)
-                        && h.season_number == r.season_number
-                        && h.episode_number == r.episode_number
+            let history = episode_history_map
+                .get(&(
+                    Some(r.work_id),
+                    r.tmdb_id,
+                    r.season_number,
+                    r.episode_number,
+                ))
+                .or_else(|| {
+                    episode_history_map.get(&(
+                        Some(r.work_id),
+                        None,
+                        r.season_number,
+                        r.episode_number,
+                    ))
                 })
-                .map(|h| (h.position_ticks, h.duration_ticks, h.is_played));
+                .or_else(|| {
+                    episode_history_map.get(&(None, r.tmdb_id, r.season_number, r.episode_number))
+                })
+                .copied();
             let ep = EpisodeGroupRow {
                 season_number: r.season_number,
                 episode_number: r.episode_number,
@@ -454,6 +403,7 @@ mod sql_tests {
 #[derive(sqlx::FromRow)]
 struct EpisodeListingHistoryRow {
     work_id: Option<i64>,
+    tmdb_id: Option<i32>,
     season_number: i32,
     episode_number: i32,
     position_ticks: i64,
@@ -464,6 +414,7 @@ struct EpisodeListingHistoryRow {
 #[derive(sqlx::FromRow)]
 struct EpisodeListRow {
     work_id: i64,
+    tmdb_id: Option<i32>,
     series_title: String,
     season_number: i32,
     episode_number: i32,

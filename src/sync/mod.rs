@@ -624,6 +624,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         .await;
 
         let stats = apply_sync_diff(&state.db, deduped, total_lines, batch_size, force).await?;
+        state.caches.image_meta_cache.invalidate_all();
 
         *state.sync_ctrl.last_file_hash.write().await = Some(file_hash);
         *state.sync_ctrl.last_sync_time.write().await = Some(Utc::now());

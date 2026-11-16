@@ -175,7 +175,7 @@ async fn get_item_image_inner(
         .header(header::CONTENT_LENGTH, bytes.len())
         .header(header::ETAG, etag)
         .header(header::CACHE_CONTROL, "public, max-age=604800")
-        .body(axum::body::Body::from(bytes.clone()))
+        .body(axum::body::Body::from(bytes))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -314,7 +314,7 @@ async fn try_serve_dynamic_cover(
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, content_type)
                     .header(header::CACHE_CONTROL, "public, max-age=300")
-                    .body(axum::body::Body::from(bytes.clone()))
+                    .body(axum::body::Body::from(bytes))
                     .map_err(|e| {
                         tracing::warn!("构建动态封面响应失败: {}", e);
                         e
@@ -332,7 +332,7 @@ async fn try_serve_dynamic_cover(
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/jpeg")
                 .header(header::CACHE_CONTROL, "public, max-age=300")
-                .body(axum::body::Body::from(bytes.clone()))
+                .body(axum::body::Body::from(bytes))
                 .map_err(|e| {
                     tracing::warn!("构建拼接封面响应失败: {}", e);
                     e
@@ -526,11 +526,7 @@ async fn fetch_or_build_virtual_library_collage(
                 }
             }
 
-            let poster_bytes: Vec<Vec<u8>> = posters
-                .into_iter()
-                .flatten()
-                .map(|bytes| bytes.to_vec())
-                .collect();
+            let poster_bytes: Vec<Bytes> = posters.into_iter().flatten().collect();
             if poster_bytes.is_empty() && primary_backdrop.is_none() {
                 return Err(anyhow::anyhow!("没有可用于拼接的封面素材"));
             }

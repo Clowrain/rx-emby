@@ -116,7 +116,7 @@ pub(super) async fn list_admin_media(
     .bind(kw_tmdb_id)
     .fetch_one(&state.db)
     .await
-    .unwrap_or(0);
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let sql = format!(
         r#"
@@ -361,10 +361,11 @@ pub(super) async fn bind_tmdb_id(
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("改绑 TMDB 失败: {:#}", e)))?;
     }
 
-    let _ = sqlx::query("UPDATE media_works SET is_locked = TRUE WHERE id = $1")
+    sqlx::query("UPDATE media_works SET is_locked = TRUE WHERE id = $1")
         .bind(target_work_id)
         .execute(&state.db)
-        .await;
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.caches.admin_stats_cache.invalidate_all();
     state.caches.image_meta_cache.invalidate_all();
@@ -381,10 +382,11 @@ pub(super) async fn scrape_one_now(
     State(state): State<Arc<AppState>>,
     Path(work_id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let _ = sqlx::query("UPDATE work_seasons SET scrape_attempts = 0 WHERE work_id = $1")
+    sqlx::query("UPDATE work_seasons SET scrape_attempts = 0 WHERE work_id = $1")
         .bind(work_id)
         .execute(&state.db)
-        .await;
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     scrape_work_seasons_by_id(&state, work_id, true)
         .await
@@ -566,7 +568,7 @@ pub(super) async fn list_staging_folders(
     .bind(kw_tmdb_id)
     .fetch_one(&state.db)
     .await
-    .unwrap_or(0);
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let items: Vec<StagingFolderRow> = sqlx::query_as(
         r#"
@@ -605,12 +607,13 @@ pub(super) async fn scrape_staging_folder(
     State(state): State<Arc<AppState>>,
     Path(folder_id): Path<i64>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let _ = sqlx::query(
+    sqlx::query(
         "UPDATE sync_folders SET scrape_state = 'pending', is_locked = FALSE, retry_count = 0, next_retry_at = NULL, conflict_reason = NULL WHERE id = $1",
     )
     .bind(folder_id)
     .execute(&state.db)
-    .await;
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     scrape_single_folder(&state, folder_id)
         .await
@@ -622,7 +625,7 @@ pub(super) async fn scrape_staging_folder(
     .bind(folder_id)
     .fetch_optional(&state.db)
     .await
-    .unwrap_or(None);
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.caches.admin_stats_cache.invalidate_all();
     state.caches.image_meta_cache.invalidate_all();

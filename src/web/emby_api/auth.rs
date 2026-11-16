@@ -80,18 +80,17 @@ pub(super) async fn authenticate_by_name(
 
     let (device_id, device_name, client_name) = parse_emby_client_identity(&headers);
 
-    // 按 (user_id, device_id / client_name) 复用已有令牌并清理同客户端历史重复记录
+    // 只按设备标识复用令牌；相同应用名的不同设备必须保留独立会话。
     let existing_token: Option<String> = sqlx::query_scalar(
         r#"
         SELECT token FROM access_tokens
-        WHERE user_id = $1 AND (device_id = $2 OR client_name = $3)
+        WHERE user_id = $1 AND device_id = $2
         ORDER BY last_used_at DESC
         LIMIT 1
         "#,
     )
     .bind(&user_id)
     .bind(&device_id)
-    .bind(&client_name)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| {
@@ -113,12 +112,11 @@ pub(super) async fn authenticate_by_name(
             tracing::warn!("更新访问令牌设备信息失败: {}", e);
         }
         let removed: Vec<String> = sqlx::query_scalar(
-            "DELETE FROM access_tokens WHERE user_id = $1 AND token <> $2 AND (device_id = $3 OR client_name = $4) RETURNING token",
+            "DELETE FROM access_tokens WHERE user_id = $1 AND token <> $2 AND device_id = $3 RETURNING token",
         )
         .bind(&user_id)
         .bind(&tok)
         .bind(&device_id)
-        .bind(&client_name)
         .fetch_all(&state.db)
         .await
         .unwrap_or_else(|e| {
@@ -207,7 +205,7 @@ fn parse_emby_client_identity(headers: &HeaderMap) -> (String, String, String) {
         .collect();
 
     let stable_device_id: String = device_id
-        .unwrap_or_else(|| format!("client:{}", client_name))
+        .unwrap_or_else(|| format!("anonymous:{}", Uuid::new_v4().simple()))
         .chars()
         .take(64)
         .collect();
@@ -390,9 +388,53 @@ pub(super) async fn resolve_valid_user_id_with_query(
 
 #[cfg(test)]
 mod cache_tests {
-    use super::invalidate_token_cache_entries;
+    use super::{extract_emby_token, invalidate_token_cache_entries, parse_emby_client_identity};
+    use axum::http::{HeaderMap, HeaderValue};
     use moka::future::Cache;
     use std::sync::Arc;
+
+    #[test]
+    fn detail_token_extraction_supports_emby_authorization_and_api_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-emby-authorization",
+            HeaderValue::from_static("MediaBrowser Token=authorization-token, Client=Test"),
+        );
+        assert_eq!(
+            extract_emby_token(&headers, None).as_deref(),
+            Some("authorization-token")
+        );
+        assert_eq!(
+            extract_emby_token(&headers, Some("query-token")).as_deref(),
+            Some("query-token")
+        );
+    }
+
+    #[test]
+    fn devices_sharing_a_client_name_have_distinct_identities() {
+        let mut device_a = HeaderMap::new();
+        device_a.insert(
+            "x-emby-authorization",
+            HeaderValue::from_static("MediaBrowser Client=Infuse, DeviceId=device-a"),
+        );
+        let mut device_b = HeaderMap::new();
+        device_b.insert(
+            "x-emby-authorization",
+            HeaderValue::from_static("MediaBrowser Client=Infuse, DeviceId=device-b"),
+        );
+        let (a, _, client_a) = parse_emby_client_identity(&device_a);
+        let (b, _, client_b) = parse_emby_client_identity(&device_b);
+        assert_eq!(client_a, client_b);
+        assert_ne!(a, b);
+
+        let without_device_id = HeaderMap::from_iter([(
+            axum::http::HeaderName::from_static("x-emby-authorization"),
+            HeaderValue::from_static("MediaBrowser Client=Infuse"),
+        )]);
+        let (fallback_a, _, _) = parse_emby_client_identity(&without_device_id);
+        let (fallback_b, _, _) = parse_emby_client_identity(&without_device_id);
+        assert_ne!(fallback_a, fallback_b);
+    }
 
     #[tokio::test]
     async fn revoking_a_token_invalidates_only_that_token_entry() {

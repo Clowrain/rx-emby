@@ -323,14 +323,19 @@ pub(super) async fn delete_virtual_library(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i32>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     sqlx::query("DELETE FROM virtual_libraries WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let grant_key = format!("lib_vlib_{}", id);
-    let _ = sqlx::query(
+    sqlx::query(
         r#"
         UPDATE users
         SET allowed_categories = CASE
@@ -341,8 +346,12 @@ pub(super) async fn delete_virtual_library(
         "#,
     )
     .bind(&grant_key)
-    .execute(&state.db)
-    .await;
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let covers_dir = state.config.load().image_cache_dir.join("covers");
     let prefix = format!("vlib_{}", id);

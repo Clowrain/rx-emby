@@ -3,8 +3,8 @@
 
 use super::auth::resolve_valid_user_id_with_query;
 use super::ids::{build_search_pattern, numeric_tmdb_id};
-use super::views::{user_access_scope, UserAccessScope};
-use crate::smart_views::VirtualLibraryRule;
+use super::items::DynSql;
+use super::views::user_access_scope;
 use crate::state::AppState;
 use axum::{
     extract::{Query, State},
@@ -59,10 +59,10 @@ pub(super) async fn get_search_hints(
     let item_types = parse_type_filter(q.include_item_types.as_deref(), q.media_types.as_deref());
     let include_items = item_types
         .as_ref()
-        .is_none_or(|types| types.iter().any(|t| t == "Movie" || t == "Series"));
+        .is_none_or(|types| types.iter().any(|t| *t == "Movie" || *t == "Series"));
     let include_episodes = item_types
         .as_ref()
-        .is_none_or(|types| types.contains(&"Episode".to_string()));
+        .is_none_or(|types| types.contains(&"Episode"));
     let limit = q.limit.unwrap_or(20).clamp(1, 50);
     // 条目与分集各占一部分配额
     let item_limit = (limit / 2).max(8);
@@ -70,8 +70,7 @@ pub(super) async fn get_search_hints(
 
     // 主条目：标题 / 原名 / 排序名 / TMDB ID / 关联目录名
     let item_search_predicate = main_item_search_predicate("$1", "$2");
-    let (item_access_predicate, item_access_rules) = access_scope.sql_predicate(5);
-    let item_sql = format!(
+    let mut item_sql = DynSql::new(&format!(
         r#"
         SELECT 'work_' || m.id AS item_id,
                m.title,
@@ -86,30 +85,22 @@ pub(super) async fn get_search_hints(
         WHERE $4::boolean
           AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)
           {item_search_predicate}
-          AND ({item_access_predicate})
-        ORDER BY m.rating DESC, m.year DESC NULLS LAST, m.id DESC
-        LIMIT $3
-        "#,
-        item_search_predicate = item_search_predicate,
-        item_access_predicate = item_access_predicate,
-    );
-    let mut item_query = sqlx::query_as(&item_sql)
-        .bind(p)
-        .bind(tmdb)
-        .bind(item_limit)
-        .bind(include_items)
-        .bind(access_scope.allowed_categories.clone().unwrap_or_default());
-    for rule in item_access_rules {
-        item_query = item_query.bind(rule);
-    }
-    let items: Vec<HintRow> = item_query
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        "#
+    ));
+    item_sql.bind(p.clone())?;
+    item_sql.bind(tmdb)?;
+    item_sql.bind(item_limit)?;
+    item_sql.bind(include_items)?;
+    access_scope.push_sql_predicate(&mut item_sql)?;
+    item_sql.push(" ORDER BY m.rating DESC, m.year DESC NULLS LAST, m.id DESC LIMIT $3");
+    let items: Vec<HintRow> =
+        sqlx::query_as_with::<sqlx::Postgres, HintRow, _>(&item_sql.sql, item_sql.args)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 分集：TMDB 分集标题 / 本地文件名 / 剧名（1~2 字符短查询退化为顺序扫描，语义不受影响）
-    let (episode_access_predicate, episode_access_rules) = access_scope.sql_predicate(4);
-    let episode_sql = format!(
+    // 文件名独立 EXISTS 保持 trigram 索引谓词可见；目录必须非忽略。
+    let mut episode_sql = DynSql::new(
         r#"
         SELECT 'ep_' || we.work_id || '_' || we.season_number || '_' || we.episode_number AS item_id,
                COALESCE(we.title, '第 ' || we.episode_number || ' 集') AS title,
@@ -124,32 +115,33 @@ pub(super) async fn get_search_hints(
         FROM work_episodes we
         JOIN media_works m ON m.id = we.work_id
         WHERE $3::boolean
-          AND EXISTS (
+          AND (EXISTS (
             SELECT 1 FROM sync_files sf
             JOIN sync_folders f ON f.id = sf.folder_id
             WHERE f.work_id = m.id AND f.is_ignored = FALSE
               AND sf.season_number = we.season_number AND sf.episode_number = we.episode_number
-              AND (we.title ILIKE $1 OR m.title ILIKE $1 OR m.original_title ILIKE $1
-                   OR m.sort_title ILIKE $1 OR sf.file_name ILIKE $1)
+              AND (we.title ILIKE $1 OR m.title ILIKE $1 OR m.original_title ILIKE $1 OR m.sort_title ILIKE $1)
           )
-          AND ({episode_access_predicate})
-        ORDER BY m.rating DESC, we.season_number ASC, we.episode_number ASC
-        LIMIT $2
+          OR EXISTS (
+            SELECT 1 FROM sync_files sf
+            JOIN sync_folders f ON f.id = sf.folder_id
+            WHERE f.work_id = m.id AND f.is_ignored = FALSE
+              AND sf.season_number = we.season_number AND sf.episode_number = we.episode_number
+              AND sf.file_name ILIKE $1
+          ))
         "#,
-        episode_access_predicate = episode_access_predicate,
     );
-    let mut episode_query = sqlx::query_as(&episode_sql)
-        .bind(p)
-        .bind(ep_limit)
-        .bind(include_episodes)
-        .bind(access_scope.allowed_categories.clone().unwrap_or_default());
-    for rule in episode_access_rules {
-        episode_query = episode_query.bind(rule);
-    }
-    let episodes: Vec<HintRow> = episode_query
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    episode_sql.bind(p.clone())?;
+    episode_sql.bind(ep_limit)?;
+    episode_sql.bind(include_episodes)?;
+    access_scope.push_sql_predicate(&mut episode_sql)?;
+    episode_sql
+        .push(" ORDER BY m.rating DESC, we.season_number ASC, we.episode_number ASC LIMIT $2");
+    let episodes: Vec<HintRow> =
+        sqlx::query_as_with::<sqlx::Postgres, HintRow, _>(&episode_sql.sql, episode_sql.args)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let hints: Vec<Value> = items
         .into_iter()
@@ -191,78 +183,53 @@ pub(super) async fn get_search_hints(
     })))
 }
 
-impl UserAccessScope {
-    fn sql_predicate(&self, category_param: usize) -> (String, Vec<Value>) {
-        if self.allowed_categories.is_none() {
-            return ("TRUE".to_string(), Vec::new());
-        }
-        let mut parts = vec![format!("m.category = ANY(${}::text[])", category_param)];
-        let mut rules = Vec::with_capacity(self.virtual_libraries.len());
-        for library in &self.virtual_libraries {
-            let Ok(rule) =
-                serde_json::from_value::<VirtualLibraryRule>(library.filter_rules.clone())
-            else {
-                continue;
-            };
-            let rule_param = category_param + 1 + rules.len();
-            parts.push(format!(
-                "({})",
-                rule.sql_predicate(&format!("${}::jsonb", rule_param))
-            ));
-            rules.push(library.filter_rules.clone());
-        }
-        (parts.join(" OR "), rules)
-    }
-}
-
 fn parse_type_filter(
     include_item_types: Option<&str>,
     media_types: Option<&str>,
-) -> Option<Vec<String>> {
-    let values = include_item_types
+) -> Option<Vec<&'static str>> {
+    let mut types: Vec<&'static str> = Vec::new();
+    let mut has_value = false;
+    for value in include_item_types
         .into_iter()
         .chain(media_types)
-        .flat_map(|v| v.split(','))
+        .flat_map(|value| value.split(','))
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return None;
-    }
-    let mut types = Vec::new();
-    for value in values {
-        let normalized = match value.to_ascii_lowercase().as_str() {
+        .filter(|value| !value.is_empty())
+    {
+        has_value = true;
+        let normalized: &'static str = match value.to_ascii_lowercase().as_str() {
             "movie" => "Movie",
             "series" | "tv" => "Series",
             "episode" => "Episode",
             _ => continue,
         };
-        if !types.contains(&normalized.to_string()) {
-            types.push(normalized.to_string());
+        if !types.contains(&normalized) {
+            types.push(normalized);
         }
     }
-    Some(types)
+    has_value.then_some(types)
 }
 
 fn main_item_search_predicate(pattern_param: &str, tmdb_param: &str) -> String {
     format!(
-        "AND (m.title ILIKE {pattern_param} OR m.original_title ILIKE {pattern_param} OR m.sort_title ILIKE {pattern_param}\n         OR ({tmdb_param}::int4 IS NOT NULL AND m.tmdb_id = {tmdb_param})\n         OR EXISTS (SELECT 1 FROM sync_folders sf2 WHERE sf2.work_id = m.id\n                    AND (sf2.clean_title ILIKE {pattern_param} OR sf2.raw_folder_name ILIKE {pattern_param})))"
+        "AND (m.title ILIKE {pattern_param} OR m.original_title ILIKE {pattern_param} OR m.sort_title ILIKE {pattern_param}\n         OR ({tmdb_param}::int4 IS NOT NULL AND m.tmdb_id = {tmdb_param})\n         OR EXISTS (SELECT 1 FROM sync_folders sf2 WHERE sf2.work_id = m.id AND sf2.is_ignored = FALSE\n                    AND (sf2.clean_title ILIKE {pattern_param} OR sf2.raw_folder_name ILIKE {pattern_param})))"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{main_item_search_predicate, parse_type_filter, UserAccessScope};
+    use super::super::views::{AccessibleVirtualLibrary, UserAccessScope};
+    use super::{main_item_search_predicate, parse_type_filter, DynSql};
 
     #[test]
     fn search_type_filters_normalize_supported_media_types() {
         assert_eq!(
             parse_type_filter(Some("Movie,Episode"), None),
-            Some(vec!["Movie".into(), "Episode".into()])
+            Some(vec!["Movie", "Episode"])
         );
         assert_eq!(
             parse_type_filter(None, Some("Series")),
-            Some(vec!["Series".into()])
+            Some(vec!["Series"])
         );
         assert_eq!(parse_type_filter(None, None), None);
     }
@@ -271,15 +238,16 @@ mod tests {
     fn access_scope_filters_categories_and_permitted_virtual_libraries_in_sql() {
         let scope = UserAccessScope {
             allowed_categories: Some(vec!["电影".into()]),
-            virtual_libraries: vec![super::super::views::AccessibleVirtualLibrary {
+            virtual_libraries: vec![AccessibleVirtualLibrary {
                 filter_rules: serde_json::json!({"min_rating": 8.0}),
             }],
         };
-        let (predicate, rules) = scope.sql_predicate(4);
-        assert!(predicate.contains("m.category = ANY($4::text[])"));
-        assert!(predicate.contains("$5::jsonb"));
-        assert!(predicate.contains("min_rating"));
-        assert_eq!(rules.len(), 1);
+        let mut sql = DynSql::new("SELECT m.id FROM media_works m WHERE TRUE");
+        scope.push_sql_predicate(&mut sql).unwrap();
+        assert!(sql.sql.contains("m.category = ANY($1)"));
+        assert!(sql.sql.contains("m.rating >="));
+        assert!(sql.sql.contains("$2::jsonb"));
+        assert_eq!(sql.n, 2);
     }
 
     #[test]
@@ -290,7 +258,10 @@ mod tests {
         let end = rest.find("ORDER BY m.rating").unwrap();
         let query = &rest[..end];
         assert!(query.contains("m.sort_title ILIKE $1"));
-        assert_eq!(query.matches("AND EXISTS (").count(), 1);
+        assert!(query.contains("sf.file_name ILIKE $1"));
+        assert!(!query.contains("OR sf.file_name ILIKE $1"));
+        assert!(query.contains("f.is_ignored = FALSE"));
+        assert_eq!(query.matches("EXISTS (").count(), 2);
     }
 
     #[test]

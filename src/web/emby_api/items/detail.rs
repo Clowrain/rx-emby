@@ -21,7 +21,7 @@ pub async fn get_item_detail(
         state.spawn_prewarm_media_dirs(wid, None);
     }
     Ok(Json(
-        get_item_detail_inner(&state, &user_id, &headers, &item_id).await?,
+        get_item_detail_inner(&state, &user_id, &headers, &q, &item_id).await?,
     ))
 }
 
@@ -40,7 +40,7 @@ pub async fn get_item_detail_unscoped(
         state.spawn_prewarm_media_dirs(wid, None);
     }
     Ok(Json(
-        get_item_detail_inner(&state, &user_id, &headers, &item_id).await?,
+        get_item_detail_inner(&state, &user_id, &headers, &q, &item_id).await?,
     ))
 }
 
@@ -63,6 +63,7 @@ async fn get_item_detail_inner(
     state: &AppState,
     user_id: &str,
     headers: &HeaderMap,
+    q: &PlaybackQuery,
     item_id: &str,
 ) -> Result<Value, (StatusCode, String)> {
     let cfg = state.config.load();
@@ -71,11 +72,7 @@ async fn get_item_detail_inner(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("127.0.0.1:8096")
         .to_string();
-    let token = headers
-        .get("x-emby-token")
-        .or_else(|| headers.get("x-mediabrowser-token"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+    let token = extract_emby_token(headers, q.api_key.as_deref())
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let session_id = Uuid::new_v4().simple().to_string();
 
@@ -117,10 +114,11 @@ async fn get_item_detail_inner(
                 .try_send(ScrapeTask::WorkSeasons(wid));
         }
 
-        let fav_set = load_user_favorite_keys(state, user_id).await;
+        let fav_set = load_user_favorite_keys(state, user_id).await?;
         let is_fav = is_media_favorited(&fav_set, wid, work.tmdb_id, &work.media_type);
         let history_map =
-            load_media_episode_histories(state, user_id, wid, work.tmdb_id, &work.media_type).await;
+            load_media_episode_histories(state, user_id, wid, work.tmdb_id, &work.media_type)
+                .await?;
         let (pos_ticks, dur_ticks, is_played) =
             history_map.get(&(0, 1)).copied().unwrap_or((0, 0, false));
 
@@ -226,7 +224,8 @@ async fn get_item_detail_inner(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let (tmdb_id, mtype, series_title) =
             media_meta.unwrap_or((None, "tv".to_string(), String::new()));
-        let history_map = load_media_episode_histories(state, user_id, wid, tmdb_id, &mtype).await;
+        let history_map =
+            load_media_episode_histories(state, user_id, wid, tmdb_id, &mtype).await?;
         let (pos_ticks, dur_ticks, is_played) = history_map
             .get(&(snum, epnum))
             .copied()

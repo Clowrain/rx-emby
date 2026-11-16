@@ -416,7 +416,10 @@ pub(super) async fn stream_video(
         .bind(epnum)
         .fetch_optional(&state.db)
         .await
-        .unwrap_or(None)
+        .map_err(|error| {
+            tracing::error!("查询播放源失败: {}", error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        })?
         .unwrap_or(0)
     } else if let Some(raw_wid) = item_id
         .strip_prefix("work_")
@@ -436,7 +439,10 @@ pub(super) async fn stream_video(
         .bind(wid)
         .fetch_optional(&state.db)
         .await
-        .unwrap_or(None)
+        .map_err(|error| {
+            tracing::error!("查询播放源失败: {}", error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        })?
         .unwrap_or(0)
     } else {
         item_id.parse::<i64>().unwrap_or(0)
@@ -484,6 +490,30 @@ pub(super) async fn stream_video(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+fn indexed_path_work_id(row: Option<(Option<i64>, bool)>) -> Result<i64, (StatusCode, String)> {
+    let Some((work_id, is_ignored)) = row else {
+        return Err((StatusCode::NOT_FOUND, "未找到已索引的播放源".to_string()));
+    };
+    if is_ignored {
+        return Err((StatusCode::NOT_FOUND, "条目已被屏蔽".to_string()));
+    }
+    work_id.ok_or((
+        StatusCode::NOT_FOUND,
+        "播放源未关联到已刮削媒体".to_string(),
+    ))
+}
+
+fn canonicalize_alist_path(path: &str) -> Result<String, (StatusCode, String)> {
+    let normalized = format!("/{}", path.trim_start_matches('/'));
+    if normalized
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err((StatusCode::BAD_REQUEST, "非法播放路径".to_string()));
+    }
+    Ok(normalized)
+}
+
 /// 兼容按 `/d/*alist_path` 逻辑路径直接请求播放，内部换链并 302 跳转真实网盘直链
 pub(super) async fn stream_by_d_path(
     State(state): State<Arc<AppState>>,
@@ -499,7 +529,7 @@ pub(super) async fn stream_by_d_path(
         .unwrap_or("");
 
     let decoded = crate::sync::parser::lossy_url_decode(&raw_path);
-    let alist_path = format!("/{}", decoded.trim_start_matches('/'));
+    let alist_path = canonicalize_alist_path(&decoded)?;
     let path_hash = xxhash_rust::xxh3::xxh3_64(alist_path.as_bytes()) as i64;
 
     let path_row = sqlx::query_as::<_, (Option<i64>, bool)>(
@@ -509,14 +539,8 @@ pub(super) async fn stream_by_d_path(
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    if let Some((wid, is_ignored)) = path_row {
-        if is_ignored {
-            return Err((StatusCode::NOT_FOUND, "条目已被屏蔽".to_string()));
-        }
-        if let Some(wid) = wid {
-            ensure_media_accessible(&state, &user_id, wid).await?;
-        }
-    }
+    let wid = indexed_path_work_id(path_row)?;
+    ensure_media_accessible(&state, &user_id, wid).await?;
 
     let resolved = state
         .resolve_playback_url(path_hash, &alist_path, client_ua)
@@ -547,4 +571,44 @@ pub(super) async fn get_media_segments() -> Json<Value> {
         "TotalRecordCount": 0,
         "StartIndex": 0
     }))
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{canonicalize_alist_path, indexed_path_work_id, StatusCode};
+
+    #[test]
+    fn d_path_rejects_missing_ignored_and_unindexed_sources() {
+        assert_eq!(
+            indexed_path_work_id(None).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            indexed_path_work_id(Some((Some(7), true))).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            indexed_path_work_id(Some((None, false))).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(indexed_path_work_id(Some((Some(7), false))).unwrap(), 7);
+    }
+
+    #[test]
+    fn canonical_path_rejects_dot_segments_and_normalizes_leading_slashes() {
+        assert_eq!(
+            canonicalize_alist_path("//Movies/a.mkv").unwrap(),
+            "/Movies/a.mkv"
+        );
+        assert_eq!(
+            canonicalize_alist_path("Movies/../secret.mkv")
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            canonicalize_alist_path("./secret.mkv").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }
