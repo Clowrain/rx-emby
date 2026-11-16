@@ -22,6 +22,22 @@ pub(super) struct AdminMediaQuery {
     offset: Option<i64>,
 }
 
+fn build_admin_media_order_clause(sort_by: Option<&str>, is_asc: bool) -> &'static str {
+    match sort_by.unwrap_or("updated_at") {
+        "created_at" => if is_asc { "w.created_at ASC, w.id ASC" } else { "w.created_at DESC, w.id DESC" },
+        "year" => {
+            if is_asc {
+                "COALESCE(NULLIF(w.premiered_at, ''), CASE WHEN w.year IS NOT NULL THEN w.year::text || '-01-01' ELSE NULL END) ASC NULLS LAST, w.id ASC"
+            } else {
+                "COALESCE(NULLIF(w.premiered_at, ''), CASE WHEN w.year IS NOT NULL THEN w.year::text || '-01-01' ELSE NULL END) DESC NULLS LAST, w.id DESC"
+            }
+        }
+        "rating" => if is_asc { "w.rating ASC, w.id ASC" } else { "w.rating DESC, w.id DESC" },
+        "title" => if is_asc { "w.title ASC, w.id ASC" } else { "w.title DESC, w.id DESC" },
+        _ => if is_asc { "w.updated_at ASC, w.id ASC" } else { "w.updated_at DESC, w.id DESC" },
+    }
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct AdminWorkRow {
     id: i64,
@@ -54,13 +70,7 @@ pub(super) async fn list_admin_media(
         .as_deref()
         .map(|s| s.eq_ignore_ascii_case("asc") || s.eq_ignore_ascii_case("ascending"))
         .unwrap_or(false);
-    let order_clause = match q.sort_by.as_deref().unwrap_or("updated_at") {
-        "created_at" => if is_asc { "w.created_at ASC, w.id ASC" } else { "w.created_at DESC, w.id DESC" },
-        "year" => if is_asc { "w.year ASC NULLS LAST, w.id ASC" } else { "w.year DESC NULLS LAST, w.id DESC" },
-        "rating" => if is_asc { "w.rating ASC, w.id ASC" } else { "w.rating DESC, w.id DESC" },
-        "title" => if is_asc { "w.title ASC, w.id ASC" } else { "w.title DESC, w.id DESC" },
-        _ => if is_asc { "w.updated_at ASC, w.id ASC" } else { "w.updated_at DESC, w.id DESC" },
-    };
+    let order_clause = build_admin_media_order_clause(q.sort_by.as_deref(), is_asc);
 
     let total: i64 = sqlx::query_scalar(
         r#"
@@ -677,4 +687,21 @@ pub(super) async fn retry_failed_scrapes(
         "reset_count": res.rows_affected(),
         "message": format!("已将 {} 个失败/冲突目录重新加入待刮削队列", res.rows_affected())
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_admin_media_order_clause;
+
+    #[test]
+    fn year_sort_prefers_premiered_at_with_year_fallback() {
+        assert_eq!(
+            build_admin_media_order_clause(Some("year"), false),
+            "COALESCE(NULLIF(w.premiered_at, ''), CASE WHEN w.year IS NOT NULL THEN w.year::text || '-01-01' ELSE NULL END) DESC NULLS LAST, w.id DESC"
+        );
+        assert_eq!(
+            build_admin_media_order_clause(Some("year"), true),
+            "COALESCE(NULLIF(w.premiered_at, ''), CASE WHEN w.year IS NOT NULL THEN w.year::text || '-01-01' ELSE NULL END) ASC NULLS LAST, w.id ASC"
+        );
+    }
 }
