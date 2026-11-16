@@ -16,20 +16,115 @@ use tokio::{fs, io::AsyncBufReadExt, time::sleep};
 use tracing::{error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
+const MIN_SYNC_INTERVAL_SEC: u64 = 60;
+const STARTUP_OVERDUE_GRACE: Duration = Duration::from_secs(15);
+const CONFIG_RELOAD_GRACE: Duration = Duration::from_secs(1);
+const SYNC_ERROR_RETRY_SEC: u64 = 300;
+const SYNC_LAST_CHECK_KEY: &str = "sync.last_check_at";
+
 enum FetchedSource {
     NotModified,
     Bytes { data: Vec<u8>, etag: Option<String> },
 }
 
+fn compute_next_run_at(
+    last_sync_utc: Option<chrono::DateTime<Utc>>,
+    interval: Duration,
+    overdue_grace: Duration,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    if let Some(last_utc) = last_sync_utc {
+        let elapsed_sec = Utc::now()
+            .signed_duration_since(last_utc)
+            .num_seconds()
+            .max(0) as u64;
+        let interval_sec = interval.as_secs();
+        if elapsed_sec >= interval_sec {
+            now + overdue_grace
+        } else {
+            now + Duration::from_secs(interval_sec - elapsed_sec)
+        }
+    } else {
+        now + interval
+    }
+}
+
+fn remaining_wait_secs(next_run_at: tokio::time::Instant) -> u64 {
+    next_run_at
+        .saturating_duration_since(tokio::time::Instant::now())
+        .as_secs()
+}
+
+fn schedule_after_sync(
+    succeeded: bool,
+    interval_sec: u64,
+    cycle_anchor_utc: &mut chrono::DateTime<Utc>,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    if succeeded {
+        // 仅在同步/检查成功时推进周期锚点；失败时保持原锚点并按短退避重试
+        *cycle_anchor_utc = Utc::now();
+        now + Duration::from_secs(interval_sec)
+    } else {
+        now + Duration::from_secs(interval_sec.min(SYNC_ERROR_RETRY_SEC))
+    }
+}
+
+async fn load_last_sync_utc(state: &AppState) -> Option<chrono::DateTime<Utc>> {
+    let log_ts = match sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+        "SELECT MAX(started_at) FROM sync_logs WHERE status = 'success'",
+    )
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(ts) => ts,
+        Err(e) => {
+            warn!("读取最近成功同步时间失败，将回退到检查游标: {}", e);
+            None
+        }
+    };
+
+    let check_ts = load_persisted_cursor(state, SYNC_LAST_CHECK_KEY)
+        .await
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    match (log_ts, check_ts) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 pub fn spawn_sync_worker(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut config_rx = state.config_tx.subscribe();
-        let mut current_interval_sec = state.config.load().sync_interval_sec.max(60);
+        let (mut current_interval_sec, mut current_source) = {
+            let cfg = state.config.load();
+            (
+                cfg.sync_interval_sec.max(MIN_SYNC_INTERVAL_SEC),
+                cfg.strm_txt_source.clone(),
+            )
+        };
 
-        info!("增量同步调度器已启动，当前同步周期: {} 秒", current_interval_sec);
+        let last_sync_utc = load_last_sync_utc(&state).await;
+        // 即使历史从未同步，也以启动时刻作为当前周期锚点，保证调整周期时保留已等待时长
+        let mut cycle_anchor_utc = last_sync_utc.unwrap_or_else(Utc::now);
+        let mut next_run_at = compute_next_run_at(
+            last_sync_utc,
+            Duration::from_secs(current_interval_sec),
+            STARTUP_OVERDUE_GRACE,
+        );
+
+        info!(
+            "增量同步调度器已启动，当前同步周期: {} 秒，距下次定时检查: {} 秒",
+            current_interval_sec,
+            remaining_wait_secs(next_run_at)
+        );
 
         loop {
-            let timer = sleep(Duration::from_secs(current_interval_sec));
+            let timer = tokio::time::sleep_until(next_run_at);
             tokio::pin!(timer);
 
             tokio::select! {
@@ -39,21 +134,66 @@ pub fn spawn_sync_worker(state: Arc<AppState>) {
                 }
                 _ = &mut timer => {
                     info!("定时同步周期到达，开始执行索引增量同步");
-                    if let Err(e) = run_sync_once(&state, false).await {
-                        error!("定时增量同步执行失败: {:#}", e);
-                    }
+                    let ok = match run_sync_once(&state, false).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            error!("定时增量同步执行失败: {:#}", e);
+                            false
+                        }
+                    };
+                    next_run_at = schedule_after_sync(ok, current_interval_sec, &mut cycle_anchor_utc);
                 }
                 _ = state.sync_ctrl.manual_trigger.notified() => {
                     info!("收到手动触发指令，立即执行全量对账同步");
-                    if let Err(e) = run_sync_once(&state, true).await {
-                        error!("手动触发同步执行失败: {:#}", e);
-                    }
+                    let ok = match run_sync_once(&state, true).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            error!("手动触发同步执行失败: {:#}", e);
+                            false
+                        }
+                    };
+                    next_run_at = schedule_after_sync(ok, current_interval_sec, &mut cycle_anchor_utc);
                 }
-                Ok(_) = config_rx.changed() => {
-                    let new_interval = config_rx.borrow().sync_interval_sec.max(60);
-                    if new_interval != current_interval_sec {
+                changed = config_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let (new_interval, new_source) = {
+                        let cfg = config_rx.borrow_and_update();
+                        (
+                            cfg.sync_interval_sec.max(MIN_SYNC_INTERVAL_SEC),
+                            cfg.strm_txt_source.clone(),
+                        )
+                    };
+
+                    if new_source != current_source {
+                        current_source = new_source;
                         current_interval_sec = new_interval;
-                        info!("检测到同步周期热更新，已重置定时器为: {} 秒", current_interval_sec);
+                        // 索引源地址变更时清理旧 ETag/哈希游标，避免新源命中旧缓存并立即触发同步
+                        *state.sync_ctrl.last_file_hash.write().await = None;
+                        let _ = sqlx::query(
+                            "DELETE FROM system_configs WHERE config_key IN ('sync.last_etag', 'sync.last_file_hash')",
+                        )
+                        .execute(&state.db)
+                        .await;
+                        next_run_at = tokio::time::Instant::now() + CONFIG_RELOAD_GRACE;
+                        info!(
+                            "检测到索引源变更为 {}，已清理旧游标并将在 {} 秒后触发同步",
+                            current_source,
+                            remaining_wait_secs(next_run_at)
+                        );
+                    } else if new_interval != current_interval_sec {
+                        current_interval_sec = new_interval;
+                        next_run_at = compute_next_run_at(
+                            Some(cycle_anchor_utc),
+                            Duration::from_secs(current_interval_sec),
+                            CONFIG_RELOAD_GRACE,
+                        );
+                        info!(
+                            "检测到同步周期热更新为 {} 秒，距下次定时检查: {} 秒",
+                            current_interval_sec,
+                            remaining_wait_secs(next_run_at)
+                        );
                     }
                 }
             }
@@ -315,6 +455,9 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
     let fetched = match fetch_source_bytes(state, &source, persisted_etag.as_deref(), force).await {
         Ok(FetchedSource::NotModified) => {
             info!("远程索引源 ETag 未变更 (304 Not Modified)，跳过本次同步");
+            let now = Utc::now();
+            *state.sync_ctrl.last_sync_time.write().await = Some(now);
+            save_persisted_cursor(state, SYNC_LAST_CHECK_KEY, &now.to_rfc3339(), "最近一次索引检查时间").await;
             let _ = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
                 .bind(log_id)
                 .execute(&state.db)
@@ -341,6 +484,9 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
     let file_hash = xxh3_64(&raw_bytes);
     if !force && mem_hash == Some(file_hash) {
         info!("索引文件哈希未变更 ({:#x})，跳过本次入库", file_hash);
+        let now = Utc::now();
+        *state.sync_ctrl.last_sync_time.write().await = Some(now);
+        save_persisted_cursor(state, SYNC_LAST_CHECK_KEY, &now.to_rfc3339(), "最近一次索引检查时间").await;
         if let Some(ref etag) = new_etag {
             save_persisted_cursor(state, "sync.last_etag", etag, "最近一次同步远程索引 ETag").await;
         }
@@ -534,5 +680,55 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             .await;
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_next_run_at, remaining_wait_secs, schedule_after_sync, SYNC_ERROR_RETRY_SEC};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::time::Duration;
+
+    #[test]
+    fn compute_next_run_triggers_after_grace_when_overdue() {
+        let last = Utc::now() - ChronoDuration::seconds(7200);
+        let next = compute_next_run_at(Some(last), Duration::from_secs(3600), Duration::from_secs(15));
+        let wait = remaining_wait_secs(next);
+        assert!((13..=15).contains(&wait));
+    }
+
+    #[test]
+    fn compute_next_run_waits_remaining_interval_when_recent() {
+        let last = Utc::now() - ChronoDuration::seconds(1000);
+        let next = compute_next_run_at(Some(last), Duration::from_secs(3600), Duration::from_secs(15));
+        let wait = remaining_wait_secs(next);
+        assert!((2595..=2600).contains(&wait));
+    }
+
+    #[test]
+    fn compute_next_run_waits_full_interval_when_never_synced() {
+        let next = compute_next_run_at(None, Duration::from_secs(3600), Duration::from_secs(15));
+        let wait = remaining_wait_secs(next);
+        assert!((3595..=3600).contains(&wait));
+    }
+
+    #[test]
+    fn schedule_after_sync_uses_short_backoff_on_failure_and_keeps_anchor() {
+        let original_anchor = Utc::now() - ChronoDuration::seconds(5000);
+        let mut anchor = original_anchor;
+        let next = schedule_after_sync(false, 21600, &mut anchor);
+        let wait = remaining_wait_secs(next);
+        assert_eq!(anchor, original_anchor);
+        assert!((SYNC_ERROR_RETRY_SEC - 2..=SYNC_ERROR_RETRY_SEC).contains(&wait));
+    }
+
+    #[test]
+    fn schedule_after_sync_advances_anchor_on_success() {
+        let original_anchor = Utc::now() - ChronoDuration::seconds(5000);
+        let mut anchor = original_anchor;
+        let next = schedule_after_sync(true, 3600, &mut anchor);
+        let wait = remaining_wait_secs(next);
+        assert!(anchor > original_anchor);
+        assert!((3598..=3600).contains(&wait));
     }
 }
