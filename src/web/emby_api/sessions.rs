@@ -482,6 +482,7 @@ async fn resolve_item_target(
 }
 
 /// 写入或更新播放进度（同时兼容有/无 tmdb_id 的条目）
+#[allow(clippy::too_many_arguments)]
 async fn upsert_play_history(
     state: &AppState,
     user_id: &str,

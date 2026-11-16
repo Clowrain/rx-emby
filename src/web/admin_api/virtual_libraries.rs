@@ -232,8 +232,10 @@ pub(super) async fn seed_preset_virtual_libraries(
         let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM virtual_libraries WHERE name=$1)")
             .bind(name).fetch_one(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
         if exists { continue; }
+        let filter_rules = serde_json::to_value(rule)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         sqlx::query("INSERT INTO virtual_libraries (name,icon_type,sort_order,filter_rules,is_enabled,cover_image) VALUES ($1,$2,$3,$4,TRUE,$5)")
-            .bind(name).bind(icon_type).bind(sort_order).bind(serde_json::to_value(rule).unwrap()).bind(cover_image)
+            .bind(name).bind(icon_type).bind(sort_order).bind(filter_rules).bind(cover_image)
             .execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
         inserted += 1;
     }

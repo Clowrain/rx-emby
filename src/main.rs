@@ -32,6 +32,9 @@ async fn main() -> Result<()> {
     // 2. 连接 PostgreSQL 并执行初始化建表迁移
     let db = PgPoolOptions::new()
         .max_connections(20)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .idle_timeout(std::time::Duration::from_secs(10 * 60))
+        .max_lifetime(std::time::Duration::from_secs(30 * 60))
         .connect(&db_url)
         .await
         .context("连接 PostgreSQL 数据库失败，请确认 docker compose up -d 已运行")?;

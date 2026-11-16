@@ -1,8 +1,8 @@
 use crate::state::AppState;
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use hmac::{Hmac, Mac};
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -12,6 +12,26 @@ use std::{
 use tracing::{debug, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn refresh_completed_since(request_started: Instant, last_refresh: Option<Instant>) -> bool {
+    last_refresh.is_some_and(|refreshed_at| refreshed_at > request_started)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refresh_completed_since;
+    use std::time::Instant;
+
+    #[test]
+    fn recognizes_refresh_completed_after_request_started() {
+        let started = Instant::now();
+        let completed = started + std::time::Duration::from_millis(1);
+
+        assert!(refresh_completed_since(started, Some(completed)));
+        assert!(!refresh_completed_since(started, Some(started)));
+        assert!(!refresh_completed_since(started, None));
+    }
+}
 
 /// URL 路径段百分号编码字符集（保留 `/` 分隔符，安全编码中文、空格与 Emoji）
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -92,6 +112,7 @@ pub struct ResolvedStream {
 impl AppState {
     /// 获取有效 AList Token（带并发防雪崩锁）
     pub async fn get_alist_token(&self, force_refresh: bool) -> Result<String> {
+        let request_started = Instant::now();
         if !force_refresh {
             let guard = self.alist_auth.current_token.read().await;
             if let Some(ref token) = *guard {
@@ -102,8 +123,15 @@ impl AppState {
         // 加互斥锁防止并发请求同时触发多次登录
         let _lock = self.alist_auth.refresh_lock.lock().await;
 
-        // 双重检查
-        if !force_refresh {
+        // 双重检查；强制刷新请求若等待期间已有请求完成刷新，则复用新 Token。
+        if force_refresh {
+            let last_refresh = *self.alist_auth.last_refresh_at.read().await;
+            if refresh_completed_since(request_started, last_refresh) {
+                if let Some(token) = self.alist_auth.current_token.read().await.as_ref() {
+                    return Ok(token.clone());
+                }
+            }
+        } else {
             let guard = self.alist_auth.current_token.read().await;
             if let Some(ref token) = *guard {
                 return Ok(token.clone());
@@ -127,7 +155,11 @@ impl AppState {
 
         let body: AlistResp<LoginData> = resp.json().await.context("解析 AList 登录响应失败")?;
         if body.code != 200 {
-            return Err(anyhow!("AList 登录失败 (code={}): {}", body.code, body.message));
+            return Err(anyhow!(
+                "AList 登录失败 (code={}): {}",
+                body.code,
+                body.message
+            ));
         }
 
         let token = body
@@ -137,6 +169,7 @@ impl AppState {
 
         let mut guard = self.alist_auth.current_token.write().await;
         *guard = Some(token.clone());
+        *self.alist_auth.last_refresh_at.write().await = Some(Instant::now());
         info!("AList 自动登录成功并已刷新内存 Token");
         Ok(token)
     }
@@ -166,7 +199,10 @@ impl AppState {
 
         let cache_key = format!("{}:{}", path_hash, effective_ua);
         if let Some(cached_url) = self.caches.alist_direct_urls.get(&cache_key).await {
-            debug!("⚡ [DirectURL HIT] path_hash={} 命中直链内存缓存", path_hash);
+            debug!(
+                "⚡ [DirectURL HIT] path_hash={} 命中直链内存缓存",
+                path_hash
+            );
             return Ok(ResolvedStream {
                 redirect_url: cached_url,
                 file_size: None,
@@ -237,11 +273,7 @@ impl AppState {
 
     /// 零转存浪费的目录寻址预热：用户点进详情页/分集列表时，在后台对父目录执行只读 `/api/fs/list`，
     /// 让小雅提前把挂载目录树和分享文件列表加载进内存，并顺手把整季单集的真实文件体积批量回填到数据库。
-    pub fn spawn_prewarm_media_dirs(
-        self: &Arc<Self>,
-        work_id: i64,
-        season_number: Option<i32>,
-    ) {
+    pub fn spawn_prewarm_media_dirs(self: &Arc<Self>, work_id: i64, season_number: Option<i32>) {
         let state = self.clone();
         tokio::spawn(async move {
             let sample_paths: Vec<String> = sqlx::query_scalar(
@@ -270,7 +302,13 @@ impl AppState {
                     continue;
                 }
                 let full_dir = state.build_full_alist_path(parent_dir);
-                if state.caches.alist_dir_prewarmed.get(&full_dir).await.is_some() {
+                if state
+                    .caches
+                    .alist_dir_prewarmed
+                    .get(&full_dir)
+                    .await
+                    .is_some()
+                {
                     continue;
                 }
 
@@ -284,30 +322,37 @@ impl AppState {
                         let items = state_inner.call_alist_fs_list(&full_dir).await?;
                         let elapsed = start.elapsed().as_millis();
 
-                        let mut updated = 0usize;
+                        let mut sizes_by_name = std::collections::HashMap::new();
                         for item in &items {
                             if !item.is_dir && item.size > 0 {
-                                if let Ok(res) = sqlx::query(
-                                    r#"
-                                    UPDATE sync_files sf SET file_size_bytes = $1
-                                    FROM sync_folders f
-                                    WHERE sf.folder_id = f.id
-                                      AND f.work_id = $2
-                                      AND f.is_ignored = FALSE
-                                      AND sf.file_name = $3
-                                      AND sf.file_size_bytes IS NULL
-                                    "#,
-                                )
-                                .bind(item.size)
-                                .bind(work_id)
-                                .bind(&item.name)
-                                .execute(&state_inner.db)
-                                .await
-                                {
-                                    updated += res.rows_affected() as usize;
-                                }
+                                sizes_by_name.entry(item.name.clone()).or_insert(item.size);
                             }
                         }
+                        let (file_names, file_sizes): (Vec<_>, Vec<_>) =
+                            sizes_by_name.into_iter().unzip();
+                        let updated = if file_names.is_empty() {
+                            0
+                        } else {
+                            sqlx::query(
+                                r#"
+                                UPDATE sync_files sf SET file_size_bytes = listing.file_size_bytes
+                                FROM sync_folders f,
+                                     unnest($2::text[], $3::bigint[]) AS listing(file_name, file_size_bytes)
+                                WHERE sf.folder_id = f.id
+                                  AND f.work_id = $1
+                                  AND f.is_ignored = FALSE
+                                  AND sf.file_name = listing.file_name
+                                  AND sf.file_size_bytes IS NULL
+                                "#,
+                            )
+                            .bind(work_id)
+                            .bind(file_names)
+                            .bind(file_sizes)
+                            .execute(&state_inner.db)
+                            .await
+                            .map(|result| result.rows_affected() as usize)
+                            .unwrap_or_default()
+                        };
 
                         info!(
                             "📂 [DirPrewarm] 小雅目录寻址预热完成: dir={} | 条目数={} | 回填体积={}条 | 耗时={}ms",
@@ -366,12 +411,17 @@ impl AppState {
             return Err(anyhow!("AList /api/fs/list HTTP 错误: {}", status));
         }
 
-        let body: AlistResp<FsListData> = resp.json().await.context("解析 /api/fs/list 响应失败")?;
+        let body: AlistResp<FsListData> =
+            resp.json().await.context("解析 /api/fs/list 响应失败")?;
         if body.code == 401 {
             return Err(anyhow!("401 Unauthorized: {}", body.message));
         }
         if body.code != 200 {
-            return Err(anyhow!("AList fs/list 错误 (code={}): {}", body.code, body.message));
+            return Err(anyhow!(
+                "AList fs/list 错误 (code={}): {}",
+                body.code,
+                body.message
+            ));
         }
 
         Ok(body.data.and_then(|d| d.content).unwrap_or_default())
@@ -413,10 +463,15 @@ impl AppState {
             return Err(anyhow!("401 Unauthorized: {}", body.message));
         }
         if body.code != 200 {
-            return Err(anyhow!("AList fs/get 错误 (code={}): {}", body.code, body.message));
+            return Err(anyhow!(
+                "AList fs/get 错误 (code={}): {}",
+                body.code,
+                body.message
+            ));
         }
 
-        body.data.ok_or_else(|| anyhow!("AList fs/get 未返回文件数据"))
+        body.data
+            .ok_or_else(|| anyhow!("AList fs/get 未返回文件数据"))
     }
 
     /// 本地计算 AList /d/ 路径的 HMAC-SHA256 签名直链（用于强制中转网盘兜底）

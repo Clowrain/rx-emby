@@ -60,7 +60,7 @@ pub(super) async fn authenticate_by_name(
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
                 .fetch_one(&state.db)
                 .await
-                .unwrap_or(0);
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             if count == 0 {
                 let new_id = Uuid::new_v4().simple().to_string()[..16].to_string();
                 sqlx::query(
@@ -95,10 +95,13 @@ pub(super) async fn authenticate_by_name(
     .bind(&client_name)
     .fetch_optional(&state.db)
     .await
-    .unwrap_or(None);
+    .map_err(|e| {
+        tracing::error!("查询已有访问令牌失败: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     let token = if let Some(tok) = existing_token {
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "UPDATE access_tokens SET device_id = $2, device_name = $3, client_name = $4, last_used_at = NOW() WHERE token = $1",
         )
         .bind(&tok)
@@ -106,20 +109,30 @@ pub(super) async fn authenticate_by_name(
         .bind(&device_name)
         .bind(&client_name)
         .execute(&state.db)
-        .await;
-        let _ = sqlx::query(
-            "DELETE FROM access_tokens WHERE user_id = $1 AND token <> $2 AND (device_id = $3 OR client_name = $4)",
+        .await
+        {
+            tracing::warn!("更新访问令牌设备信息失败: {}", e);
+        }
+        let removed: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM access_tokens WHERE user_id = $1 AND token <> $2 AND (device_id = $3 OR client_name = $4) RETURNING token",
         )
         .bind(&user_id)
         .bind(&tok)
         .bind(&device_id)
         .bind(&client_name)
-        .execute(&state.db)
-        .await;
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("清理同客户端旧访问令牌失败: {}", e);
+            Vec::new()
+        });
+        if !removed.is_empty() {
+            invalidate_token_cache(&state, &removed).await;
+        }
         tok
     } else {
         let new_tok = Uuid::new_v4().simple().to_string();
-        let _ = sqlx::query(
+        if let Err(e) = sqlx::query(
             "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&new_tok)
@@ -128,7 +141,10 @@ pub(super) async fn authenticate_by_name(
         .bind(&device_name)
         .bind(&client_name)
         .execute(&state.db)
-        .await;
+        .await
+        {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
         new_tok
     };
 
@@ -223,8 +239,14 @@ pub(super) async fn get_user_info(
     })))
 }
 
-pub(super) fn extract_emby_token(headers: &HeaderMap, api_key: Option<&str>) -> Option<String> {
-    if let Some(k) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
+/// 令牌被注销/吊销后使其内存校验缓存立即失效
+pub(in crate::web) async fn invalidate_token_cache(state: &AppState, tokens: &[String]) {
+    for tok in tokens {
+        state.caches.token_user_cache.invalidate(tok).await;
+    }
+}
+
+pub(super) fn extract_emby_token(headers: &HeaderMap, api_key: Option<&str>) -> Option<String> {    if let Some(k) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(k.to_string());
     }
     for key in ["x-emby-token", "x-mediabrowser-token"] {
@@ -277,31 +299,57 @@ pub(super) async fn resolve_valid_user_id_with_query(
         (StatusCode::UNAUTHORIZED, "缺少访问令牌，请先登录".to_string())
     })?;
 
-    let token_user: Option<(String, bool)> = sqlx::query_as(
-        r#"
-        SELECT u.id, u.is_admin
-        FROM access_tokens t
-        JOIN users u ON u.id = t.user_id
-        WHERE t.token = $1
-        "#,
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // 短 TTL 内存校验缓存：大多数请求免 PG JOIN；注销/吊销时通过 invalidate_token_cache 失效
+    let token_uid;
+    let is_admin;
+    if let Some(cached) = state.caches.token_user_cache.get(&token).await {
+        (token_uid, is_admin) = (cached.0.clone(), cached.1);
+    } else {
+        let token_user: Option<(String, bool)> = sqlx::query_as(
+            r#"
+            SELECT u.id, u.is_admin
+            FROM access_tokens t
+            JOIN users u ON u.id = t.user_id
+            WHERE t.token = $1
+            "#,
+        )
+        .bind(&token)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let (token_uid, is_admin) = token_user.ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, "访问令牌无效或已注销，请重新登录".to_string())
-    })?;
-
-    let db = state.db.clone();
-    let tok = token.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query("UPDATE access_tokens SET last_used_at = NOW() WHERE token = $1")
-            .bind(tok)
-            .execute(&db)
+        let (uid, admin) = token_user.ok_or_else(|| {
+            (StatusCode::UNAUTHORIZED, "访问令牌无效或已注销，请重新登录".to_string())
+        })?;
+        state
+            .caches
+            .token_user_cache
+            .insert(token.clone(), std::sync::Arc::new((uid.clone(), admin)))
             .await;
-    });
+        (token_uid, is_admin) = (uid, admin);
+    }
+
+    // last_used_at 去抖：同一 token 5 分钟窗口内至多触发一次 UPDATE，避免每个请求都写库
+    if state.caches.token_touch_debounce.get(&token).await.is_none() {
+        state
+            .caches
+            .token_touch_debounce
+            .insert(token.clone(), ())
+            .await;
+        let db = state.db.clone();
+        let tok = token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query(
+                "UPDATE access_tokens SET last_used_at = NOW() WHERE token = $1 AND last_used_at < NOW() - INTERVAL '5 minutes'",
+            )
+            .bind(&tok)
+            .execute(&db)
+            .await
+            {
+                tracing::warn!("更新访问令牌 last_used_at 失败: {}", e);
+            }
+        });
+    }
 
     if let Some(uid) = explicit_uid.map(str::trim).filter(|s| !s.is_empty()) {
         if uid != token_uid {

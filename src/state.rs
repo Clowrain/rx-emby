@@ -15,7 +15,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -41,6 +41,8 @@ pub struct AppState {
 pub struct AlistAuthManager {
     pub current_token: RwLock<Option<String>>,
     pub refresh_lock: Mutex<()>,
+    /// 最近一次成功登录时间，用于 401 风暴时判断是否已有并发协程完成刷新
+    pub last_refresh_at: RwLock<Option<Instant>>,
 }
 
 impl Default for AlistAuthManager {
@@ -48,6 +50,7 @@ impl Default for AlistAuthManager {
         Self {
             current_token: RwLock::new(None),
             refresh_lock: Mutex::new(()),
+            last_refresh_at: RwLock::new(None),
         }
     }
 }
@@ -101,7 +104,21 @@ pub struct CacheLayer {
     pub alist_direct_urls: Cache<String, String>,
     /// Key = AList 父目录路径，记录已通过 fs/list 预热过寻址的目录（避免短时间重复 list）
     pub alist_dir_prewarmed: Cache<String, ()>,
-    pub image_fetch_inflight: Cache<String, ()>,
+    /// Key = "{size}/{file_name}", Value = 图片字节流。
+    /// `try_get_with` 兼做真正的 singleflight：并发同图请求只放行一次回源/渲染并共享结果。
+    pub image_hot_bytes: Cache<String, Arc<Vec<u8>>>,
+    /// Key = "collage:{view_id}:{style}:{hash}", Value = 渲染完成的拼接封面字节流
+    pub collage_cache: Cache<String, Arc<Vec<u8>>>,
+    /// TMDB 图片出站下载并发上限（防止海报墙风暴打满反代带宽与连接池）
+    pub image_download_permits: Arc<Semaphore>,
+    /// 图片条目元数据查询缓存：Key = "{item_id}:{image_type}" -> (size, file_name)
+    pub image_meta_cache: Cache<String, Option<(String, String)>>,
+    /// LRU touch 写库去抖：Key = cache_key，TTL 窗口内同一 key 至多触发一次 UPDATE
+    pub image_lru_touch_debounce: Cache<String, ()>,
+    /// 访问令牌校验缓存：token -> (user_id, is_admin)，注销/吊销时需显式失效
+    pub token_user_cache: Cache<String, Arc<(String, bool)>>,
+    /// access_tokens.last_used_at 写库去抖：同一 token 在窗口内至多更新一次
+    pub token_touch_debounce: Cache<String, ()>,
     /// 后台概览与统计短时缓存（避免频繁切换 Tab 反复触发全表聚合扫描）
     pub admin_stats_cache: Cache<String, serde_json::Value>,
 }
@@ -144,8 +161,33 @@ impl AppState {
             .build();
 
         let inflight = Cache::builder()
+            .max_capacity(512)
+            .time_to_live(Duration::from_secs(600))
+            .build();
+
+        let collage_cache = Cache::builder()
+            .max_capacity(128)
+            .time_to_live(Duration::from_secs(3600))
+            .build();
+
+        let image_meta_cache = Cache::builder()
+            .max_capacity(20_000)
+            .time_to_live(Duration::from_secs(300))
+            .build();
+
+        let lru_touch_debounce = Cache::builder()
+            .max_capacity(50_000)
+            .time_to_live(Duration::from_secs(1800))
+            .build();
+
+        let token_user_cache = Cache::builder()
+            .max_capacity(2_000)
+            .time_to_live(Duration::from_secs(60))
+            .build();
+
+        let token_touch_debounce = Cache::builder()
             .max_capacity(5_000)
-            .time_to_live(Duration::from_secs(30))
+            .time_to_live(Duration::from_secs(300))
             .build();
 
         let admin_stats_cache = Cache::builder()
@@ -171,7 +213,13 @@ impl AppState {
             caches: CacheLayer {
                 alist_direct_urls: direct_urls,
                 alist_dir_prewarmed: dir_prewarmed,
-                image_fetch_inflight: inflight,
+                image_hot_bytes: inflight,
+                collage_cache,
+                image_download_permits: Arc::new(Semaphore::new(8)),
+                image_meta_cache,
+                image_lru_touch_debounce: lru_touch_debounce,
+                token_user_cache,
+                token_touch_debounce,
                 admin_stats_cache,
             },
             sessions: DashMap::new(),
@@ -257,6 +305,6 @@ pub fn build_alist_client() -> Result<Client> {
 }
 
 pub fn build_rate_limiter(per_sec: u32) -> SharedRateLimiter {
-    let quota = Quota::per_second(NonZeroU32::new(per_sec.max(1)).unwrap());
+    let quota = Quota::per_second(NonZeroU32::new(per_sec.max(1)).unwrap_or(NonZeroU32::MAX));
     RateLimiter::direct(quota)
 }

@@ -30,17 +30,20 @@ pub(super) async fn get_user_views(
         ("lib_variety", "综艺", "tvshows"),
     ];
 
-    let base_cover_rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT config_key, config_value FROM system_configs WHERE config_key LIKE 'base_lib_cover:%'",
+    let base_cover_rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT config_key, config_value, updated_at FROM system_configs WHERE config_key LIKE 'base_lib_cover:%'",
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
-    let base_cover_map: HashMap<String, String> = base_cover_rows
+    .unwrap_or_else(|e| {
+        tracing::warn!("查询基础库封面配置失败: {}", e);
+        Vec::new()
+    });
+    let base_cover_map: HashMap<String, (String, i64)> = base_cover_rows
         .into_iter()
-        .filter_map(|(k, v)| {
+        .filter_map(|(k, v, updated_at)| {
             k.strip_prefix("base_lib_cover:")
-                .map(|id| (id.to_string(), v))
+                .map(|id| (id.to_string(), (v, updated_at.timestamp())))
         })
         .collect();
 
@@ -53,7 +56,11 @@ pub(super) async fn get_user_views(
             }
         })
         .map(|(id, name, ctype)| {
-            let tag = compute_cover_image_tag(base_cover_map.get(id).map(|s| s.as_str()));
+            let (cover, revision) = base_cover_map
+                .get(id)
+                .map(|(v, r)| (Some(v.as_str()), *r))
+                .unwrap_or((None, 1));
+            let tag = compute_cover_image_tag(cover, revision);
             json!({
                 "Id": id,
                 "Name": name,
@@ -61,8 +68,7 @@ pub(super) async fn get_user_views(
                 "Type": "CollectionFolder",
                 "CollectionType": ctype,
                 "IsFolder": true,
-                "ImageTags": { "Primary": tag },
-                "BackdropImageTags": [tag]
+                "ImageTags": { "Primary": tag }
             })
         })
         .collect();
@@ -73,6 +79,10 @@ pub(super) async fn get_user_views(
     )
     .fetch_all(&state.db)
     .await
+    .map_err(|e| {
+        tracing::warn!("查询虚拟媒体库列表失败: {}", e);
+        Vec::<(i32, String, String, Option<String>, i64)>::new()
+    })
     .unwrap_or_default();
 
     for (vid, vname, icon_type, cover_image, revision) in vlibs {
@@ -86,7 +96,13 @@ pub(super) async fn get_user_views(
         } else {
             "tvshows"
         };
-        let image_tag = format!("{}_{}", compute_cover_image_tag(cover_image.as_deref()), revision);
+        let image_tag = format!(
+            "{}_{}",
+            compute_cover_image_tag(cover_image.as_deref(), revision),
+            revision
+        );
+        // 视图仅投放 Primary：图片接口对视图的 Backdrop 与 Primary 返回同一资源，
+        // 同时投放会诱发客户端冗余拉取
         items.push(json!({
             "Id": view_id,
             "Name": vname,
@@ -94,8 +110,7 @@ pub(super) async fn get_user_views(
             "Type": "CollectionFolder",
             "CollectionType": ctype,
             "IsFolder": true,
-            "ImageTags": { "Primary": image_tag },
-            "BackdropImageTags": [image_tag]
+            "ImageTags": { "Primary": image_tag }
         }));
     }
 
@@ -108,11 +123,17 @@ pub(super) async fn get_user_views(
 /// 获取用户被允许访问的分类集合：`None` 代表不限权限（管理员或包含 `*`），`Some(vec)` 代表受限分类列表
 pub(super) async fn get_user_allowed_categories(state: &AppState, user_id: &str) -> Option<Vec<String>> {
     let row: Option<(bool, Vec<String>)> =
-        sqlx::query_as("SELECT is_admin, allowed_categories FROM users WHERE id = $1")
+        match sqlx::query_as("SELECT is_admin, allowed_categories FROM users WHERE id = $1")
             .bind(user_id)
             .fetch_optional(&state.db)
             .await
-            .unwrap_or(None);
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!("查询用户分类权限失败 ({}): {}", user_id, e);
+                None
+            }
+        };
 
     match row {
         Some((is_admin, cats)) => {
@@ -128,14 +149,20 @@ pub(super) async fn get_user_allowed_categories(state: &AppState, user_id: &str)
 
 
 /// 统计某个虚拟媒体库规则当前在库内命中的影视作品数
-pub async fn count_virtual_library_matches(state: &AppState, rule: &VirtualLibraryRule) -> Result<i64, sqlx::Error> {
+pub async fn count_virtual_library_matches(
+    state: &AppState,
+    rule: &VirtualLibraryRule,
+) -> Result<i64, sqlx::Error> {
     let sql = format!(
         "SELECT COUNT(*) FROM media_works m WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE) AND $1::jsonb IS NOT NULL AND {}",
         rule.sql_predicate("$1::jsonb")
     );
+    let rule_json = serde_json::to_value(rule)
+        .map_err(|e| sqlx::Error::Configuration(e.into()))?;
     sqlx::query_scalar(&sql)
-        .bind(serde_json::to_value(rule).expect("已校验的规则"))
-        .fetch_one(&state.db).await
+        .bind(rule_json)
+        .fetch_one(&state.db)
+        .await
 }
 
 pub(super) fn base_library_category(item_id: &str) -> Option<&'static str> {

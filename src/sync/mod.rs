@@ -218,6 +218,7 @@ pub async fn run_sync_once(state: &AppState, force: bool) -> Result<()> {
     res
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn set_sync_progress(
     state: &AppState,
     log_id: i64,
@@ -320,8 +321,11 @@ async fn fetch_source_bytes(
         let resp = match resp_opt {
             Some(r) => r,
             None => {
-                return Err(last_err.unwrap())
-                    .with_context(|| format!("下载索引源失败: {}", source));
+                let error = match last_err {
+                    Some(error) => anyhow::Error::from(error),
+                    None => anyhow!("下载索引源请求未能完成"),
+                };
+                return Err(error).with_context(|| format!("下载索引源失败: {}", source));
             }
         };
         if resp.status() == StatusCode::NOT_MODIFIED {

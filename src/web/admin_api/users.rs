@@ -250,6 +250,7 @@ pub(super) async fn revoke_access_token(
         state
             .sessions
             .retain(|_, s| !(s.user_id == uid && s.device_name == dev));
+        crate::web::emby_api::invalidate_token_cache(&state, std::slice::from_ref(&token)).await;
     }
     state.caches.admin_stats_cache.invalidate_all();
 

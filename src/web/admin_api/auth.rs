@@ -234,6 +234,7 @@ pub(super) async fn admin_logout(
             .bind(&token)
             .execute(&state.db)
             .await;
+        crate::web::emby_api::invalidate_token_cache(&state, std::slice::from_ref(&token)).await;
     }
     Ok(Json(json!({ "status": "ok" })))
 }

@@ -4,7 +4,7 @@ use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{fs, time::sleep};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// 计算基于文件名 xxh3 哈希前 2 位十六进制的分片相对路径（如 `w500/3a/xxx.jpg`）
@@ -15,59 +15,55 @@ fn image_shard_rel_path(size: &str, file_name: &str) -> String {
 }
 
 impl AppState {
-    /// 获取图片字节流（开启磁盘缓存时自动落盘并防击穿；关闭磁盘缓存时直接通过后台网络拉取返回）
-    pub async fn get_or_fetch_tmdb_image(&self, size: &str, file_name: &str) -> Result<Vec<u8>> {
+    /// 获取图片字节流（开启磁盘缓存时自动落盘并防击穿；关闭磁盘缓存时直接回源返回）。
+    ///
+    /// `image_hot_bytes` 的 `try_get_with` 同时承担两层职责：
+    /// 1. 内存热缓存：热门海报/背景图命中后无需重复读盘；
+    /// 2. 真正的 singleflight：同一 `cache_key` 的并发请求只会执行一次回源，其余等待共享结果。
+    pub async fn get_or_fetch_tmdb_image(&self, size: &str, file_name: &str) -> Result<Arc<Vec<u8>>> {
         // 路径安全过滤，防止目录穿越攻击
         if size.contains("..") || file_name.contains("..") || file_name.contains('/') {
             return Err(anyhow!("非法的图片路径参数"));
         }
 
         let cache_key = format!("{}/{}", size, file_name);
+        let key = cache_key.clone();
+        let bytes = self
+            .caches
+            .image_hot_bytes
+            .try_get_with(cache_key, async { self.load_image_bytes(size, file_name, &key).await })
+            .await
+            .map_err(|e| anyhow!("{:#}", e))?;
+        Ok(bytes)
+    }
+
+    /// 实际加载逻辑：优先命中本地磁盘缓存，未命中则限流回源 TMDB 并原子落盘
+    async fn load_image_bytes(&self, size: &str, file_name: &str, cache_key: &str) -> Result<Arc<Vec<u8>>> {
         let cfg = self.config.load();
 
-        // 若未开启磁盘缓存，直接通过后台网络回源 TMDB 并返回字节流（不读写本地磁盘与 LRU 表）
-        if !cfg.image_disk_cache_enabled {
-            let remote_url = format!("{}/{}/{}", cfg.tmdb_image_base, size, file_name);
-            let client = self.tmdb_client.load();
-            let resp = client
-                .get(&remote_url)
-                .send()
-                .await
-                .with_context(|| format!("回源拉取 TMDB 图片失败: {}", remote_url))?
-                .error_for_status()?;
-            return Ok(resp.bytes().await?.to_vec());
-        }
-
-        let rel_path = image_shard_rel_path(size, file_name);
-        let full_path = cfg.image_cache_dir.join(&rel_path);
-        let legacy_path = cfg.image_cache_dir.join(size).join(file_name);
-
         // 1. 命中本地磁盘缓存（优先分片路径，兼容历史平铺路径）
-        if let Ok(bytes) = fs::read(&full_path).await {
-            self.touch_image_lru(&cache_key).await;
-            return Ok(bytes);
-        }
-        if let Ok(bytes) = fs::read(&legacy_path).await {
-            self.touch_image_lru(&cache_key).await;
-            return Ok(bytes);
+        if cfg.image_disk_cache_enabled {
+            let rel_path = image_shard_rel_path(size, file_name);
+            let full_path = cfg.image_cache_dir.join(&rel_path);
+            let legacy_path = cfg.image_cache_dir.join(size).join(file_name);
+
+            if let Ok(bytes) = fs::read(&full_path).await {
+                self.touch_image_lru(cache_key).await;
+                return Ok(Arc::new(bytes));
+            }
+            if let Ok(bytes) = fs::read(&legacy_path).await {
+                self.touch_image_lru(cache_key).await;
+                return Ok(Arc::new(bytes));
+            }
         }
 
-        // 2. Singleflight 防缓存击穿：同一张图片并发请求只放行一次回源
-        let _inflight_guard = self
+        // 2. 出站并发限流：避免海报墙同时打开过多 TMDB 下载连接
+        let _permit = self
             .caches
-            .image_fetch_inflight
-            .get_with(cache_key.clone(), async { () })
+            .image_download_permits
+            .clone()
+            .acquire_owned()
             .await;
-
-        // 二次检查是否已被前序并发请求落盘
-        if let Ok(bytes) = fs::read(&full_path).await {
-            self.touch_image_lru(&cache_key).await;
-            return Ok(bytes);
-        }
-        if let Ok(bytes) = fs::read(&legacy_path).await {
-            self.touch_image_lru(&cache_key).await;
-            return Ok(bytes);
-        }
 
         // 3. 回源 TMDB 图片源（自动走配置的代理与反代域名）
         let remote_url = format!("{}/{}/{}", cfg.tmdb_image_base, size, file_name);
@@ -79,45 +75,79 @@ impl AppState {
             .with_context(|| format!("回源拉取 TMDB 图片失败: {}", remote_url))?
             .error_for_status()?;
 
-        let bytes = resp.bytes().await?.to_vec();
-        let size_bytes = bytes.len() as i64;
+        let bytes = Arc::new(resp.bytes().await?.to_vec());
 
-        // 4. 异步写入本地分片磁盘并更新 LRU 索引
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent).await?;
+        // 4. 原子写入本地分片磁盘并更新 LRU 索引：先写同目录唯一临时文件再 rename 到位，
+        //    并发读端永远不会看到半截图片文件
+        if cfg.image_disk_cache_enabled {
+            let rel_path = image_shard_rel_path(size, file_name);
+            let full_path = cfg.image_cache_dir.join(&rel_path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            let tmp_path = full_path.with_extension(format!(
+                "tmp-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            fs::write(&tmp_path, bytes.as_ref()).await?;
+            if let Err(e) = fs::rename(&tmp_path, &full_path).await {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(e).with_context(|| format!("原子落盘图片失败: {}", full_path.display()));
+            }
+
+            if let Err(e) = sqlx::query(
+                r#"
+                INSERT INTO image_cache_index (cache_key, local_rel_path, size_bytes, last_accessed_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (cache_key) DO UPDATE SET
+                    local_rel_path = EXCLUDED.local_rel_path,
+                    size_bytes = EXCLUDED.size_bytes,
+                    last_accessed_at = NOW()
+                "#,
+            )
+            .bind(cache_key)
+            .bind(&rel_path)
+            .bind(bytes.len() as i64)
+            .execute(&self.db)
+            .await
+            {
+                warn!("写入图片缓存 LRU 索引失败 ({}): {}", cache_key, e);
+            }
+
+            // 刚落盘的内容 30 分钟去抖窗口内无需再 touch
+            self.caches
+                .image_lru_touch_debounce
+                .insert(cache_key.to_string(), ())
+                .await;
         }
-        fs::write(&full_path, &bytes).await?;
-
-        let _ = sqlx::query(
-            r#"
-            INSERT INTO image_cache_index (cache_key, local_rel_path, size_bytes, last_accessed_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (cache_key) DO UPDATE SET
-                local_rel_path = EXCLUDED.local_rel_path,
-                size_bytes = EXCLUDED.size_bytes,
-                last_accessed_at = NOW()
-            "#,
-        )
-        .bind(&cache_key)
-        .bind(&rel_path)
-        .bind(size_bytes)
-        .execute(&self.db)
-        .await;
 
         Ok(bytes)
     }
 
+    /// 去抖更新 LRU 访问时间：同一 key 在 30 分钟窗口内至多触发一次落库 UPDATE，
+    /// 避免海报墙浏览期间的每请求 PG 写放大
     async fn touch_image_lru(&self, cache_key: &str) {
+        if self.caches.image_lru_touch_debounce.get(cache_key).await.is_some() {
+            return;
+        }
+        self.caches
+            .image_lru_touch_debounce
+            .insert(cache_key.to_string(), ())
+            .await;
+
         let db = self.db.clone();
         let key = cache_key.to_string();
         tokio::spawn(async move {
-            // 仅当距上次更新时间超过 1 小时才执行写入，避免浏览海报墙时高频 UPDATE 引发 PG 写放大与 Vacuum 扫盘
-            let _ = sqlx::query(
+            // 仅当距上次更新时间超过 1 小时才执行写入
+            if let Err(e) = sqlx::query(
                 "UPDATE image_cache_index SET last_accessed_at = NOW() WHERE cache_key = $1 AND last_accessed_at < NOW() - INTERVAL '1 hour'",
             )
             .bind(&key)
             .execute(&db)
-            .await;
+            .await
+            {
+                warn!("更新图片 LRU 访问时间失败 ({}): {}", key, e);
+            }
         });
     }
 }
@@ -170,19 +200,33 @@ pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {
     let mut freed_bytes: i64 = 0;
     let mut deleted_count: usize = 0;
     let target_to_free = current_total - low_limit;
-    let mut last_seen_key: Option<String> = None;
+    // keyset 分页游标：必须与 ORDER BY (last_accessed_at, cache_key) 完全对齐使用元组比较，
+    // 单独用 cache_key > $1 在 cache_key 与 last_accessed_at 不单调一致时会漏扫/重扫
+    let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
 
     while freed_bytes < target_to_free {
-        let victims: Vec<(String, String, i64)> = if let Some(ref cursor) = last_seen_key {
+        let victims: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = if let Some((ts, key)) = &cursor {
             sqlx::query_as(
-                "SELECT cache_key, local_rel_path, size_bytes FROM image_cache_index WHERE cache_key > $1 ORDER BY last_accessed_at ASC, cache_key ASC LIMIT 2000",
+                r#"
+                SELECT cache_key, local_rel_path, size_bytes, last_accessed_at
+                FROM image_cache_index
+                WHERE (last_accessed_at, cache_key) > ($1, $2)
+                ORDER BY last_accessed_at ASC, cache_key ASC
+                LIMIT 2000
+                "#,
             )
-            .bind(cursor)
+            .bind(ts)
+            .bind(key)
             .fetch_all(&state.db)
             .await?
         } else {
             sqlx::query_as(
-                "SELECT cache_key, local_rel_path, size_bytes FROM image_cache_index ORDER BY last_accessed_at ASC, cache_key ASC LIMIT 2000",
+                r#"
+                SELECT cache_key, local_rel_path, size_bytes, last_accessed_at
+                FROM image_cache_index
+                ORDER BY last_accessed_at ASC, cache_key ASC
+                LIMIT 2000
+                "#,
             )
             .fetch_all(&state.db)
             .await?
@@ -191,10 +235,10 @@ pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {
         if victims.is_empty() {
             break;
         }
-        last_seen_key = victims.last().map(|(k, _, _)| k.clone());
+        cursor = victims.last().map(|(key, _, _, ts)| (*ts, key.clone()));
 
         let mut deleted_keys = Vec::new();
-        for (key, rel_path, sz) in victims {
+        for (key, rel_path, sz, _) in victims {
             if freed_bytes >= target_to_free {
                 break;
             }
@@ -203,7 +247,7 @@ pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {
                 Ok(()) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                 Err(e) => {
-                    tracing::warn!("删除图片缓存文件失败 ({}): {}", file_path.display(), e);
+                    warn!("删除图片缓存文件失败 ({}): {}", file_path.display(), e);
                     false
                 }
             };

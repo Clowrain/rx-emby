@@ -91,13 +91,16 @@ fn pick_img<'a>(posters: &'a [DynamicImage], backdrop: Option<&'a DynamicImage>,
     if !posters.is_empty() {
         &posters[idx % posters.len()]
     } else {
-        backdrop.unwrap()
+        backdrop.unwrap_or_else(|| {
+            static FALLBACK: std::sync::OnceLock<DynamicImage> = std::sync::OnceLock::new();
+            FALLBACK.get_or_init(|| DynamicImage::new_rgba8(1, 1))
+        })
     }
 }
 
 /// 1. 立体叠放卡片：模糊暗色剧照底图 + 3 张微倾圆角海报 + 柔和投影
 fn render_cards(posters: &[DynamicImage], backdrop: Option<&DynamicImage>) -> RgbaImage {
-    let bg_src = backdrop.unwrap_or_else(|| &posters[0]);
+    let bg_src = pick_img(posters, backdrop, 0);
     let small_w = 160;
     let small_h = 90;
     let small_bg = fit_cover(bg_src, small_w, small_h);
@@ -246,7 +249,7 @@ fn render_diagonal(posters: &[DynamicImage], backdrop: Option<&DynamicImage>) ->
 /// 3. 1 主 3 辅非对称：左侧主剧照渐变过渡 + 右侧 3 张精选缩略图
 fn render_hero(posters: &[DynamicImage], backdrop: Option<&DynamicImage>) -> RgbaImage {
     let mut canvas = RgbaImage::from_pixel(COVER_W, COVER_H, Rgba([10, 12, 18, 255]));
-    let hero_img = backdrop.unwrap_or_else(|| &posters[0]);
+    let hero_img = pick_img(posters, backdrop, 0);
     let hero = fit_cover(hero_img, 650, COVER_H);
 
     // 绘制左侧主视觉（在 x: 540..650 平滑淡出）

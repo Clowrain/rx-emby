@@ -105,7 +105,10 @@ async fn serve_embedded_file(clean_path: &str) -> Response {
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime)
                 .body(axum::body::Body::from(content.data.into_owned()))
-                .unwrap()
+                .unwrap_or_else(|error| {
+                    tracing::error!("构建静态资源响应失败: {}", error);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "静态资源响应构建失败").into_response()
+                })
         }
         None => serve_index().await.into_response(),
     }

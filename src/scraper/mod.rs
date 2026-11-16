@@ -255,6 +255,7 @@ fn titles_similar(local_title: &str, tmdb_title: &str, tmdb_orig: Option<&str>) 
 }
 
 /// 4 维度交叉校验：基本类型、片名相似度（含原名）、发行年份容差、本地多集结构
+#[allow(clippy::too_many_arguments)]
 fn verify_tmdb_match(
     clean_title: &str,
     local_year: Option<i32>,
