@@ -2,7 +2,12 @@ pub mod collage;
 
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use bytes::Bytes;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{fs, time::sleep};
 use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
@@ -14,13 +19,29 @@ fn image_shard_rel_path(size: &str, file_name: &str) -> String {
     format!("{}/{:02x}/{}", size, shard, file_name)
 }
 
+async fn atomic_write_image_file(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    if let Err(error) = fs::write(&tmp_path, data).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(error).with_context(|| format!("原子落盘图片失败: {}", path.display()));
+    }
+    if let Err(error) = fs::rename(&tmp_path, path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(error).with_context(|| format!("原子落盘图片失败: {}", path.display()));
+    }
+    Ok(())
+}
+
 impl AppState {
     /// 获取图片字节流（开启磁盘缓存时自动落盘并防击穿；关闭磁盘缓存时直接回源返回）。
     ///
     /// `image_hot_bytes` 的 `try_get_with` 同时承担两层职责：
     /// 1. 内存热缓存：热门海报/背景图命中后无需重复读盘；
     /// 2. 真正的 singleflight：同一 `cache_key` 的并发请求只会执行一次回源，其余等待共享结果。
-    pub async fn get_or_fetch_tmdb_image(&self, size: &str, file_name: &str) -> Result<Arc<Vec<u8>>> {
+    pub async fn get_or_fetch_tmdb_image(&self, size: &str, file_name: &str) -> Result<Bytes> {
         // 路径安全过滤，防止目录穿越攻击
         if size.contains("..") || file_name.contains("..") || file_name.contains('/') {
             return Err(anyhow!("非法的图片路径参数"));
@@ -31,14 +52,21 @@ impl AppState {
         let bytes = self
             .caches
             .image_hot_bytes
-            .try_get_with(cache_key, async { self.load_image_bytes(size, file_name, &key).await })
+            .try_get_with(cache_key, async {
+                self.load_image_bytes(size, file_name, &key).await
+            })
             .await
             .map_err(|e| anyhow!("{:#}", e))?;
         Ok(bytes)
     }
 
     /// 实际加载逻辑：优先命中本地磁盘缓存，未命中则限流回源 TMDB 并原子落盘
-    async fn load_image_bytes(&self, size: &str, file_name: &str, cache_key: &str) -> Result<Arc<Vec<u8>>> {
+    async fn load_image_bytes(
+        &self,
+        size: &str,
+        file_name: &str,
+        cache_key: &str,
+    ) -> Result<Bytes> {
         let cfg = self.config.load();
 
         // 1. 命中本地磁盘缓存（优先分片路径，兼容历史平铺路径）
@@ -49,11 +77,11 @@ impl AppState {
 
             if let Ok(bytes) = fs::read(&full_path).await {
                 self.touch_image_lru(cache_key).await;
-                return Ok(Arc::new(bytes));
+                return Ok(Bytes::from(bytes));
             }
             if let Ok(bytes) = fs::read(&legacy_path).await {
                 self.touch_image_lru(cache_key).await;
-                return Ok(Arc::new(bytes));
+                return Ok(Bytes::from(bytes));
             }
         }
 
@@ -75,25 +103,14 @@ impl AppState {
             .with_context(|| format!("回源拉取 TMDB 图片失败: {}", remote_url))?
             .error_for_status()?;
 
-        let bytes = Arc::new(resp.bytes().await?.to_vec());
+        let bytes = resp.bytes().await?;
 
         // 4. 原子写入本地分片磁盘并更新 LRU 索引：先写同目录唯一临时文件再 rename 到位，
         //    并发读端永远不会看到半截图片文件
         if cfg.image_disk_cache_enabled {
             let rel_path = image_shard_rel_path(size, file_name);
             let full_path = cfg.image_cache_dir.join(&rel_path);
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            let tmp_path = full_path.with_extension(format!(
-                "tmp-{}",
-                uuid::Uuid::new_v4().simple()
-            ));
-            fs::write(&tmp_path, bytes.as_ref()).await?;
-            if let Err(e) = fs::rename(&tmp_path, &full_path).await {
-                let _ = fs::remove_file(&tmp_path).await;
-                return Err(e).with_context(|| format!("原子落盘图片失败: {}", full_path.display()));
-            }
+            atomic_write_image_file(&full_path, bytes.as_ref()).await?;
 
             if let Err(e) = sqlx::query(
                 r#"
@@ -127,7 +144,13 @@ impl AppState {
     /// 去抖更新 LRU 访问时间：同一 key 在 30 分钟窗口内至多触发一次落库 UPDATE，
     /// 避免海报墙浏览期间的每请求 PG 写放大
     async fn touch_image_lru(&self, cache_key: &str) {
-        if self.caches.image_lru_touch_debounce.get(cache_key).await.is_some() {
+        if self
+            .caches
+            .image_lru_touch_debounce
+            .get(cache_key)
+            .await
+            .is_some()
+        {
             return;
         }
         self.caches
@@ -205,32 +228,33 @@ pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {
     let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
 
     while freed_bytes < target_to_free {
-        let victims: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> = if let Some((ts, key)) = &cursor {
-            sqlx::query_as(
-                r#"
+        let victims: Vec<(String, String, i64, chrono::DateTime<chrono::Utc>)> =
+            if let Some((ts, key)) = &cursor {
+                sqlx::query_as(
+                    r#"
                 SELECT cache_key, local_rel_path, size_bytes, last_accessed_at
                 FROM image_cache_index
                 WHERE (last_accessed_at, cache_key) > ($1, $2)
                 ORDER BY last_accessed_at ASC, cache_key ASC
                 LIMIT 2000
                 "#,
-            )
-            .bind(ts)
-            .bind(key)
-            .fetch_all(&state.db)
-            .await?
-        } else {
-            sqlx::query_as(
-                r#"
+                )
+                .bind(ts)
+                .bind(key)
+                .fetch_all(&state.db)
+                .await?
+            } else {
+                sqlx::query_as(
+                    r#"
                 SELECT cache_key, local_rel_path, size_bytes, last_accessed_at
                 FROM image_cache_index
                 ORDER BY last_accessed_at ASC, cache_key ASC
                 LIMIT 2000
                 "#,
-            )
-            .fetch_all(&state.db)
-            .await?
-        };
+                )
+                .fetch_all(&state.db)
+                .await?
+            };
 
         if victims.is_empty() {
             break;
@@ -280,7 +304,91 @@ pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::image_shard_rel_path;
+    use super::{atomic_write_image_file, image_shard_rel_path};
+    use bytes::Bytes;
+    use moka::future::Cache;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn same_key_concurrent_loads_are_coalesced() {
+        let cache: Cache<String, Bytes> = Cache::builder()
+            .max_capacity(1024)
+            .weigher(|_key: &String, value: &Bytes| value.len() as u32)
+            .build();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut requests = Vec::new();
+
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let loads = loads.clone();
+            requests.push(tokio::spawn(async move {
+                cache
+                    .try_get_with("same-image".to_string(), async move {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        sleep(Duration::from_millis(30)).await;
+                        Ok::<_, &'static str>(Bytes::from_static(b"image"))
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        for request in requests {
+            assert_eq!(request.await.unwrap().as_ref(), b"image");
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn hot_cache_capacity_is_weighted_by_image_bytes() {
+        let cache: Cache<String, Bytes> = Cache::builder()
+            .max_capacity(5)
+            .weigher(|_key: &String, value: &Bytes| value.len() as u32)
+            .build();
+
+        cache
+            .insert("large".to_string(), Bytes::from(vec![1; 4]))
+            .await;
+        cache.run_pending_tasks().await;
+        cache
+            .insert("small".to_string(), Bytes::from(vec![2; 3]))
+            .await;
+        cache.run_pending_tasks().await;
+
+        let large = cache.get(&"large".to_string()).await;
+        let small = cache.get(&"small".to_string()).await;
+        assert!(
+            large.is_some() || small.is_some(),
+            "the cache should retain an entry"
+        );
+        assert!(
+            large.is_none() || small.is_none(),
+            "byte weights must force one eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_image_write_leaves_no_temporary_files() {
+        let root =
+            std::env::temp_dir().join(format!("rx-emby-image-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let destination = root.join("poster.jpg");
+        atomic_write_image_file(&destination, b"image-bytes")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"image-bytes");
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["poster.jpg"]);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[test]
     fn test_image_shard_rel_path() {
@@ -292,7 +400,9 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], "w500");
         assert_eq!(parts[1].len(), 2);
-        assert!(parts[1].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(parts[1]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(parts[2], "18vQBzGNLrEYCUaU9SaWanpms8D.jpg");
     }
 }

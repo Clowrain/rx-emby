@@ -1,13 +1,5 @@
-use crate::{
-    config::BootstrapFileConfig,
-    image_cache::enforce_image_cache_quota,
-    state::AppState,
-};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use crate::{config::BootstrapFileConfig, image_cache::enforce_image_cache_quota, state::AppState};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
@@ -75,7 +67,9 @@ pub(super) async fn update_configs(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    Ok(Json(json!({ "status": "ok", "message": "设置已保存并立即生效" })))
+    Ok(Json(
+        json!({ "status": "ok", "message": "设置已保存并立即生效" }),
+    ))
 }
 
 pub(super) async fn trigger_sync(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -147,7 +141,12 @@ pub(super) async fn list_sync_logs(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // 复用 10s 缓存提供轻量级元数据扩展覆盖率统计，避免前端额外触发 smart_view_options 的 7 次 JSONB 全表扫描
-    let metadata = if let Some(cached) = state.caches.admin_stats_cache.get("sync_metadata_stats").await {
+    let metadata = if let Some(cached) = state
+        .caches
+        .admin_stats_cache
+        .get("sync_metadata_stats")
+        .await
+    {
         cached
     } else {
         let stats: (i64, i64, i64, i64) = sqlx::query_as(
@@ -229,7 +228,6 @@ pub(super) async fn trigger_cache_evict(
     })))
 }
 
-
 pub(super) async fn get_admin_overview(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -252,7 +250,13 @@ pub(super) async fn get_admin_overview(
     .await
     .unwrap_or(0);
 
-    let (verified_folders_count, pending_count, conflict_count, failed_count, ignored_count): (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let (verified_folders_count, pending_count, conflict_count, failed_count, ignored_count): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
         r#"
         SELECT
             COUNT(*) FILTER (WHERE NOT is_ignored AND scrape_state = 'verified'),
@@ -310,10 +314,11 @@ pub(super) async fn get_admin_overview(
     .await
     .unwrap_or(None);
 
-    let vlib_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM virtual_libraries WHERE is_enabled = TRUE")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
+    let vlib_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM virtual_libraries WHERE is_enabled = TRUE")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
 
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(&state.db)
@@ -413,4 +418,3 @@ pub(super) async fn trigger_resource_sample(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     get_resource_metrics(State(state)).await
 }
-

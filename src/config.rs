@@ -33,7 +33,9 @@ impl Default for ServerSection {
             bind_addr: "0.0.0.0:8096".to_string(),
             server_id: "rx-emby-nas-01".to_string(),
             server_name: "RX-Emby Media Server".to_string(),
-            database_url: "postgres://media_admin:rx_emby_strong_password@127.0.0.1:5432/xiaoya_media".to_string(),
+            database_url:
+                "postgres://media_admin:rx_emby_strong_password@127.0.0.1:5432/xiaoya_media"
+                    .to_string(),
         }
     }
 }
@@ -222,7 +224,10 @@ impl BootstrapFileConfig {
         env_str("ALIST_PASSWORD", &mut self.alist.password);
         env_str("ALIST_OTP_SECRET", &mut self.alist.otp_secret);
         env_str("ALIST_PATH_PREFIX", &mut self.alist.path_prefix);
-        env_parse("ALIST_DIRECT_URL_TTL_SEC", &mut self.alist.direct_url_ttl_sec);
+        env_parse(
+            "ALIST_DIRECT_URL_TTL_SEC",
+            &mut self.alist.direct_url_ttl_sec,
+        );
 
         // [tmdb]
         env_str("TMDB_API_KEY", &mut self.tmdb.api_key);
@@ -233,7 +238,10 @@ impl BootstrapFileConfig {
         env_parse("TMDB_RATE_LIMIT_PER_SEC", &mut self.tmdb.rate_limit_per_sec);
 
         // [image_cache]
-        env_parse("IMAGE_CACHE_DISK_ENABLED", &mut self.image_cache.disk_cache_enabled);
+        env_parse(
+            "IMAGE_CACHE_DISK_ENABLED",
+            &mut self.image_cache.disk_cache_enabled,
+        );
         env_str("IMAGE_CACHE_DIR", &mut self.image_cache.cache_dir);
         env_parse("IMAGE_CACHE_MAX_SIZE_MB", &mut self.image_cache.max_size_mb);
         env_parse(
@@ -345,19 +353,85 @@ impl DynamicConfig {
             };
         }
 
-        merge_field!("sync.strm_txt_source", self.strm_txt_source, "string", "Xiaoya strm.txt 源地址或路径", |s: &str| Ok::<_, ()>(s.to_string()));
-        merge_field!("sync.sync_interval_sec", self.sync_interval_sec, "int", "增量同步间隔(秒)", |s: &str| s.parse::<u64>());
-        merge_field!("sync.parse_concurrency", self.parse_concurrency, "int", "流式解析并发数", |s: &str| s.parse::<usize>());
-        merge_field!("sync.db_batch_size", self.db_batch_size, "int", "数据库批量写入事务大小", |s: &str| s.parse::<usize>());
-        merge_field!("sync.include_prefixes", self.sync_include_prefixes, "string", "同步目录白名单前缀(逗号分隔,留空全收)", |s: &str| Ok::<_, ()>(s.to_string()));
-        merge_field!("sync.exclude_keywords", self.sync_exclude_keywords, "string", "同步排除关键词(逗号分隔)", |s: &str| Ok::<_, ()>(s.to_string()));
-        merge_field!("sync.max_lines_limit", self.sync_max_lines_limit, "int", "单次最大解析行数(0为不限,调试可设5000)", |s: &str| s.parse::<usize>());
+        merge_field!(
+            "sync.strm_txt_source",
+            self.strm_txt_source,
+            "string",
+            "Xiaoya strm.txt 源地址或路径",
+            |s: &str| Ok::<_, ()>(s.to_string())
+        );
+        merge_field!(
+            "sync.sync_interval_sec",
+            self.sync_interval_sec,
+            "int",
+            "增量同步间隔(秒)",
+            |s: &str| s.parse::<u64>()
+        );
+        merge_field!(
+            "sync.parse_concurrency",
+            self.parse_concurrency,
+            "int",
+            "流式解析并发数",
+            |s: &str| s.parse::<usize>()
+        );
+        merge_field!(
+            "sync.db_batch_size",
+            self.db_batch_size,
+            "int",
+            "数据库批量写入事务大小",
+            |s: &str| s.parse::<usize>()
+        );
+        merge_field!(
+            "sync.include_prefixes",
+            self.sync_include_prefixes,
+            "string",
+            "同步目录白名单前缀(逗号分隔,留空全收)",
+            |s: &str| Ok::<_, ()>(s.to_string())
+        );
+        merge_field!(
+            "sync.exclude_keywords",
+            self.sync_exclude_keywords,
+            "string",
+            "同步排除关键词(逗号分隔)",
+            |s: &str| Ok::<_, ()>(s.to_string())
+        );
+        merge_field!(
+            "sync.max_lines_limit",
+            self.sync_max_lines_limit,
+            "int",
+            "单次最大解析行数(0为不限,调试可设5000)",
+            |s: &str| s.parse::<usize>()
+        );
 
-        merge_field!("scraper.auto_background", self.scraper_auto_background, "bool", "是否开启后台全库自动刮削(false则仅点开时按需刮削)", |s: &str| s.parse::<bool>());
+        merge_field!(
+            "scraper.auto_background",
+            self.scraper_auto_background,
+            "bool",
+            "是否开启后台全库自动刮削(false则仅点开时按需刮削)",
+            |s: &str| s.parse::<bool>()
+        );
 
-        merge_field!("alist.base_url", self.alist_base_url, "string", "AList 服务基础地址", |s: &str| Ok::<_, ()>(s.trim_end_matches('/').to_string()));
-        merge_field!("alist.username", self.alist_username, "string", "AList 登录账号", |s: &str| Ok::<_, ()>(s.to_string()));
-        merge_field!("alist.password", self.alist_password, "secret", "AList 登录密码", |s: &str| Ok::<_, ()>(s.to_string()));
+        merge_field!(
+            "alist.base_url",
+            self.alist_base_url,
+            "string",
+            "AList 服务基础地址",
+            |s: &str| Ok::<_, ()>(s.trim_end_matches('/').to_string())
+        );
+        merge_field!(
+            "alist.username",
+            self.alist_username,
+            "string",
+            "AList 登录账号",
+            |s: &str| Ok::<_, ()>(s.to_string())
+        );
+        merge_field!(
+            "alist.password",
+            self.alist_password,
+            "secret",
+            "AList 登录密码",
+            |s: &str| Ok::<_, ()>(s.to_string())
+        );
         if let Some(raw_otp) = db_map.remove("alist.otp_secret") {
             self.alist_otp_secret = non_empty_opt(&raw_otp);
         } else {
@@ -369,13 +443,49 @@ impl DynamicConfig {
             .execute(db)
             .await?;
         }
-        merge_field!("alist.path_prefix", self.alist_path_prefix, "string", "小雅挂载子目录前缀", |s: &str| Ok::<_, ()>(normalize_prefix(s)));
-        merge_field!("alist.direct_url_ttl_sec", self.direct_url_ttl_sec, "int", "直链内存缓存有效期(秒)", |s: &str| s.parse::<u64>());
+        merge_field!(
+            "alist.path_prefix",
+            self.alist_path_prefix,
+            "string",
+            "小雅挂载子目录前缀",
+            |s: &str| Ok::<_, ()>(normalize_prefix(s))
+        );
+        merge_field!(
+            "alist.direct_url_ttl_sec",
+            self.direct_url_ttl_sec,
+            "int",
+            "直链内存缓存有效期(秒)",
+            |s: &str| s.parse::<u64>()
+        );
 
-        merge_field!("tmdb.api_key", self.tmdb_api_key, "secret", "TMDB API Key", |s: &str| Ok::<_, ()>(s.to_string()));
-        merge_field!("tmdb.api_base_url", self.tmdb_api_base, "string", "TMDB API 基础地址", |s: &str| Ok::<_, ()>(s.trim_end_matches('/').to_string()));
-        merge_field!("tmdb.image_base_url", self.tmdb_image_base, "string", "TMDB 图片源基础地址", |s: &str| Ok::<_, ()>(s.trim_end_matches('/').to_string()));
-        merge_field!("tmdb.rate_limit_per_sec", self.tmdb_rate_limit_per_sec, "int", "TMDB 每秒请求限流数", |s: &str| s.parse::<u32>().map(|v| v.max(1)));
+        merge_field!(
+            "tmdb.api_key",
+            self.tmdb_api_key,
+            "secret",
+            "TMDB API Key",
+            |s: &str| Ok::<_, ()>(s.to_string())
+        );
+        merge_field!(
+            "tmdb.api_base_url",
+            self.tmdb_api_base,
+            "string",
+            "TMDB API 基础地址",
+            |s: &str| Ok::<_, ()>(s.trim_end_matches('/').to_string())
+        );
+        merge_field!(
+            "tmdb.image_base_url",
+            self.tmdb_image_base,
+            "string",
+            "TMDB 图片源基础地址",
+            |s: &str| Ok::<_, ()>(s.trim_end_matches('/').to_string())
+        );
+        merge_field!(
+            "tmdb.rate_limit_per_sec",
+            self.tmdb_rate_limit_per_sec,
+            "int",
+            "TMDB 每秒请求限流数",
+            |s: &str| s.parse::<u32>().map(|v| v.max(1))
+        );
 
         if let Some(raw_proxy) = db_map.remove("tmdb.proxy_url") {
             self.tmdb_proxy_url = non_empty_opt(&raw_proxy);
@@ -403,10 +513,34 @@ impl DynamicConfig {
             .execute(db)
             .await?;
         }
-        merge_field!("image_cache.disk_cache_enabled", self.image_disk_cache_enabled, "bool", "是否将海报与剧照缓存到本地磁盘", |s: &str| s.parse::<bool>());
-        merge_field!("image_cache.max_size_mb", self.image_max_size_mb, "int", "图片磁盘缓存上限(MB)", |s: &str| s.parse::<u64>());
-        merge_field!("image_cache.evict_high_watermark", self.image_evict_high_watermark, "float", "图片缓存清理高水位线", |s: &str| s.parse::<f64>());
-        merge_field!("image_cache.evict_low_watermark", self.image_evict_low_watermark, "float", "图片缓存清理低水位线", |s: &str| s.parse::<f64>());
+        merge_field!(
+            "image_cache.disk_cache_enabled",
+            self.image_disk_cache_enabled,
+            "bool",
+            "是否将海报与剧照缓存到本地磁盘",
+            |s: &str| s.parse::<bool>()
+        );
+        merge_field!(
+            "image_cache.max_size_mb",
+            self.image_max_size_mb,
+            "int",
+            "图片磁盘缓存上限(MB)",
+            |s: &str| s.parse::<u64>()
+        );
+        merge_field!(
+            "image_cache.evict_high_watermark",
+            self.image_evict_high_watermark,
+            "float",
+            "图片缓存清理高水位线",
+            |s: &str| s.parse::<f64>()
+        );
+        merge_field!(
+            "image_cache.evict_low_watermark",
+            self.image_evict_low_watermark,
+            "float",
+            "图片缓存清理低水位线",
+            |s: &str| s.parse::<f64>()
+        );
 
         Ok(self)
     }

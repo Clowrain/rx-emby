@@ -49,7 +49,9 @@ pub(in crate::web) fn build_search_pattern(term: Option<&str>) -> Option<String>
 
 /// 当搜索词是纯数字时，额外精确匹配 `media_works.tmdb_id`
 pub(in crate::web) fn numeric_tmdb_id(term: Option<&str>) -> Option<i32> {
-    term.map(str::trim).filter(|s| !s.is_empty()).and_then(|s| s.parse::<i32>().ok())
+    term.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i32>().ok())
 }
 
 #[cfg(test)]

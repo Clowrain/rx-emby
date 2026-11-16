@@ -3,8 +3,8 @@ mod config;
 mod image_cache;
 mod monitor;
 mod scraper;
-mod state;
 mod smart_views;
+mod state;
 mod sync;
 mod web;
 
@@ -55,7 +55,10 @@ async fn main() -> Result<()> {
     // 5. 预热 AList 自动登录
     match app_state.get_alist_token(false).await {
         Ok(_) => info!("AList 账号鉴权预热成功"),
-        Err(e) => warn!("AList 鉴权预热跳过（请在 config.toml 或后台配置真实账号密码）: {}", e),
+        Err(e) => warn!(
+            "AList 鉴权预热跳过（请在 config.toml 或后台配置真实账号密码）: {}",
+            e
+        ),
     }
 
     // 6. 拉起后台异步工作协程

@@ -474,7 +474,8 @@ pub async fn scrape_single_folder_with_mode(
 
                 state.caches.admin_stats_cache.invalidate_all();
                 if work.media_type == "tv" {
-                    scrape_tv_seasons(state, work.id, tid, work.year.or(folder.year), is_p0).await?;
+                    scrape_tv_seasons(state, work.id, tid, work.year.or(folder.year), is_p0)
+                        .await?;
                 }
                 return Ok(());
             }
@@ -512,7 +513,12 @@ pub async fn scrape_single_folder_with_mode(
                             folder.id, tid, reason
                         );
                         match state
-                            .scrape_tmdb_metadata(None, effective_type, &folder.clean_title, folder.year)
+                            .scrape_tmdb_metadata(
+                                None,
+                                effective_type,
+                                &folder.clean_title,
+                                folder.year,
+                            )
                             .await
                         {
                             Ok(fb) => {
@@ -590,9 +596,14 @@ pub async fn scrape_single_folder_with_mode(
             );
 
             if meta.media_type == "tv" {
-                if let Err(e) =
-                    scrape_tv_seasons(state, work_id, meta.tmdb_id, meta.year.or(folder.year), is_p0)
-                        .await
+                if let Err(e) = scrape_tv_seasons(
+                    state,
+                    work_id,
+                    meta.tmdb_id,
+                    meta.year.or(folder.year),
+                    is_p0,
+                )
+                .await
                 {
                     debug!("作品 work_id={} 分集刮削部分异常: {:#}", work_id, e);
                 }
@@ -614,7 +625,10 @@ pub async fn scrape_single_folder_with_mode(
             .execute(&state.db)
             .await?;
             state.caches.admin_stats_cache.invalidate_all();
-            info!("⚠️ [Scraper] 目录校验存疑 folder_id={}: {}", folder.id, conflict_reason);
+            info!(
+                "⚠️ [Scraper] 目录校验存疑 folder_id={}: {}",
+                folder.id, conflict_reason
+            );
         }
         Err(e) => {
             let next_retry = folder.retry_count + 1;
@@ -642,11 +656,7 @@ pub async fn scrape_single_folder_with_mode(
 }
 
 /// 刷新正式作品（扩展元数据 + 剧集季/分集）
-pub async fn scrape_work_seasons_by_id(
-    state: &AppState,
-    work_id: i64,
-    is_p0: bool,
-) -> Result<()> {
+pub async fn scrape_work_seasons_by_id(state: &AppState, work_id: i64, is_p0: bool) -> Result<()> {
     let row: Option<WorkSummaryRow> = sqlx::query_as(
         "SELECT id, media_type, tmdb_id, title, original_title, year, is_locked, metadata_version, metadata_refresh_requested, metadata_retry_count FROM media_works WHERE id = $1",
     )
@@ -927,7 +937,10 @@ pub async fn scrape_tv_seasons(
                 .await?;
             }
             Err(e) => {
-                debug!("拉取 TMDB 剧集季失败 (tmdb_id={}, S{:02}): {:#}", tmdb_id, season_num, e);
+                debug!(
+                    "拉取 TMDB 剧集季失败 (tmdb_id={}, S{:02}): {:#}",
+                    tmdb_id, season_num, e
+                );
                 sqlx::query(
                     "UPDATE work_seasons SET scrape_attempts = LEAST(GREATEST(scrape_attempts, 0) + 1, 5) WHERE work_id = $1 AND season_number = $2",
                 )

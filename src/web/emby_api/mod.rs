@@ -22,7 +22,7 @@ use axum::{
 #[cfg(test)]
 use images::fetch_virtual_library_top_media_images;
 #[cfg(test)]
-use items::{get_user_items, ItemsQuery};
+use items::{get_item_detail, get_user_items, ItemsQuery};
 #[cfg(test)]
 use serde_json::{json, Value};
 #[cfg(test)]
@@ -43,14 +43,20 @@ pub fn router() -> Router<Arc<AppState>> {
     let core = Router::new()
         .route("/System/Info/Public", get(auth::system_info_public))
         .route("/System/Info", get(auth::system_info_public))
-        .route("/Users/AuthenticateByName", post(auth::authenticate_by_name))
+        .route(
+            "/Users/AuthenticateByName",
+            post(auth::authenticate_by_name),
+        )
         .route("/Users/:user_id", get(auth::get_user_info))
         .route("/Users/:user_id/Views", get(views::get_user_views))
         .route("/Users/:user_id/Items", get(items::get_user_items))
         .route("/Users/:user_id/Items/Resume", get(items::get_resume_items))
         .route("/Users/:user_id/Items/Latest", get(items::get_latest_items))
         .route("/Users/:user_id/Items/Root", get(items::get_root_folder))
-        .route("/Users/:user_id/Items/:item_id", get(items::get_item_detail))
+        .route(
+            "/Users/:user_id/Items/:item_id",
+            get(items::get_item_detail),
+        )
         .route(
             "/Users/:user_id/PlayedItems/:item_id",
             post(sessions::mark_item_played).delete(sessions::unmark_item_played),
@@ -66,16 +72,31 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/Shows/NextUp", get(items::get_next_up_items))
         .route("/Shows/:series_id/Seasons", get(items::get_show_seasons))
         .route("/Shows/:series_id/Episodes", get(items::get_show_episodes))
-        .route("/Items/:item_id/PlaybackInfo", post(playback::get_playback_info).get(playback::get_playback_info))
-        .route("/Users/:user_id/Items/:item_id/PlaybackInfo", post(playback::get_user_playback_info).get(playback::get_user_playback_info))
+        .route(
+            "/Items/:item_id/PlaybackInfo",
+            post(playback::get_playback_info).get(playback::get_playback_info),
+        )
+        .route(
+            "/Users/:user_id/Items/:item_id/PlaybackInfo",
+            post(playback::get_user_playback_info).get(playback::get_user_playback_info),
+        )
         .route("/MediaSegments/:item_id", get(playback::get_media_segments))
         .route("/Sessions/Playing", post(sessions::session_playing))
-        .route("/Sessions/Playing/Progress", post(sessions::session_progress))
+        .route(
+            "/Sessions/Playing/Progress",
+            post(sessions::session_progress),
+        )
         .route("/Sessions/Playing/Stopped", post(sessions::session_stopped))
         .route("/Videos/:item_id/stream", get(playback::stream_video))
-        .route("/Videos/:item_id/:file_name", get(playback::stream_video_with_file))
+        .route(
+            "/Videos/:item_id/:file_name",
+            get(playback::stream_video_with_file),
+        )
         .route("/d/*alist_path", get(playback::stream_by_d_path))
-        .route("/Items/:item_id/Images/:image_type", get(images::get_item_image))
+        .route(
+            "/Items/:item_id/Images/:image_type",
+            get(images::get_item_image),
+        )
         .route(
             "/Items/:item_id/Images/:image_type/:image_index",
             get(images::get_item_image_indexed),
@@ -105,7 +126,10 @@ async fn trace_emby_request(req: axum::extract::Request, next: Next) -> Response
     if !is_image {
         tracing::info!(
             "➡️  [EMBY REQ] {} {} | UA=\"{}\" | Range={}",
-            method, uri, ua, range
+            method,
+            uri,
+            ua,
+            range
         );
     }
 

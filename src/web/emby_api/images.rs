@@ -7,7 +7,40 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::Response,
 };
+use bytes::Bytes;
 use std::sync::Arc;
+
+pub(super) fn image_path_tag(path: Option<&str>) -> String {
+    let Some(path) = path else {
+        return String::new();
+    };
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(path.as_bytes()))
+}
+
+fn not_modified_response(
+    headers: &HeaderMap,
+    etag: &str,
+) -> Result<Option<Response>, (StatusCode, String)> {
+    let matches = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|candidate| candidate.trim() == etag || candidate.trim() == "*")
+        })
+        .unwrap_or(false);
+    if !matches {
+        return Ok(None);
+    }
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "public, max-age=604800")
+        .body(axum::body::Body::empty())
+        .map(Some)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
 
 pub(super) async fn get_item_image_indexed(
     state: State<Arc<AppState>>,
@@ -84,8 +117,12 @@ async fn get_item_image_inner(
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let rule: VirtualLibraryRule = serde_json::from_value(rules_val)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("智能视图规则损坏：{}", e)))?;
+        let rule: VirtualLibraryRule = serde_json::from_value(rules_val).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("智能视图规则损坏：{}", e),
+            )
+        })?;
         if let Some(resp) = try_serve_dynamic_cover(&state, &item_id, custom_cover, &rule).await {
             return Ok(resp);
         }
@@ -96,23 +133,24 @@ async fn get_item_image_inner(
 
     // 短 TTL 元数据缓存：热门海报/背景图的 DB 定位查询不再逐请求打库
     let meta_cache_key = format!("{}:{}", item_id, image_type);
-    let (size, clean_name) = if let Some(cached) = state.caches.image_meta_cache.get(&meta_cache_key).await {
-        match cached {
-            Some(pair) => pair,
-            None => return Err((StatusCode::NOT_FOUND, "暂无图片".to_string())),
-        }
-    } else {
-        let resolved = resolve_item_image_meta(&state, &item_id, &image_type).await?;
-        state
-            .caches
-            .image_meta_cache
-            .insert(meta_cache_key, resolved.clone())
-            .await;
-        match resolved {
-            Some(pair) => pair,
-            None => return Err((StatusCode::NOT_FOUND, "暂无图片".to_string())),
-        }
-    };
+    let (size, clean_name) =
+        if let Some(cached) = state.caches.image_meta_cache.get(&meta_cache_key).await {
+            match cached {
+                Some(pair) => pair,
+                None => return Err((StatusCode::NOT_FOUND, "暂无图片".to_string())),
+            }
+        } else {
+            let resolved = resolve_item_image_meta(&state, &item_id, &image_type).await?;
+            state
+                .caches
+                .image_meta_cache
+                .insert(meta_cache_key, resolved.clone())
+                .await;
+            match resolved {
+                Some(pair) => pair,
+                None => return Err((StatusCode::NOT_FOUND, "暂无图片".to_string())),
+            }
+        };
 
     let bytes = state
         .get_or_fetch_tmdb_image(&size, &clean_name)
@@ -125,23 +163,10 @@ async fn get_item_image_inner(
         "image/jpeg"
     };
 
-    // 强 ETag：由文件名 + 尺寸 + 字节长度派生，支持客户端 If-None-Match 条件请求
-    let etag = format!(
-        "\"img-{:016x}\"",
-        xxhash_rust::xxh3::xxh3_64(format!("{}/{}:{}", size, clean_name, bytes.len()).as_bytes())
-    );
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"))
-        .unwrap_or(false)
-    {
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header(header::ETAG, etag)
-            .header(header::CACHE_CONTROL, "public, max-age=604800")
-            .body(axum::body::Body::empty())
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    // Strong ETag derived from content so changed bytes at a stable path invalidate clients.
+    let etag = format!("\"img-{:016x}\"", xxhash_rust::xxh3::xxh3_64(&bytes));
+    if let Some(response) = not_modified_response(&headers, &etag)? {
+        return Ok(response);
     }
 
     Response::builder()
@@ -150,7 +175,7 @@ async fn get_item_image_inner(
         .header(header::CONTENT_LENGTH, bytes.len())
         .header(header::ETAG, etag)
         .header(header::CACHE_CONTROL, "public, max-age=604800")
-        .body(axum::body::Body::from((*bytes).clone()))
+        .body(axum::body::Body::from(bytes.clone()))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -209,20 +234,21 @@ async fn resolve_item_image_meta(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .flatten();
 
-        return Ok(final_poster.map(|p| ("w500".to_string(), p.trim_start_matches('/').to_string())));
+        return Ok(
+            final_poster.map(|p| ("w500".to_string(), p.trim_start_matches('/').to_string()))
+        );
     }
 
     let Some(wid) = super::ids::parse_work_id(item_id) else {
         return Err((StatusCode::BAD_REQUEST, "无效的资源 ID".to_string()));
     };
 
-    let paths: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT poster_path, backdrop_path FROM media_works WHERE id = $1",
-    )
-    .bind(wid)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let paths: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT poster_path, backdrop_path FROM media_works WHERE id = $1")
+            .bind(wid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let Some((poster, backdrop)) = paths else {
         return Err((StatusCode::NOT_FOUND, "条目不存在".to_string()));
@@ -242,18 +268,11 @@ async fn resolve_item_image_meta(
 /// 管理端修改封面后 revision 变化即可让客户端刷新，无需时间戳轮转。
 pub(super) fn compute_cover_image_tag(cover_image: Option<&str>, revision: i64) -> String {
     match cover_image.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(c) => {
-            let clean: String = c
-                .chars()
-                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                .take(24)
-                .collect();
-            if clean.is_empty() {
-                format!("v{}", revision.max(1))
-            } else {
-                format!("v{}_{}", revision.max(1), clean)
-            }
-        }
+        Some(c) => format!(
+            "v{}_{:016x}",
+            revision.max(1),
+            xxhash_rust::xxh3::xxh3_64(c.as_bytes())
+        ),
         None => format!("v{}", revision.max(1)),
     }
 }
@@ -292,29 +311,33 @@ async fn try_serve_dynamic_cover(
                     "image/jpeg"
                 };
                 return Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, content_type)
-                        .header(header::CACHE_CONTROL, "public, max-age=300")
-                        .body(axum::body::Body::from((*bytes).clone()))
-                        .map_err(|e| {
-                            tracing::warn!("构建动态封面响应失败: {}", e);
-                            e
-                        })
-                        .ok();
-            }
-        }
-    } else if let Some(style) = custom_cover.and_then(crate::image_cache::collage::CollageStyle::from_key) {
-        if let Some(bytes) = fetch_or_build_virtual_library_collage(state, view_id, rule, style).await {
-            return Response::builder()
                     .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/jpeg")
+                    .header(header::CONTENT_TYPE, content_type)
                     .header(header::CACHE_CONTROL, "public, max-age=300")
-                    .body(axum::body::Body::from((*bytes).clone()))
+                    .body(axum::body::Body::from(bytes.clone()))
                     .map_err(|e| {
-                        tracing::warn!("构建拼接封面响应失败: {}", e);
+                        tracing::warn!("构建动态封面响应失败: {}", e);
                         e
                     })
                     .ok();
+            }
+        }
+    } else if let Some(style) =
+        custom_cover.and_then(crate::image_cache::collage::CollageStyle::from_key)
+    {
+        if let Some(bytes) =
+            fetch_or_build_virtual_library_collage(state, view_id, rule, style).await
+        {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/jpeg")
+                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .body(axum::body::Body::from(bytes.clone()))
+                .map_err(|e| {
+                    tracing::warn!("构建拼接封面响应失败: {}", e);
+                    e
+                })
+                .ok();
         }
     }
     None
@@ -418,7 +441,7 @@ async fn fetch_or_build_virtual_library_collage(
     view_id: &str,
     rule: &VirtualLibraryRule,
     style: crate::image_cache::collage::CollageStyle,
-) -> Option<Arc<Vec<u8>>> {
+) -> Option<Bytes> {
     let rows = fetch_virtual_library_top_media_images(state, rule, 4).await;
     if rows.is_empty() {
         return None;
@@ -452,7 +475,7 @@ async fn fetch_or_build_virtual_library_collage(
         .try_get_with(inflight_key, async move {
             // 磁盘已有同签名渲染结果则直接复用
             if let Ok(bytes) = tokio::fs::read(&cache_path2).await {
-                return Ok(Arc::new(bytes));
+                return Ok(Bytes::from(bytes));
             }
 
             // 组装并发拉取请求：第 1 行的背景图作主视觉，每行取海报（缺失时退回背景图）
@@ -480,13 +503,16 @@ async fn fetch_or_build_virtual_library_collage(
             for req in requests {
                 let st = state2.clone();
                 join_set.spawn(async move {
-                    let bytes = st.get_or_fetch_tmdb_image(req.size, &req.file_name).await.ok();
+                    let bytes = st
+                        .get_or_fetch_tmdb_image(req.size, &req.file_name)
+                        .await
+                        .ok();
                     (req.slot, bytes)
                 });
             }
 
-            let mut primary_backdrop: Option<Arc<Vec<u8>>> = None;
-            let mut posters: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(rows.len());
+            let mut primary_backdrop: Option<Bytes> = None;
+            let mut posters: Vec<Option<Bytes>> = Vec::with_capacity(rows.len());
             while let Some(finished) = join_set.join_next().await {
                 if let Ok((slot, bytes)) = finished {
                     if slot == usize::MAX {
@@ -500,7 +526,11 @@ async fn fetch_or_build_virtual_library_collage(
                 }
             }
 
-            let poster_bytes: Vec<Vec<u8>> = posters.into_iter().flatten().map(|a| (*a).clone()).collect();
+            let poster_bytes: Vec<Vec<u8>> = posters
+                .into_iter()
+                .flatten()
+                .map(|bytes| bytes.to_vec())
+                .collect();
             if poster_bytes.is_empty() && primary_backdrop.is_none() {
                 return Err(anyhow::anyhow!("没有可用于拼接的封面素材"));
             }
@@ -509,7 +539,7 @@ async fn fetch_or_build_virtual_library_collage(
                 crate::image_cache::collage::render_collage(
                     style,
                     &poster_bytes,
-                    primary_backdrop.as_ref().map(|v| v.as_slice()),
+                    primary_backdrop.as_ref().map(|v| &v[..]),
                 )
             })
             .await
@@ -517,7 +547,8 @@ async fn fetch_or_build_virtual_library_collage(
 
             if tokio::fs::create_dir_all(&covers_dir2).await.is_ok() {
                 // 原子落盘：临时文件 + rename，读端不会读到半截封面
-                let tmp_path = cache_path2.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+                let tmp_path =
+                    cache_path2.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
                 if tokio::fs::write(&tmp_path, &rendered).await.is_ok() {
                     if let Err(e) = tokio::fs::rename(&tmp_path, &cache_path2).await {
                         tracing::warn!("拼接封面原子落盘失败 ({}): {}", cache_path2.display(), e);
@@ -526,10 +557,38 @@ async fn fetch_or_build_virtual_library_collage(
                 }
             }
 
-            Ok(Arc::new(rendered))
+            Ok(Bytes::from(rendered))
         })
         .await
         .ok()?;
 
     Some(rendered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{image_path_tag, not_modified_response};
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    #[test]
+    fn matching_if_none_match_returns_304() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"img-test\""),
+        );
+        let response = not_modified_response(&headers, "\"img-test\"")
+            .unwrap()
+            .expect("matching ETag should produce a 304 response");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn image_path_tag_differs_for_distinct_paths() {
+        assert_ne!(
+            image_path_tag(Some("/covers/a.jpg")),
+            image_path_tag(Some("/covers/b.jpg"))
+        );
+        assert_eq!(image_path_tag(None), "");
+    }
 }

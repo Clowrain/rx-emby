@@ -5,14 +5,17 @@ use std::collections::HashSet;
 use xxhash_rust::xxh3::xxh3_64;
 
 static TMDB_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\{tmdb-(\d+)\}").unwrap());
-static YEAR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\(\[（](19\d{2}|20\d{2})[\)\]）]|\b(19\d{2}|20\d{2})\b").unwrap());
+static YEAR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[\(\[（](19\d{2}|20\d{2})[\)\]）]|\b(19\d{2}|20\d{2})\b").unwrap());
 static SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(?:S(\d{1,3})E(\d{1,4})|(?:^|[^A-Za-z0-9])E(\d{1,4})(?:$|[^0-9])|第\s*(\d{1,4})\s*[集话期])").unwrap()
 });
 static SEASON_DIR_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(?:(?:^|[\s._\-\[\(])Season\s*(\d{1,3})(?:$|[\s._\-\]\)])|(?:^|[\s._\-\[\(])S0*(\d{1,3})(?:$|[\s._\-\]\)])|第\s*(\d{1,3})\s*季)").unwrap()
 });
-static NOISE_PREFIX_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(?:刮削失败|每日更新|临时目录|未分类|115|阿里云盘|夸克网盘)/+").unwrap());
+static NOISE_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?:刮削失败|每日更新|临时目录|未分类|115|阿里云盘|夸克网盘)/+").unwrap()
+});
 
 static VIDEO_EXTS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
@@ -214,7 +217,9 @@ fn extract_clean_alist_path(raw_url: &str) -> Option<String> {
 
 /// 容错 URL 解码：合法 %XX 序列按 UTF-8 解码，非法孤立 %（如 100%.mkv）原样保留
 pub fn lossy_url_decode(input: &str) -> String {
-    percent_decode(input.as_bytes()).decode_utf8_lossy().into_owned()
+    percent_decode(input.as_bytes())
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 fn extract_tmdb_id(text: &str) -> Option<i32> {
@@ -455,8 +460,9 @@ fn extract_title_and_year(folder_name: &str) -> (String, Option<i32>) {
             _ => continue,
         };
 
-        let prefix_clean = without_tmdb[..full.start()]
-            .trim_end_matches(|c: char| c == '(' || c == '[' || c == '（' || c == '.' || c == '-' || c.is_whitespace());
+        let prefix_clean = without_tmdb[..full.start()].trim_end_matches(|c: char| {
+            c == '(' || c == '[' || c == '（' || c == '.' || c == '-' || c.is_whitespace()
+        });
         if prefix_clean.is_empty() {
             // 年份处于最开头（前面没有任何片名，如目录就叫 "2040" 或 "1917"），这是片名本身，不能当成发行年份
             continue;
@@ -479,7 +485,9 @@ fn extract_title_and_year(folder_name: &str) -> (String, Option<i32>) {
     };
 
     let clean = title_part
-        .trim_end_matches(|c: char| c == '(' || c == '[' || c == '（' || c == '.' || c == '-' || c.is_whitespace())
+        .trim_end_matches(|c: char| {
+            c == '(' || c == '[' || c == '（' || c == '.' || c == '-' || c.is_whitespace()
+        })
         .replace('.', " ")
         .trim()
         .to_string();
@@ -501,11 +509,7 @@ pub fn extract_version_tag_and_score(
 ) -> (String, i32) {
     let upper_file = file_name.to_uppercase();
     // 同时参考父目录名称（许多小雅资源将 [60帧] [高码] [杜比] 写在父文件夹名上）
-    let parent_dir = alist_path
-        .rsplit('/')
-        .nth(1)
-        .unwrap_or("")
-        .to_uppercase();
+    let parent_dir = alist_path.rsplit('/').nth(1).unwrap_or("").to_uppercase();
     let combined_upper = format!("{} {}", parent_dir, upper_file);
 
     let mut tags: Vec<String> = Vec::new();
@@ -639,7 +643,14 @@ pub fn extract_version_tag_and_score(
             let diff = parent.replace(clean_title, "").trim().to_string();
             if !diff.is_empty() && diff != *parent && diff.chars().count() <= 24 {
                 let cleaned_diff = diff
-                    .trim_matches(|c: char| c == '(' || c == ')' || c == '[' || c == ']' || c == '-' || c.is_whitespace())
+                    .trim_matches(|c: char| {
+                        c == '('
+                            || c == ')'
+                            || c == '['
+                            || c == ']'
+                            || c == '-'
+                            || c.is_whitespace()
+                    })
                     .to_string();
                 if !cleaned_diff.is_empty() && cleaned_diff.parse::<i32>().is_err() {
                     return (cleaned_diff, 10);
@@ -673,7 +684,11 @@ pub fn extract_origin_label(alist_path: &str) -> String {
     } else if first.contains("夸克") {
         "夸克网盘".to_string()
     } else {
-        first.trim_start_matches(|c: char| !c.is_alphanumeric() && !('\u{4e00}'..='\u{9fa5}').contains(&c)).to_string()
+        first
+            .trim_start_matches(|c: char| {
+                !c.is_alphanumeric() && !('\u{4e00}'..='\u{9fa5}').contains(&c)
+            })
+            .to_string()
     }
 }
 
@@ -684,7 +699,8 @@ pub fn disambiguate_version_tags(items: &mut [(String, i32, String, String)]) {
     // items 元素元组: (version_tag, priority_score, alist_path, container)
     for (tag, score, alist_path, container) in items.iter_mut() {
         let file_name = alist_path.rsplit('/').next().unwrap_or("");
-        let (new_tag, new_score) = extract_version_tag_and_score(alist_path, file_name, "", container);
+        let (new_tag, new_score) =
+            extract_version_tag_and_score(alist_path, file_name, "", container);
         if !new_tag.is_empty() {
             *tag = new_tag;
             *score = new_score;
@@ -697,7 +713,8 @@ pub fn disambiguate_version_tags(items: &mut [(String, i32, String, String)]) {
     }
 
     // 对出现重名的版本追加来源目录特征
-    let mut final_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut final_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for (tag, _, alist_path, _) in items.iter_mut() {
         if counts.get(tag).copied().unwrap_or(0) > 1 {
             let origin = extract_origin_label(alist_path);
@@ -707,7 +724,8 @@ pub fn disambiguate_version_tags(items: &mut [(String, i32, String, String)]) {
     }
 
     // 若同一来源目录下仍有重名，追加 #1, #2 兜底区分
-    let mut seq_tracker: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seq_tracker: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for (tag, _, _, _) in items.iter_mut() {
         if final_counts.get(tag).copied().unwrap_or(0) > 1 {
             let idx = seq_tracker.entry(tag.clone()).or_insert(0);
@@ -800,7 +818,8 @@ mod tests {
 
     #[test]
     fn test_numeric_movie_title_not_mistaken_for_year() {
-        let line1 = "纪录片/科学技术/2040/2040.mp4#http://127.0.0.1:5678/d/纪录片/科学技术/2040/2040.mp4";
+        let line1 =
+            "纪录片/科学技术/2040/2040.mp4#http://127.0.0.1:5678/d/纪录片/科学技术/2040/2040.mp4";
         let rec1 = parse_strm_line(line1).unwrap();
         assert_eq!(rec1.clean_title, "2040");
         assert_eq!(rec1.year, None);
@@ -810,7 +829,8 @@ mod tests {
         assert_eq!(rec2.clean_title, "2040");
         assert_eq!(rec2.year, Some(2019));
 
-        let line3 = "电影/1917 (2019)/1917.2019.mkv#http://127.0.0.1:5678/d/电影/1917 (2019)/1917.2019.mkv";
+        let line3 =
+            "电影/1917 (2019)/1917.2019.mkv#http://127.0.0.1:5678/d/电影/1917 (2019)/1917.2019.mkv";
         let rec3 = parse_strm_line(line3).unwrap();
         assert_eq!(rec3.clean_title, "1917");
         assert_eq!(rec3.year, Some(2019));
@@ -976,7 +996,10 @@ mod tests {
             resolve_pure_tmdb_folder_title_year(
                 "电影/人人影视电影合集/{tmdb-54093}",
                 false,
-                &["CD1.mkv".to_string(), "Killing.Bono.2011.杀死波诺.mkv".to_string()]
+                &[
+                    "CD1.mkv".to_string(),
+                    "Killing.Bono.2011.杀死波诺.mkv".to_string()
+                ]
             ),
             Some(("Killing Bono".to_string(), Some(2011)))
         );

@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+type EnabledVlibsCache = moka::future::Cache<String, Vec<(i32, String, Value)>>;
+
+fn invalidate_enabled_vlibs_cache(cache: &EnabledVlibsCache) {
+    cache.invalidate_all();
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct VirtualLibDbRow {
     id: i32,
@@ -36,15 +42,18 @@ pub(super) async fn list_virtual_libraries(
 
     let mut libraries = Vec::with_capacity(rows.len());
     for r in rows {
-        let rule: VirtualLibraryRule = serde_json::from_value(r.filter_rules.clone())
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,format!("视图 {} 规则损坏：{}",r.id,e)))?;
-        let matched_count = count_virtual_library_matches(&state, &rule).await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
-        let resolved_cover = resolve_virtual_library_cover_key(
-            r.cover_image.as_deref(),
-            &r.name,
-            &r.icon_type,
-        );
+        let rule: VirtualLibraryRule =
+            serde_json::from_value(r.filter_rules.clone()).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("视图 {} 规则损坏：{}", r.id, e),
+                )
+            })?;
+        let matched_count = count_virtual_library_matches(&state, &rule)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let resolved_cover =
+            resolve_virtual_library_cover_key(r.cover_image.as_deref(), &r.name, &r.icon_type);
         libraries.push(json!({
             "id": r.id,
             "view_id": format!("lib_vlib_{}", r.id),
@@ -86,12 +95,18 @@ pub(super) async fn save_virtual_library(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let name = payload.name.trim();
     if name.is_empty() || name.chars().count() > 64 {
-        return Err((StatusCode::BAD_REQUEST, "智能视图名称须为 1～64 个字符".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "智能视图名称须为 1～64 个字符".to_string(),
+        ));
     }
     if !["movies", "tvshows"].contains(&payload.icon_type.as_str()) {
         return Err((StatusCode::BAD_REQUEST, "请选择电影或剧集展示样式".into()));
     }
-    payload.filter_rules.validate().map_err(|e| (StatusCode::BAD_REQUEST,e))?;
+    payload
+        .filter_rules
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let rules_json = serde_json::to_value(&payload.filter_rules)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let cover_image = payload
@@ -140,9 +155,13 @@ pub(super) async fn save_virtual_library(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
+    invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
-    Ok(Json(json!({ "status": "ok", "message": "智能视图已保存并立即生效" })))
+    Ok(Json(
+        json!({ "status": "ok", "message": "智能视图已保存并立即生效" }),
+    ))
 }
 
 pub(super) async fn seed_preset_virtual_libraries(
@@ -210,28 +229,73 @@ pub(super) async fn seed_preset_virtual_libraries(
                 ..Default::default()
             },
         ),
-        ("高分口碑电影", "movies", "vlib_top_rated", 60, VirtualLibraryRule {
-            media_type: Some("movie".into()), min_rating: Some(8.0), min_votes: Some(1000), ..Default::default()
-        }),
-        ("已完结短剧", "tvshows", "vlib_default_tv", 70, VirtualLibraryRule {
-            media_type: Some("tv".into()), statuses: vec!["Ended".into()], episodes_max: Some(12), ..Default::default()
-        }),
-        ("90 分钟内电影", "movies", "vlib_default_movies", 80, VirtualLibraryRule {
-            media_type: Some("movie".into()), runtime_max: Some(90), ..Default::default()
-        }),
-        ("4K 杜比视界", "movies", "vlib_default_movies", 90, VirtualLibraryRule {
-            version_tags: vec!["4K".into(), "杜比视界".into()], ..Default::default()
-        }),
+        (
+            "高分口碑电影",
+            "movies",
+            "vlib_top_rated",
+            60,
+            VirtualLibraryRule {
+                media_type: Some("movie".into()),
+                min_rating: Some(8.0),
+                min_votes: Some(1000),
+                ..Default::default()
+            },
+        ),
+        (
+            "已完结短剧",
+            "tvshows",
+            "vlib_default_tv",
+            70,
+            VirtualLibraryRule {
+                media_type: Some("tv".into()),
+                statuses: vec!["Ended".into()],
+                episodes_max: Some(12),
+                ..Default::default()
+            },
+        ),
+        (
+            "90 分钟内电影",
+            "movies",
+            "vlib_default_movies",
+            80,
+            VirtualLibraryRule {
+                media_type: Some("movie".into()),
+                runtime_max: Some(90),
+                ..Default::default()
+            },
+        ),
+        (
+            "4K 杜比视界",
+            "movies",
+            "vlib_default_movies",
+            90,
+            VirtualLibraryRule {
+                version_tags: vec!["4K".into(), "杜比视界".into()],
+                ..Default::default()
+            },
+        ),
     ];
 
-    let mut tx = state.db.begin().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
-    sqlx::query("SELECT pg_advisory_xact_lock(728314)").execute(&mut *tx).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(728314)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut inserted = 0;
     for (name, icon_type, cover_image, sort_order, rule) in presets {
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM virtual_libraries WHERE name=$1)")
-            .bind(name).fetch_one(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
-        if exists { continue; }
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM virtual_libraries WHERE name=$1)")
+                .bind(name)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if exists {
+            continue;
+        }
         let filter_rules = serde_json::to_value(rule)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         sqlx::query("INSERT INTO virtual_libraries (name,icon_type,sort_order,filter_rules,is_enabled,cover_image) VALUES ($1,$2,$3,$4,TRUE,$5)")
@@ -239,9 +303,13 @@ pub(super) async fn seed_preset_virtual_libraries(
             .execute(&mut *tx).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
         inserted += 1;
     }
-    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if inserted > 0 {
+        invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
         state.caches.admin_stats_cache.invalidate_all();
+        state.caches.image_meta_cache.invalidate_all();
     }
 
     Ok(Json(json!({
@@ -281,14 +349,16 @@ pub(super) async fn delete_virtual_library(
     if let Ok(mut entries) = tokio::fs::read_dir(&covers_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if let Some(fname) = entry.file_name().to_str() {
-                if fname == prefix || fname.starts_with(&format!("{}.", prefix)) {
+                if fname.starts_with(&format!("{}_", prefix)) {
                     let _ = tokio::fs::remove_file(entry.path()).await;
                 }
             }
         }
     }
 
+    invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
     Ok(Json(json!({ "status": "ok", "message": "智能视图已删除" })))
 }
@@ -305,7 +375,10 @@ pub(super) async fn list_base_library_covers(
 
     let cover_map: std::collections::HashMap<String, String> = rows
         .into_iter()
-        .filter_map(|(k, v)| k.strip_prefix("base_lib_cover:").map(|id| (id.to_string(), v)))
+        .filter_map(|(k, v)| {
+            k.strip_prefix("base_lib_cover:")
+                .map(|id| (id.to_string(), v))
+        })
         .collect();
 
     let base_libs = [
@@ -379,22 +452,31 @@ pub(super) async fn save_base_library_cover(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
-    Ok(Json(json!({ "status": "ok", "message": "基础媒体库封面已更新" })))
+    Ok(Json(
+        json!({ "status": "ok", "message": "基础媒体库封面已更新" }),
+    ))
 }
-
 
 pub(super) async fn preview_smart_view(
     State(state): State<Arc<AppState>>,
     Json(rule): Json<VirtualLibraryRule>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    rule.validate().map_err(|e| (StatusCode::BAD_REQUEST,e))?;
-    let count = count_virtual_library_matches(&state,&rule).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    rule.validate().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let count = count_virtual_library_matches(&state, &rule)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({"matched_count": count})))
 }
 
-pub(super) async fn smart_view_options(State(state): State<Arc<AppState>>) -> Result<Json<Value>, (StatusCode,String)> {
-    if let Some(cached) = state.caches.admin_stats_cache.get("smart_view_options").await {
+pub(super) async fn smart_view_options(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if let Some(cached) = state
+        .caches
+        .admin_stats_cache
+        .get("smart_view_options")
+        .await
+    {
         return Ok(Json(cached));
     }
     let mut result = json!({});
@@ -414,18 +496,51 @@ pub(super) async fn smart_view_options(State(state): State<Arc<AppState>>) -> Re
     }
     let stats: (i64,i64,i64,i64) = sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER(WHERE m.metadata_version>=2), COUNT(*) FILTER(WHERE m.metadata_refresh_requested), COUNT(*) FILTER(WHERE m.metadata_refresh_requested AND m.metadata_retry_count>=3) FROM media_works m WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)")
         .fetch_one(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
-    result["metadata"] = json!({"total":stats.0,"enriched":stats.1,"queued":stats.2,"failed":stats.3});
-    state.caches.admin_stats_cache.insert("smart_view_options".to_string(), result.clone()).await;
+    result["metadata"] =
+        json!({"total":stats.0,"enriched":stats.1,"queued":stats.2,"failed":stats.3});
+    state
+        .caches
+        .admin_stats_cache
+        .insert("smart_view_options".to_string(), result.clone())
+        .await;
     Ok(Json(result))
 }
 
-pub(super) async fn queue_metadata_backfill(State(state): State<Arc<AppState>>) -> Result<Json<Value>,(StatusCode,String)> {
+pub(super) async fn queue_metadata_backfill(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let cfg = state.config.load();
     if cfg.tmdb_api_key.trim().is_empty() || cfg.tmdb_api_key == "your_tmdb_api_key" {
-        return Err((StatusCode::BAD_REQUEST,"请先在系统设置中配置 TMDB API Key".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "请先在系统设置中配置 TMDB API Key".into(),
+        ));
     }
     let result = sqlx::query("UPDATE media_works SET metadata_refresh_requested=TRUE, metadata_retry_count=0, metadata_retry_at=NULL WHERE NOT is_locked AND tmdb_id IS NOT NULL AND (metadata_version<2 OR metadata_retry_count>0)")
         .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
     state.caches.admin_stats_cache.invalidate_all();
-    Ok(Json(json!({"queued":result.rows_affected(),"message":format!("已将 {} 部作品加入深度元数据补齐队列",result.rows_affected())})))
+    state.caches.image_meta_cache.invalidate_all();
+    Ok(Json(
+        json!({"queued":result.rows_affected(),"message":format!("已将 {} 部作品加入深度元数据补齐队列",result.rows_affected())}),
+    ))
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::invalidate_enabled_vlibs_cache;
+    use moka::future::Cache;
+
+    #[tokio::test]
+    async fn virtual_library_mutations_invalidate_enabled_library_cache() {
+        let cache: Cache<String, Vec<(i32, String, serde_json::Value)>> = Cache::new(1);
+        cache
+            .insert(
+                "enabled".into(),
+                vec![(1, "view".into(), serde_json::json!({"media_type":"movie"}))],
+            )
+            .await;
+        invalidate_enabled_vlibs_cache(&cache);
+        assert!(cache.get(&"enabled".to_string()).await.is_none());
+    }
 }

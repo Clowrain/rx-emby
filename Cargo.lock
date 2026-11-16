@@ -1872,6 +1872,7 @@ dependencies = [
  "arc-swap",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "dashmap",
  "governor",

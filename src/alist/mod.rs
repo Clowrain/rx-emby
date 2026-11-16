@@ -1,8 +1,8 @@
 use crate::state::AppState;
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use hmac::{Hmac, Mac};
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -106,7 +106,6 @@ struct FsListItem {
 #[derive(Debug, Clone)]
 pub struct ResolvedStream {
     pub redirect_url: String,
-    pub file_size: Option<i64>,
 }
 
 impl AppState {
@@ -205,15 +204,11 @@ impl AppState {
             );
             return Ok(ResolvedStream {
                 redirect_url: cached_url,
-                file_size: None,
             });
         }
 
         let full_path = self.build_full_alist_path(alist_path);
         let db = self.db.clone();
-        let resolved_size = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        let resolved_size_inner = resolved_size.clone();
-
         // Singleflight：当 PlaybackInfo (IsPlayback=true) 预热与播放器 stream.mp4 并发到达时，共享同一个换链请求
         let final_url = self
             .caches
@@ -231,7 +226,6 @@ impl AppState {
 
                 let file_size = if fs_data.size > 0 { Some(fs_data.size) } else { None };
                 if let Some(sz) = file_size {
-                    resolved_size_inner.store(sz, std::sync::atomic::Ordering::Relaxed);
                     let db_clone = db.clone();
                     tokio::spawn(async move {
                         let _ = sqlx::query(
@@ -264,10 +258,8 @@ impl AppState {
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
-        let sz = resolved_size.load(std::sync::atomic::Ordering::Relaxed);
         Ok(ResolvedStream {
             redirect_url: final_url,
-            file_size: if sz > 0 { Some(sz) } else { None },
         })
     }
 

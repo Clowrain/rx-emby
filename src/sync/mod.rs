@@ -244,16 +244,14 @@ async fn set_sync_progress(
 }
 
 async fn load_persisted_cursor(state: &AppState, key: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT config_value FROM system_configs WHERE config_key = $1",
-    )
-    .bind(key)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
+    sqlx::query_scalar::<_, String>("SELECT config_value FROM system_configs WHERE config_key = $1")
+        .bind(key)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 async fn save_persisted_cursor(state: &AppState, key: &str, val: &str, desc: &str) {
@@ -461,7 +459,13 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             info!("远程索引源 ETag 未变更 (304 Not Modified)，跳过本次同步");
             let now = Utc::now();
             *state.sync_ctrl.last_sync_time.write().await = Some(now);
-            save_persisted_cursor(state, SYNC_LAST_CHECK_KEY, &now.to_rfc3339(), "最近一次索引检查时间").await;
+            save_persisted_cursor(
+                state,
+                SYNC_LAST_CHECK_KEY,
+                &now.to_rfc3339(),
+                "最近一次索引检查时间",
+            )
+            .await;
             let _ = sqlx::query("DELETE FROM sync_logs WHERE id = $1")
                 .bind(log_id)
                 .execute(&state.db)
@@ -490,7 +494,13 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         info!("索引文件哈希未变更 ({:#x})，跳过本次入库", file_hash);
         let now = Utc::now();
         *state.sync_ctrl.last_sync_time.write().await = Some(now);
-        save_persisted_cursor(state, SYNC_LAST_CHECK_KEY, &now.to_rfc3339(), "最近一次索引检查时间").await;
+        save_persisted_cursor(
+            state,
+            SYNC_LAST_CHECK_KEY,
+            &now.to_rfc3339(),
+            "最近一次索引检查时间",
+        )
+        .await;
         if let Some(ref etag) = new_etag {
             save_persisted_cursor(state, "sync.last_etag", etag, "最近一次同步远程索引 ETag").await;
         }
@@ -545,8 +555,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             total_lines += 1;
 
             if let Some(rec) = parse_strm_line(&line) {
-                if !includes.is_empty()
-                    && !includes.iter().any(|inc| rec.root_dir.starts_with(inc))
+                if !includes.is_empty() && !includes.iter().any(|inc| rec.root_dir.starts_with(inc))
                 {
                     continue;
                 }
@@ -568,7 +577,11 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
                     "parsing",
                     3,
                     pct,
-                    format!("正在解析索引行（已扫描 {} 行，命中 {} 条视频）…", total_lines, parsed_records.len()),
+                    format!(
+                        "正在解析索引行（已扫描 {} 行，命中 {} 条视频）…",
+                        total_lines,
+                        parsed_records.len()
+                    ),
                     total_lines,
                     parsed_records.len() as i32,
                 )
@@ -660,7 +673,10 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             .await?;
 
             for fid in updated_folder_ids {
-                let _ = state.scraper.priority_tx.try_send(crate::state::ScrapeTask::Folder(fid));
+                let _ = state
+                    .scraper
+                    .priority_tx
+                    .try_send(crate::state::ScrapeTask::Folder(fid));
             }
 
             state.caches.admin_stats_cache.invalidate_all();
@@ -689,14 +705,20 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_next_run_at, remaining_wait_secs, schedule_after_sync, SYNC_ERROR_RETRY_SEC};
+    use super::{
+        compute_next_run_at, remaining_wait_secs, schedule_after_sync, SYNC_ERROR_RETRY_SEC,
+    };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
 
     #[test]
     fn compute_next_run_triggers_after_grace_when_overdue() {
         let last = Utc::now() - ChronoDuration::seconds(7200);
-        let next = compute_next_run_at(Some(last), Duration::from_secs(3600), Duration::from_secs(15));
+        let next = compute_next_run_at(
+            Some(last),
+            Duration::from_secs(3600),
+            Duration::from_secs(15),
+        );
         let wait = remaining_wait_secs(next);
         assert!((13..=15).contains(&wait));
     }
@@ -704,7 +726,11 @@ mod tests {
     #[test]
     fn compute_next_run_waits_remaining_interval_when_recent() {
         let last = Utc::now() - ChronoDuration::seconds(1000);
-        let next = compute_next_run_at(Some(last), Duration::from_secs(3600), Duration::from_secs(15));
+        let next = compute_next_run_at(
+            Some(last),
+            Duration::from_secs(3600),
+            Duration::from_secs(15),
+        );
         let wait = remaining_wait_secs(next);
         assert!((2595..=2600).contains(&wait));
     }

@@ -125,10 +125,11 @@ pub async fn collect_and_record(state: &AppState) -> anyhow::Result<ResourceSamp
     let (db_host_available, db_cpu_pct, db_mem_mb) = sample_postgres_processes().await;
 
     // 3. PostgreSQL 内部统计指标
-    let db_size_bytes: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())::bigint")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
+    let db_size_bytes: i64 =
+        sqlx::query_scalar("SELECT pg_database_size(current_database())::bigint")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
     let db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
 
     let (db_active_conns, db_total_conns): (i64, i64) = sqlx::query_as(
@@ -160,14 +161,15 @@ pub async fn collect_and_record(state: &AppState) -> anyhow::Result<ResourceSamp
 
     // 4. 磁盘占用与图片缓存占用
     let (disk_total_gb, disk_used_gb, disk_avail_gb, disk_usage_pct) =
-        sample_disk_df(&cfg.image_cache_dir).await.unwrap_or((0.0, 0.0, 0.0, 0.0));
+        sample_disk_df(&cfg.image_cache_dir)
+            .await
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
 
-    let cache_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM image_cache_index",
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let cache_bytes: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM image_cache_index")
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(0);
     let image_cache_mb = cache_bytes as f64 / (1024.0 * 1024.0);
 
     let sample = ResourceSample {
@@ -348,7 +350,8 @@ async fn sample_postgres_processes() -> (bool, f64, f64) {
 
     for line in text.lines() {
         let mut parts = line.split_whitespace();
-        let (Some(cpu_s), Some(rss_s), Some(comm)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(cpu_s), Some(rss_s), Some(comm)) = (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         let lower = comm.to_lowercase();
@@ -397,7 +400,12 @@ async fn sample_disk_df(path: &std::path::Path) -> Option<(f64, f64, f64, f64)> 
     } else {
         0.0
     };
-    Some((round2(total_gb), round2(used_gb), round2(avail_gb), round2(pct)))
+    Some((
+        round2(total_gb),
+        round2(used_gb),
+        round2(avail_gb),
+        round2(pct),
+    ))
 }
 
 fn round2(v: f64) -> f64 {

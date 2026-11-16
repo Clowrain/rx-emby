@@ -1,4 +1,5 @@
 use super::auth::{extract_emby_token, resolve_valid_user_id_with_query};
+use super::ids::parse_episode_id;
 use super::items::ensure_media_accessible;
 use crate::state::AppState;
 use axum::{
@@ -20,11 +21,7 @@ pub(super) struct PlaybackQuery {
         alias = "mediasourceid"
     )]
     media_source_id: Option<String>,
-    #[serde(
-        rename = "IsPlayback",
-        alias = "isPlayback",
-        alias = "isplayback"
-    )]
+    #[serde(rename = "IsPlayback", alias = "isPlayback", alias = "isplayback")]
     is_playback: Option<bool>,
     #[serde(
         rename = "api_key",
@@ -105,34 +102,34 @@ async fn get_playback_info_inner(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             match first_ep {
                 Some((snum, epnum)) => {
-                    build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum).await?
+                    build_media_sources_for_episode(
+                        &state,
+                        &host,
+                        &token,
+                        &session_id,
+                        wid,
+                        snum,
+                        epnum,
+                    )
+                    .await?
                 }
                 None => return Err((StatusCode::NOT_FOUND, "剧集暂无可播放分集".to_string())),
             }
         } else {
             build_media_sources_for_movie(&state, &host, &token, &session_id, wid).await?
         }
-    } else if let Some(rest) = item_id.strip_prefix("ep_") {
-        let mut parts = rest.rsplitn(3, '_');
-        let epnum = parts
-            .next()
-            .and_then(|s| s.parse::<i32>().ok())
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的分集集号".to_string()))?;
-        let snum = parts
-            .next()
-            .and_then(|s| s.parse::<i32>().ok())
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的分集季号".to_string()))?;
-        let wid = parts
-            .next()
-            .and_then(|s| s.parse::<i64>().ok())
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的作品 ID".to_string()))?;
-
+    } else if item_id.starts_with("ep_") {
+        let (wid, snum, epnum) = parse_episode_id(&item_id)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的分集 ID".to_string()))?;
         ensure_media_accessible(&state, &user_id, wid).await?;
-        build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum).await?
-    } else if let Some(raw_sid) = item_id
-        .strip_prefix("src_")
-        .or_else(|| item_id.chars().all(|c| c.is_ascii_digit()).then_some(item_id.as_str()))
-    {
+        build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum)
+            .await?
+    } else if let Some(raw_sid) = item_id.strip_prefix("src_").or_else(|| {
+        item_id
+            .chars()
+            .all(|c| c.is_ascii_digit())
+            .then_some(item_id.as_str())
+    }) {
         let sid = raw_sid
             .parse::<i64>()
             .map_err(|_| (StatusCode::BAD_REQUEST, "无效的源 ID".to_string()))?;
@@ -147,7 +144,16 @@ async fn get_playback_info_inner(
         match src_meta {
             Some((wid, snum, epnum)) => {
                 ensure_media_accessible(&state, &user_id, wid).await?;
-                build_media_sources_for_episode(&state, &host, &token, &session_id, wid, snum, epnum).await?
+                build_media_sources_for_episode(
+                    &state,
+                    &host,
+                    &token,
+                    &session_id,
+                    wid,
+                    snum,
+                    epnum,
+                )
+                .await?
             }
             None => return Err((StatusCode::NOT_FOUND, "播放源不存在或已屏蔽".to_string())),
         }
@@ -188,7 +194,11 @@ async fn get_playback_info_inner(
         }
     }
 
-    tracing::info!("🎬 [PlaybackInfo] item_id={} 返回 {} 个源: {}", item_id, sources.len(), serde_json::to_string(&sources).unwrap_or_default());
+    tracing::info!(
+        "[PlaybackInfo] item_id={} 返回 {} 个源",
+        item_id,
+        sources.len()
+    );
     Ok(Json(json!({
         "MediaSources": sources,
         "PlaySessionId": session_id
@@ -225,7 +235,15 @@ pub(super) async fn build_media_sources_for_movie(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    serialize_media_sources(state, host, token, session_id, format!("work_{}", work_id), rows).await
+    serialize_media_sources(
+        state,
+        host,
+        token,
+        session_id,
+        format!("work_{}", work_id),
+        rows,
+    )
+    .await
 }
 
 pub(super) async fn build_media_sources_for_episode(
@@ -363,7 +381,8 @@ pub(super) async fn stream_video(
     Query(q): Query<PlaybackQuery>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    let user_id = resolve_valid_user_id_with_query(&state, None, &headers, q.api_key.as_deref()).await?;
+    let user_id =
+        resolve_valid_user_id_with_query(&state, None, &headers, q.api_key.as_deref()).await?;
 
     let client_ua = headers
         .get(header::USER_AGENT)
@@ -378,11 +397,9 @@ pub(super) async fn stream_video(
             .unwrap_or(0)
     } else if let Some(raw_sid) = item_id.strip_prefix("src_") {
         raw_sid.parse::<i64>().unwrap_or(0)
-    } else if let Some(rest) = item_id.strip_prefix("ep_") {
-        let mut parts = rest.rsplitn(3, '_');
-        let epnum = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-        let snum = parts.next().and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-        let wid = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    } else if item_id.starts_with("ep_") {
+        let (wid, snum, epnum) = parse_episode_id(&item_id)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "无效的分集 ID".to_string()))?;
         sqlx::query_scalar(
             r#"
             SELECT sf.id
@@ -425,16 +442,19 @@ pub(super) async fn stream_video(
         item_id.parse::<i64>().unwrap_or(0)
     };
 
-    let row: Option<(i64, String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT f.work_id, sf.alist_path, sf.path_hash, sf.file_size_bytes FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.id = $1 AND f.work_id IS NOT NULL AND f.is_ignored = FALSE",
+    let row: Option<(i64, String, i64)> = sqlx::query_as(
+        "SELECT f.work_id, sf.alist_path, sf.path_hash FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.id = $1 AND f.work_id IS NOT NULL AND f.is_ignored = FALSE",
     )
     .bind(target_src_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let Some((wid, alist_path, path_hash, existing_size)) = row else {
-        return Err((StatusCode::NOT_FOUND, "未找到对应的视频播放源或条目已被屏蔽".to_string()));
+    let Some((wid, alist_path, path_hash)) = row else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "未找到对应的视频播放源或条目已被屏蔽".to_string(),
+        ));
     };
 
     ensure_media_accessible(&state, &user_id, wid).await?;
@@ -442,20 +462,18 @@ pub(super) async fn stream_video(
     let resolved = state
         .resolve_playback_url(path_hash, &alist_path, client_ua)
         .await
-        .map_err(|e| { tracing::error!("❌ [Stream Error] target_src_id={} alist_path={} 失败: {:#}", target_src_id, alist_path, e); (StatusCode::BAD_GATEWAY, format!("获取网盘直链失败: {:#}", e)) })?;
-
-    if existing_size.is_none() {
-        if let Some(sz) = resolved.file_size {
-            let db = state.db.clone();
-            tokio::spawn(async move {
-                let _ = sqlx::query("UPDATE sync_files SET file_size_bytes = $1 WHERE id = $2")
-                    .bind(sz)
-                    .bind(target_src_id)
-                    .execute(&db)
-                    .await;
-            });
-        }
-    }
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [Stream Error] target_src_id={} alist_path={} 失败: {:#}",
+                target_src_id,
+                alist_path,
+                e
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("获取网盘直链失败: {:#}", e),
+            )
+        })?;
 
     // 返回 302 Found 直跳网盘 CDN，并严格禁用浏览器/播放器缓存该重定向
     Response::builder()
@@ -473,7 +491,8 @@ pub(super) async fn stream_by_d_path(
     Query(q): Query<PlaybackQuery>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    let user_id = resolve_valid_user_id_with_query(&state, None, &headers, q.api_key.as_deref()).await?;
+    let user_id =
+        resolve_valid_user_id_with_query(&state, None, &headers, q.api_key.as_deref()).await?;
     let client_ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -483,13 +502,14 @@ pub(super) async fn stream_by_d_path(
     let alist_path = format!("/{}", decoded.trim_start_matches('/'));
     let path_hash = xxhash_rust::xxh3::xxh3_64(alist_path.as_bytes()) as i64;
 
-    if let Ok(Some((wid, is_ignored))) = sqlx::query_as::<_, (Option<i64>, bool)>(
+    let path_row = sqlx::query_as::<_, (Option<i64>, bool)>(
         "SELECT f.work_id, f.is_ignored FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.path_hash = $1 LIMIT 1",
     )
     .bind(path_hash)
     .fetch_optional(&state.db)
     .await
-    {
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some((wid, is_ignored)) = path_row {
         if is_ignored {
             return Err((StatusCode::NOT_FOUND, "条目已被屏蔽".to_string()));
         }
@@ -513,19 +533,6 @@ pub(super) async fn stream_by_d_path(
             )
         })?;
 
-    if let Some(sz) = resolved.file_size {
-        let db = state.db.clone();
-        tokio::spawn(async move {
-            let _ = sqlx::query(
-                "UPDATE sync_files SET file_size_bytes = $1 WHERE path_hash = $2 AND file_size_bytes IS NULL",
-            )
-            .bind(sz)
-            .bind(path_hash)
-            .execute(&db)
-            .await;
-        });
-    }
-
     Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, resolved.redirect_url)
@@ -541,4 +548,3 @@ pub(super) async fn get_media_segments() -> Json<Value> {
         "StartIndex": 0
     }))
 }
-

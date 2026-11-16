@@ -40,13 +40,12 @@ pub(super) async fn authenticate_by_name(
     };
 
     // 查询或首次自动初始化管理员账号
-    let user_row: Option<(String, String, bool)> = sqlx::query_as(
-        "SELECT id, password_hash, is_admin FROM users WHERE username = $1",
-    )
-    .bind(username)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let user_row: Option<(String, String, bool)> =
+        sqlx::query_as("SELECT id, password_hash, is_admin FROM users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let (user_id, is_admin) = match user_row {
         Some((uid, stored_pw, admin)) => {
@@ -229,7 +228,8 @@ pub(super) async fn get_user_info(
             .fetch_optional(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (username, is_admin) = user_row.ok_or_else(|| (StatusCode::NOT_FOUND, "用户不存在".to_string()))?;
+    let (username, is_admin) =
+        user_row.ok_or_else(|| (StatusCode::NOT_FOUND, "用户不存在".to_string()))?;
 
     Ok(Json(json!({
         "Id": valid_uid,
@@ -240,13 +240,21 @@ pub(super) async fn get_user_info(
 }
 
 /// 令牌被注销/吊销后使其内存校验缓存立即失效
-pub(in crate::web) async fn invalidate_token_cache(state: &AppState, tokens: &[String]) {
-    for tok in tokens {
-        state.caches.token_user_cache.invalidate(tok).await;
+async fn invalidate_token_cache_entries(
+    cache: &moka::future::Cache<String, Arc<(String, bool)>>,
+    tokens: &[String],
+) {
+    for token in tokens {
+        cache.invalidate(token).await;
     }
 }
 
-pub(super) fn extract_emby_token(headers: &HeaderMap, api_key: Option<&str>) -> Option<String> {    if let Some(k) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
+pub(in crate::web) async fn invalidate_token_cache(state: &AppState, tokens: &[String]) {
+    invalidate_token_cache_entries(&state.caches.token_user_cache, tokens).await;
+}
+
+pub(super) fn extract_emby_token(headers: &HeaderMap, api_key: Option<&str>) -> Option<String> {
+    if let Some(k) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(k.to_string());
     }
     for key in ["x-emby-token", "x-mediabrowser-token"] {
@@ -296,7 +304,10 @@ pub(super) async fn resolve_valid_user_id_with_query(
     api_key: Option<&str>,
 ) -> Result<String, (StatusCode, String)> {
     let token = extract_emby_token(headers, api_key).ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, "缺少访问令牌，请先登录".to_string())
+        (
+            StatusCode::UNAUTHORIZED,
+            "缺少访问令牌，请先登录".to_string(),
+        )
     })?;
 
     // 短 TTL 内存校验缓存：大多数请求免 PG JOIN；注销/吊销时通过 invalidate_token_cache 失效
@@ -319,7 +330,10 @@ pub(super) async fn resolve_valid_user_id_with_query(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let (uid, admin) = token_user.ok_or_else(|| {
-            (StatusCode::UNAUTHORIZED, "访问令牌无效或已注销，请重新登录".to_string())
+            (
+                StatusCode::UNAUTHORIZED,
+                "访问令牌无效或已注销，请重新登录".to_string(),
+            )
         })?;
         state
             .caches
@@ -330,7 +344,13 @@ pub(super) async fn resolve_valid_user_id_with_query(
     }
 
     // last_used_at 去抖：同一 token 5 分钟窗口内至多触发一次 UPDATE，避免每个请求都写库
-    if state.caches.token_touch_debounce.get(&token).await.is_none() {
+    if state
+        .caches
+        .token_touch_debounce
+        .get(&token)
+        .await
+        .is_none()
+    {
         state
             .caches
             .token_touch_debounce
@@ -368,3 +388,25 @@ pub(super) async fn resolve_valid_user_id_with_query(
     Ok(token_uid)
 }
 
+#[cfg(test)]
+mod cache_tests {
+    use super::invalidate_token_cache_entries;
+    use moka::future::Cache;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn revoking_a_token_invalidates_only_that_token_entry() {
+        let cache: Cache<String, Arc<(String, bool)>> = Cache::new(4);
+        cache
+            .insert("revoked".into(), Arc::new(("user-a".into(), false)))
+            .await;
+        cache
+            .insert("retained".into(), Arc::new(("user-b".into(), true)))
+            .await;
+
+        invalidate_token_cache_entries(&cache, &["revoked".to_string()]).await;
+
+        assert!(cache.get(&"revoked".to_string()).await.is_none());
+        assert!(cache.get(&"retained".to_string()).await.is_some());
+    }
+}

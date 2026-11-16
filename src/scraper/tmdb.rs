@@ -34,7 +34,10 @@ struct CountryObj {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct TmdbNamedId { pub id: i32, pub name: String }
+pub struct TmdbNamedId {
+    pub id: i32,
+    pub name: String,
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct TmdbWatchProviderEntry {
@@ -286,7 +289,11 @@ impl AppState {
         year: Option<i32>,
     ) -> Result<ScrapedMetadata> {
         if let Some(tid) = known_tmdb_id {
-            let primary = if inferred_type == "movie" { "movie" } else { "tv" };
+            let primary = if inferred_type == "movie" {
+                "movie"
+            } else {
+                "tv"
+            };
             let secondary = if primary == "movie" { "tv" } else { "movie" };
 
             if let Ok(meta) = self.fetch_tmdb_by_id(tid, primary).await {
@@ -294,7 +301,11 @@ impl AppState {
                 if let (Some(y1), Some(y2)) = (year, meta.year) {
                     if (y1 - y2).abs() > 2 {
                         if let Ok(alt_meta) = self.fetch_tmdb_by_id(tid, secondary).await {
-                            if alt_meta.year.map(|ay| (y1 - ay).abs() <= 2).unwrap_or(false) {
+                            if alt_meta
+                                .year
+                                .map(|ay| (y1 - ay).abs() <= 2)
+                                .unwrap_or(false)
+                            {
                                 return Ok(alt_meta);
                             }
                         }
@@ -327,7 +338,11 @@ impl AppState {
             cfg.tmdb_api_base, media_type, tmdb_id, cfg.tmdb_api_key, append
         );
 
-        let resp = client.get(&url).send().await.context("请求 TMDB 详情失败")?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .context("请求 TMDB 详情失败")?;
         if !resp.status().is_success() {
             return Err(anyhow!("TMDB 返回非成功状态码: {}", resp.status()));
         }
@@ -395,7 +410,11 @@ impl AppState {
             if let Some(kw) = t.keywords {
                 t.extra.keyword_items = kw.results;
             }
-            let crew = t.aggregate_credits.as_ref().map(|c| c.crew.as_slice()).unwrap_or(&[]);
+            let crew = t
+                .aggregate_credits
+                .as_ref()
+                .map(|c| c.crew.as_slice())
+                .unwrap_or(&[]);
             t.extra.directors = extract_directors(crew, &t.created_by);
             if let Some(cr) = t.aggregate_credits {
                 t.extra.cast = extract_top_cast(&cr.cast);
@@ -463,7 +482,10 @@ impl AppState {
                 if item.media_type == preferred_type {
                     score += 500;
                 }
-                let item_date = item.release_date.as_deref().or(item.first_air_date.as_deref());
+                let item_date = item
+                    .release_date
+                    .as_deref()
+                    .or(item.first_air_date.as_deref());
                 if let (Some(ty), Some(iy)) = (target_year, parse_year_from_date(item_date)) {
                     let diff = (ty - iy).abs();
                     if diff == 0 {
@@ -502,11 +524,9 @@ impl AppState {
             cfg.tmdb_api_base, tmdb_id, season_number, cfg.tmdb_api_key
         );
 
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("请求 TMDB 季详情失败: tv={} S{:02}", tmdb_id, season_number))?;
+        let resp = client.get(&url).send().await.with_context(|| {
+            format!("请求 TMDB 季详情失败: tv={} S{:02}", tmdb_id, season_number)
+        })?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -520,22 +540,52 @@ impl AppState {
             ));
         }
 
-        let mut season_data: TmdbSeasonDetailResp = resp
-            .json()
-            .await
-            .with_context(|| format!("解析 TMDB Season JSON 失败: tv={} S{:02}", tmdb_id, season_number))?;
+        let mut season_data: TmdbSeasonDetailResp = resp.json().await.with_context(|| {
+            format!(
+                "解析 TMDB Season JSON 失败: tv={} S{:02}",
+                tmdb_id, season_number
+            )
+        })?;
 
         // 清洗空字符串字段为 None
-        season_data.name = season_data.name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        season_data.overview = season_data.overview.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        season_data.poster_path = season_data.poster_path.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        season_data.air_date = season_data.air_date.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        season_data.name = season_data
+            .name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        season_data.overview = season_data
+            .overview
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        season_data.poster_path = season_data
+            .poster_path
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        season_data.air_date = season_data
+            .air_date
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         for ep in &mut season_data.episodes {
-            ep.name = ep.name.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            ep.overview = ep.overview.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            ep.still_path = ep.still_path.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            ep.air_date = ep.air_date.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            ep.name = ep
+                .name
+                .take()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            ep.overview = ep
+                .overview
+                .take()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            ep.still_path = ep
+                .still_path
+                .take()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            ep.air_date = ep
+                .air_date
+                .take()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
         }
 
         Ok(Some(season_data))
@@ -546,7 +596,12 @@ fn extract_spoken_languages(langs: &[RawSpokenLanguage]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for l in langs {
-        if let Some(code) = l.iso_639_1.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(code) = l
+            .iso_639_1
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let low = code.to_lowercase();
             if seen.insert(low.clone()) {
                 out.push(low);
@@ -639,7 +694,12 @@ fn extract_movie_release_dates(
             continue;
         }
         for item in c.release_dates {
-            if let Some(cert) = item.certification.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(cert) = item
+                .certification
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 if cert_seen.insert((reg.clone(), cert.to_string())) {
                     certs.push(TmdbCertificationEntry {
                         region: reg.clone(),
@@ -647,7 +707,8 @@ fn extract_movie_release_dates(
                     });
                 }
             }
-            if let (Some(rtype), Some(date_str)) = (item.release_type, item.release_date.as_deref()) {
+            if let (Some(rtype), Some(date_str)) = (item.release_type, item.release_date.as_deref())
+            {
                 if (rtype == 3 || rtype == 4) && date_str.len() >= 10 {
                     let ymd = &date_str[..10];
                     if stage_seen.insert((reg.clone(), rtype, ymd.to_string())) {
@@ -713,16 +774,18 @@ mod tests {
             "id":1,"title":"测试电影","original_language":"ja","vote_count":1200,"runtime":88,
             "genres":[{"id":16,"name":"动画"}],"belongs_to_collection":{"id":2,"name":"系列"},
             "production_companies":[{"id":3,"name":"制作公司"}]
-        })).unwrap();
-        assert_eq!(movie.extra.vote_count,Some(1200));
-        assert_eq!(movie.extra.collection.unwrap().id,2);
+        }))
+        .unwrap();
+        assert_eq!(movie.extra.vote_count, Some(1200));
+        assert_eq!(movie.extra.collection.unwrap().id, 2);
         let tv: TvDetailResp = serde_json::from_value(serde_json::json!({
             "id":2,"name":"测试剧","type":"Miniseries","status":"Ended",
             "networks":[{"id":2552,"name":"Apple TV"}],"number_of_episodes":8
-        })).unwrap();
-        assert_eq!(tv.extra.tv_type.as_deref(),Some("Miniseries"));
-        assert_eq!(tv.extra.networks[0].id,2552);
-        assert_eq!(tv.extra.number_of_episodes,Some(8));
+        }))
+        .unwrap();
+        assert_eq!(tv.extra.tv_type.as_deref(), Some("Miniseries"));
+        assert_eq!(tv.extra.networks[0].id, 2552);
+        assert_eq!(tv.extra.number_of_episodes, Some(8));
 
         let rich_movie: MovieDetailResp = serde_json::from_value(serde_json::json!({
             "id": 10, "title": "时空之旅", "spoken_languages": [{"iso_639_1": "ja"}, {"iso_639_1": "en"}],
@@ -734,7 +797,10 @@ mod tests {
             "watch/providers": {"results": {"US": {"flatrate": [{"provider_id": 8, "provider_name": "Netflix"}]}}},
             "release_dates": {"results": [{"iso_3166_1": "US", "release_dates": [{"certification": "PG-13", "release_date": "2026-10-01T00:00:00.000Z", "type": 4}]}]}
         })).unwrap();
-        assert_eq!(extract_spoken_languages(&rich_movie.spoken_languages), vec!["ja", "en"]);
+        assert_eq!(
+            extract_spoken_languages(&rich_movie.spoken_languages),
+            vec!["ja", "en"]
+        );
         assert_eq!(rich_movie.keywords.unwrap().keywords[0].id, 4379);
         let cr = rich_movie.credits.unwrap();
         assert_eq!(extract_directors(&cr.crew, &[])[0].id, 201);

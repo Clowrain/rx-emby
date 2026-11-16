@@ -1,26 +1,88 @@
-use super::auth::resolve_valid_user_id;
+use super::auth::resolve_valid_user_id_with_query;
 use super::images::compute_cover_image_tag;
+use super::playback::PlaybackQuery;
 use crate::smart_views::{can_access_view, VirtualLibraryRule};
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     Json,
 };
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 
+#[derive(Clone, Debug)]
+pub(crate) struct AccessibleVirtualLibrary {
+    pub filter_rules: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UserAccessScope {
+    pub allowed_categories: Option<Vec<String>>,
+    pub virtual_libraries: Vec<AccessibleVirtualLibrary>,
+}
+
+impl UserAccessScope {
+    pub(crate) fn has_no_access(&self) -> bool {
+        matches!(&self.allowed_categories, Some(categories) if categories.is_empty())
+            && self.virtual_libraries.is_empty()
+    }
+}
+
+pub(crate) async fn user_access_scope(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Arc<UserAccessScope>, (axum::http::StatusCode, String)> {
+    let allowed_categories = get_user_allowed_categories(state, user_id).await?;
+    let rows = if let Some(rows) = state.caches.enabled_vlibs_cache.get("enabled").await {
+        rows
+    } else {
+        let rows: Vec<(i32, String, Value)> = sqlx::query_as(
+            "SELECT id, name, filter_rules FROM virtual_libraries WHERE is_enabled = TRUE",
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        state
+            .caches
+            .enabled_vlibs_cache
+            .insert("enabled".to_string(), rows.clone())
+            .await;
+        rows
+    };
+    let virtual_libraries = rows
+        .into_iter()
+        .filter_map(|(id, name, filter_rules)| {
+            can_access_view(
+                allowed_categories.as_deref(),
+                &format!("lib_vlib_{id}"),
+                &name,
+            )
+            .then_some(AccessibleVirtualLibrary { filter_rules })
+        })
+        .collect();
+    Ok(Arc::new(UserAccessScope {
+        allowed_categories,
+        virtual_libraries,
+    }))
+}
+
 pub(super) async fn get_user_views(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(path_user_id): Path<String>,
-) -> Json<Value> {
+    Query(q): Query<PlaybackQuery>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
     let cfg = state.config.load();
-    let user_id = resolve_valid_user_id(&state, Some(&path_user_id), &headers)
-        .await
-        .unwrap_or(path_user_id);
+    let user_id = resolve_valid_user_id_with_query(
+        &state,
+        Some(&path_user_id),
+        &headers,
+        q.api_key.as_deref(),
+    )
+    .await?;
 
-    let allowed_cats = get_user_allowed_categories(&state, &user_id).await;
+    let allowed_cats = get_user_allowed_categories(&state, &user_id).await?;
 
     let base_libs = vec![
         ("lib_movie", "电影", "movies"),
@@ -49,11 +111,9 @@ pub(super) async fn get_user_views(
 
     let mut items: Vec<Value> = base_libs
         .into_iter()
-        .filter(|(id, name, _)| {
-            match &allowed_cats {
-                None => true,
-                Some(cats) => cats.iter().any(|c| c == "*" || c == name || c == id),
-            }
+        .filter(|(id, name, _)| match &allowed_cats {
+            None => true,
+            Some(cats) => cats.iter().any(|c| c == "*" || c == name || c == id),
         })
         .map(|(id, name, ctype)| {
             let (cover, revision) = base_cover_map
@@ -114,39 +174,44 @@ pub(super) async fn get_user_views(
         }));
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "Items": items,
         "TotalRecordCount": items.len()
-    }))
+    })))
 }
 
 /// 获取用户被允许访问的分类集合：`None` 代表不限权限（管理员或包含 `*`），`Some(vec)` 代表受限分类列表
-pub(super) async fn get_user_allowed_categories(state: &AppState, user_id: &str) -> Option<Vec<String>> {
+pub(super) async fn get_user_allowed_categories(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Option<Vec<String>>, (axum::http::StatusCode, String)> {
+    if let Some(categories) = state.caches.user_categories_cache.get(user_id).await {
+        return Ok(categories);
+    }
     let row: Option<(bool, Vec<String>)> =
-        match sqlx::query_as("SELECT is_admin, allowed_categories FROM users WHERE id = $1")
+        sqlx::query_as("SELECT is_admin, allowed_categories FROM users WHERE id = $1")
             .bind(user_id)
             .fetch_optional(&state.db)
             .await
-        {
-            Ok(row) => row,
-            Err(e) => {
-                tracing::warn!("查询用户分类权限失败 ({}): {}", user_id, e);
-                None
-            }
-        };
-
-    match row {
-        Some((is_admin, cats)) => {
-            if is_admin || cats.is_empty() || cats.iter().any(|c| c == "*") {
-                None
-            } else {
-                Some(cats)
-            }
-        }
-        None => None,
-    }
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (is_admin, cats) = row.ok_or_else(|| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "用户不存在".to_string(),
+        )
+    })?;
+    let categories = if is_admin || cats.iter().any(|c| c == "*") {
+        None
+    } else {
+        Some(cats)
+    };
+    state
+        .caches
+        .user_categories_cache
+        .insert(user_id.to_owned(), categories.clone())
+        .await;
+    Ok(categories)
 }
-
 
 /// 统计某个虚拟媒体库规则当前在库内命中的影视作品数
 pub async fn count_virtual_library_matches(
@@ -157,8 +222,7 @@ pub async fn count_virtual_library_matches(
         "SELECT COUNT(*) FROM media_works m WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE) AND $1::jsonb IS NOT NULL AND {}",
         rule.sql_predicate("$1::jsonb")
     );
-    let rule_json = serde_json::to_value(rule)
-        .map_err(|e| sqlx::Error::Configuration(e.into()))?;
+    let rule_json = serde_json::to_value(rule).map_err(|e| sqlx::Error::Configuration(e.into()))?;
     sqlx::query_scalar(&sql)
         .bind(rule_json)
         .fetch_one(&state.db)
@@ -176,3 +240,28 @@ pub(super) fn base_library_category(item_id: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
+mod access_scope_tests {
+    use super::{AccessibleVirtualLibrary, UserAccessScope};
+
+    #[test]
+    fn empty_restricted_categories_and_no_libraries_means_no_access() {
+        assert!(UserAccessScope {
+            allowed_categories: Some(vec![]),
+            virtual_libraries: vec![],
+        }
+        .has_no_access());
+        assert!(!UserAccessScope {
+            allowed_categories: None,
+            virtual_libraries: vec![],
+        }
+        .has_no_access());
+        assert!(!UserAccessScope {
+            allowed_categories: Some(vec![]),
+            virtual_libraries: vec![AccessibleVirtualLibrary {
+                filter_rules: serde_json::json!({"media_type":"movie"}),
+            }],
+        }
+        .has_no_access());
+    }
+}

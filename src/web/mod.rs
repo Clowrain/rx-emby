@@ -46,18 +46,15 @@ async fn log_unmatched_404(req: Request) -> StatusCode {
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
-    tracing::warn!(
-        "⚠️ [HTTP 404] {} {} | UA={:?}",
-        req.method(),
-        req.uri(),
-        ua
-    );
+    tracing::warn!("⚠️ [HTTP 404] {} {} | UA={:?}", req.method(), req.uri(), ua);
     StatusCode::NOT_FOUND
 }
 
 async fn serve_index() -> impl IntoResponse {
     match WebAssets::get("index.html") {
-        Some(content) => Html(String::from_utf8_lossy(content.data.as_ref()).into_owned()).into_response(),
+        Some(content) => {
+            Html(String::from_utf8_lossy(content.data.as_ref()).into_owned()).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "index.html 未找到").into_response(),
     }
 }

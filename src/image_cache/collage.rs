@@ -87,7 +87,11 @@ fn fit_cover(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
     resized.crop_imm(cx, cy, target_w, target_h).to_rgba8()
 }
 
-fn pick_img<'a>(posters: &'a [DynamicImage], backdrop: Option<&'a DynamicImage>, idx: usize) -> &'a DynamicImage {
+fn pick_img<'a>(
+    posters: &'a [DynamicImage],
+    backdrop: Option<&'a DynamicImage>,
+    idx: usize,
+) -> &'a DynamicImage {
     if !posters.is_empty() {
         &posters[idx % posters.len()]
     } else {
@@ -116,9 +120,33 @@ fn render_cards(posters: &[DynamicImage], backdrop: Option<&DynamicImage>) -> Rg
 
     // 卡片参数：(图片索引, 中心X, 中心Y, 宽, 高, 旋转角度, 亮度系数)
     let specs: [(usize, f32, f32, u32, u32, f32, f32); 3] = [
-        (1, COVER_W as f32 * 0.27, COVER_H as f32 * 0.54, 210, 315, -8.5, 0.86),
-        (2, COVER_W as f32 * 0.73, COVER_H as f32 * 0.54, 210, 315, 8.5, 0.86),
-        (0, COVER_W as f32 * 0.50, COVER_H as f32 * 0.50, 240, 360, 0.0, 1.0),
+        (
+            1,
+            COVER_W as f32 * 0.27,
+            COVER_H as f32 * 0.54,
+            210,
+            315,
+            -8.5,
+            0.86,
+        ),
+        (
+            2,
+            COVER_W as f32 * 0.73,
+            COVER_H as f32 * 0.54,
+            210,
+            315,
+            8.5,
+            0.86,
+        ),
+        (
+            0,
+            COVER_W as f32 * 0.50,
+            COVER_H as f32 * 0.50,
+            240,
+            360,
+            0.0,
+            1.0,
+        ),
     ];
 
     for (idx, cx, cy, cw, ch, angle_deg, brightness) in specs {
@@ -168,7 +196,10 @@ fn draw_rounded_rotated_card(
                 } else {
                     0.55 * (1.0 - dist / 24.0).powi(2)
                 };
-                blend_pixel(canvas.get_pixel_mut(px as u32, py as u32), Rgba([0, 0, 0, (shadow_alpha * 255.0) as u8]));
+                blend_pixel(
+                    canvas.get_pixel_mut(px as u32, py as u32),
+                    Rgba([0, 0, 0, (shadow_alpha * 255.0) as u8]),
+                );
             }
         }
     }
@@ -280,7 +311,11 @@ fn render_hero(posters: &[DynamicImage], backdrop: Option<&DynamicImage>) -> Rgb
             for cx in 0..right_w {
                 let mut px = *cell.get_pixel(cx, cy);
                 // 左侧边缘与主视觉融合过渡
-                let edge_fade = if cx < 28 { 0.4 + 0.6 * (cx as f32 / 28.0) } else { 1.0 };
+                let edge_fade = if cx < 28 {
+                    0.4 + 0.6 * (cx as f32 / 28.0)
+                } else {
+                    1.0
+                };
                 px[0] = (px[0] as f32 * 0.88 * edge_fade) as u8;
                 px[1] = (px[1] as f32 * 0.88 * edge_fade) as u8;
                 px[2] = (px[2] as f32 * 0.90 * edge_fade) as u8;
@@ -382,8 +417,14 @@ fn sample_bilinear(img: &RgbaImage, x: f32, y: f32) -> Rgba<u8> {
 fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     let a = src[3] as f32 / 255.0;
     let inv = 1.0 - a;
-    dst[0] = (src[0] as f32 * a + dst[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-    dst[1] = (src[1] as f32 * a + dst[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-    dst[2] = (src[2] as f32 * a + dst[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+    dst[0] = (src[0] as f32 * a + dst[0] as f32 * inv)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    dst[1] = (src[1] as f32 * a + dst[1] as f32 * inv)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    dst[2] = (src[2] as f32 * a + dst[2] as f32 * inv)
+        .round()
+        .clamp(0.0, 255.0) as u8;
     dst[3] = 255;
 }

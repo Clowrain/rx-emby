@@ -19,7 +19,10 @@ pub struct AdminUser {
 }
 
 fn extract_admin_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         let trimmed = auth.trim();
         if let Some(token) = trimmed
             .strip_prefix("Bearer ")
@@ -47,8 +50,12 @@ pub(super) async fn require_admin_auth(
     mut req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
-    let token = extract_admin_token(req.headers())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "未登录，请先使用系统管理员账号登录".to_string()))?;
+    let token = extract_admin_token(req.headers()).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "未登录，请先使用系统管理员账号登录".to_string(),
+        )
+    })?;
 
     let row: Option<(String, String, bool)> = sqlx::query_as(
         r#"
@@ -112,13 +119,12 @@ pub(super) async fn admin_login(
         return Err((StatusCode::BAD_REQUEST, "请输入用户名".to_string()));
     }
 
-    let user_row: Option<(String, String, bool)> = sqlx::query_as(
-        "SELECT id, password_hash, is_admin FROM users WHERE username = $1",
-    )
-    .bind(username)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let user_row: Option<(String, String, bool)> =
+        sqlx::query_as("SELECT id, password_hash, is_admin FROM users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let (user_id, is_admin) = match user_row {
         Some((uid, stored_pw, admin)) => {
@@ -242,4 +248,3 @@ pub(super) async fn admin_logout(
 pub(super) async fn admin_me(Extension(user): Extension<AdminUser>) -> Json<Value> {
     Json(json!({ "user": user }))
 }
-

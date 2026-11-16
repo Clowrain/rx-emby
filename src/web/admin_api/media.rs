@@ -24,7 +24,13 @@ pub(super) struct AdminMediaQuery {
 
 fn build_admin_media_order_clause(sort_by: Option<&str>, is_asc: bool) -> &'static str {
     match sort_by.unwrap_or("updated_at") {
-        "created_at" => if is_asc { "w.created_at ASC, w.id ASC" } else { "w.created_at DESC, w.id DESC" },
+        "created_at" => {
+            if is_asc {
+                "w.created_at ASC, w.id ASC"
+            } else {
+                "w.created_at DESC, w.id DESC"
+            }
+        }
         "year" => {
             if is_asc {
                 "COALESCE(NULLIF(w.premiered_at, ''), CASE WHEN w.year IS NOT NULL THEN w.year::text || '-01-01' ELSE NULL END) ASC NULLS LAST, w.id ASC"
@@ -32,9 +38,27 @@ fn build_admin_media_order_clause(sort_by: Option<&str>, is_asc: bool) -> &'stat
                 "COALESCE(NULLIF(w.premiered_at, ''), CASE WHEN w.year IS NOT NULL THEN w.year::text || '-01-01' ELSE NULL END) DESC NULLS LAST, w.id DESC"
             }
         }
-        "rating" => if is_asc { "w.rating ASC, w.id ASC" } else { "w.rating DESC, w.id DESC" },
-        "title" => if is_asc { "w.title ASC, w.id ASC" } else { "w.title DESC, w.id DESC" },
-        _ => if is_asc { "w.updated_at ASC, w.id ASC" } else { "w.updated_at DESC, w.id DESC" },
+        "rating" => {
+            if is_asc {
+                "w.rating ASC, w.id ASC"
+            } else {
+                "w.rating DESC, w.id DESC"
+            }
+        }
+        "title" => {
+            if is_asc {
+                "w.title ASC, w.id ASC"
+            } else {
+                "w.title DESC, w.id DESC"
+            }
+        }
+        _ => {
+            if is_asc {
+                "w.updated_at ASC, w.id ASC"
+            } else {
+                "w.updated_at DESC, w.id DESC"
+            }
+        }
     }
 }
 
@@ -61,7 +85,11 @@ pub(super) async fn list_admin_media(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(30).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
-    let kw_raw = q.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let kw_raw = q
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let kw = kw_raw.map(|s| format!("%{}%", s));
     let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
 
@@ -201,7 +229,10 @@ pub(super) async fn get_admin_media_detail(
     };
 
     if media.media_type == "tv" {
-        let _ = state.scraper.priority_tx.try_send(ScrapeTask::WorkSeasons(work_id));
+        let _ = state
+            .scraper
+            .priority_tx
+            .try_send(ScrapeTask::WorkSeasons(work_id));
     }
 
     let folders: Vec<AdminLinkedFolderRow> = sqlx::query_as(
@@ -324,14 +355,10 @@ pub(super) async fn bind_tmdb_id(
 
     let mut target_work_id = work_id;
     for fid in folder_ids {
-        target_work_id = promote_folder_manually(
-            &state,
-            fid,
-            Some(tmdb_id),
-            payload.media_type.as_deref(),
-        )
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("改绑 TMDB 失败: {:#}", e)))?;
+        target_work_id =
+            promote_folder_manually(&state, fid, Some(tmdb_id), payload.media_type.as_deref())
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("改绑 TMDB 失败: {:#}", e)))?;
     }
 
     let _ = sqlx::query("UPDATE media_works SET is_locked = TRUE WHERE id = $1")
@@ -340,6 +367,7 @@ pub(super) async fn bind_tmdb_id(
         .await;
 
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
     Ok(Json(json!({
         "status": "ok",
@@ -360,11 +388,19 @@ pub(super) async fn scrape_one_now(
 
     scrape_work_seasons_by_id(&state, work_id, true)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("作品分集刮削失败: {:#}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("作品分集刮削失败: {:#}", e),
+            )
+        })?;
 
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
-    Ok(Json(json!({ "status": "ok", "message": "作品及分集元数据刷新成功" })))
+    Ok(Json(
+        json!({ "status": "ok", "message": "作品及分集元数据刷新成功" }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -386,6 +422,7 @@ pub(super) async fn toggle_ignore_media(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
     Ok(Json(json!({
         "status": "ok",
@@ -407,12 +444,14 @@ pub(super) async fn update_folder_priority(
     Path(folder_id): Path<i64>,
     Json(payload): Json<FolderPriorityReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let res = sqlx::query("UPDATE sync_folders SET priority_boost = $1, updated_at = NOW() WHERE id = $2")
-        .bind(payload.priority_boost)
-        .bind(folder_id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let res = sqlx::query(
+        "UPDATE sync_folders SET priority_boost = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(payload.priority_boost)
+    .bind(folder_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if res.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "物理目录不存在".into()));
@@ -502,7 +541,11 @@ pub(super) async fn list_staging_folders(
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "all")
         .map(str::to_string);
-    let kw_raw = q.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let kw_raw = q
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let kw = kw_raw.map(|s| format!("%{}%", s));
     let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
 
@@ -582,6 +625,7 @@ pub(super) async fn scrape_staging_folder(
     .unwrap_or(None);
 
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
     let (scrape_state, conflict_reason, work_id) =
         state_after.unwrap_or(("pending".into(), None, None));
@@ -614,6 +658,7 @@ pub(super) async fn promote_staging_folder(
     .map_err(|e| (StatusCode::BAD_GATEWAY, format!("手动发布失败: {:#}", e)))?;
 
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
     Ok(Json(json!({
         "status": "ok",
@@ -639,6 +684,7 @@ pub(super) async fn toggle_ignore_staging_folder(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
     Ok(Json(json!({
         "status": "ok",
@@ -681,6 +727,7 @@ pub(super) async fn retry_failed_scrapes(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.caches.admin_stats_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
 
     Ok(Json(json!({
         "status": "ok",

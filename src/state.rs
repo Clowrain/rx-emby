@@ -106,9 +106,9 @@ pub struct CacheLayer {
     pub alist_dir_prewarmed: Cache<String, ()>,
     /// Key = "{size}/{file_name}", Value = 图片字节流。
     /// `try_get_with` 兼做真正的 singleflight：并发同图请求只放行一次回源/渲染并共享结果。
-    pub image_hot_bytes: Cache<String, Arc<Vec<u8>>>,
+    pub image_hot_bytes: Cache<String, bytes::Bytes>,
     /// Key = "collage:{view_id}:{style}:{hash}", Value = 渲染完成的拼接封面字节流
-    pub collage_cache: Cache<String, Arc<Vec<u8>>>,
+    pub collage_cache: Cache<String, bytes::Bytes>,
     /// TMDB 图片出站下载并发上限（防止海报墙风暴打满反代带宽与连接池）
     pub image_download_permits: Arc<Semaphore>,
     /// 图片条目元数据查询缓存：Key = "{item_id}:{image_type}" -> (size, file_name)
@@ -121,6 +121,10 @@ pub struct CacheLayer {
     pub token_touch_debounce: Cache<String, ()>,
     /// 后台概览与统计短时缓存（避免频繁切换 Tab 反复触发全表聚合扫描）
     pub admin_stats_cache: Cache<String, serde_json::Value>,
+    /// 用户可访问分类缓存；None 表示管理员/通配 unrestricted，Some(empty) 表示没有分类。
+    pub user_categories_cache: Cache<String, Option<Vec<String>>>,
+    /// 启用的虚拟媒体库缓存（全局短 TTL）。
+    pub enabled_vlibs_cache: Cache<String, Vec<(i32, String, serde_json::Value)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,7 +165,10 @@ impl AppState {
             .build();
 
         let inflight = Cache::builder()
-            .max_capacity(512)
+            .max_capacity(128 * 1024 * 1024)
+            .weigher(|_key: &String, value: &bytes::Bytes| {
+                value.len().min(u32::MAX as usize) as u32
+            })
             .time_to_live(Duration::from_secs(600))
             .build();
 
@@ -195,6 +202,16 @@ impl AppState {
             .time_to_live(Duration::from_secs(10))
             .build();
 
+        let user_categories_cache = Cache::builder()
+            .max_capacity(2_000)
+            .time_to_live(Duration::from_secs(60))
+            .build();
+
+        let enabled_vlibs_cache = Cache::builder()
+            .max_capacity(1)
+            .time_to_live(Duration::from_secs(30))
+            .build();
+
         let cfg_arc = Arc::new(initial_cfg);
         let (config_tx, _) = watch::channel(cfg_arc.clone());
 
@@ -221,6 +238,8 @@ impl AppState {
                 token_user_cache,
                 token_touch_debounce,
                 admin_stats_cache,
+                user_categories_cache,
+                enabled_vlibs_cache,
             },
             sessions: DashMap::new(),
             monitor: crate::monitor::MonitorState::default(),
@@ -255,7 +274,10 @@ impl AppState {
         if old_cfg.tmdb_rate_limit_per_sec != new_cfg.tmdb_rate_limit_per_sec {
             let limiter = build_rate_limiter(new_cfg.tmdb_rate_limit_per_sec);
             self.scraper.limiter.store(Arc::new(limiter));
-            info!("TMDB 限流速率已热更新: {} req/s", new_cfg.tmdb_rate_limit_per_sec);
+            info!(
+                "TMDB 限流速率已热更新: {} req/s",
+                new_cfg.tmdb_rate_limit_per_sec
+            );
         }
 
         // 3. 若 AList 鉴权或路径前缀变更，清空旧 Token 与直链/目录预热缓存
@@ -285,7 +307,8 @@ pub fn build_tmdb_client(proxy_url: Option<&str>) -> Result<Client> {
         .pool_max_idle_per_host(16);
 
     if let Some(p_url) = proxy_url {
-        let proxy = Proxy::all(p_url).with_context(|| format!("无效的 TMDB 代理地址: {}", p_url))?;
+        let proxy =
+            Proxy::all(p_url).with_context(|| format!("无效的 TMDB 代理地址: {}", p_url))?;
         builder = builder.proxy(proxy);
     }
 

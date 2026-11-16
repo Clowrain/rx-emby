@@ -9,6 +9,14 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn invalidate_user_permission_caches(
+    token_cache: &moka::future::Cache<String, Arc<(String, bool)>>,
+    categories_cache: &moka::future::Cache<String, Option<Vec<String>>>,
+) {
+    token_cache.invalidate_all();
+    categories_cache.invalidate_all();
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct AdminUserRow {
     id: String,
@@ -196,20 +204,26 @@ pub(super) async fn save_user(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("创建用户失败: {}", e)))?;
     }
 
-    Ok(Json(json!({ "status": "ok", "message": "用户账号与权限配置已保存" })))
+    invalidate_user_permission_caches(
+        &state.caches.token_user_cache,
+        &state.caches.user_categories_cache,
+    );
+
+    Ok(Json(
+        json!({ "status": "ok", "message": "用户账号与权限配置已保存" }),
+    ))
 }
 
 pub(super) async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(uid): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let is_target_admin: bool =
-        sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
-            .bind(&uid)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None)
-            .unwrap_or(false);
+    let is_target_admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = $1")
+        .bind(&uid)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(false);
 
     if is_target_admin {
         let admin_count: i64 =
@@ -218,7 +232,10 @@ pub(super) async fn delete_user(
                 .await
                 .unwrap_or(1);
         if admin_count <= 1 {
-            return Err((StatusCode::BAD_REQUEST, "不能删除系统唯一的管理员账号".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "不能删除系统唯一的管理员账号".to_string(),
+            ));
         }
     }
 
@@ -229,6 +246,10 @@ pub(super) async fn delete_user(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.sessions.retain(|_, s| s.user_id != uid);
+    invalidate_user_permission_caches(
+        &state.caches.token_user_cache,
+        &state.caches.user_categories_cache,
+    );
     state.caches.admin_stats_cache.invalidate_all();
 
     Ok(Json(json!({ "status": "ok", "message": "用户已删除" })))
@@ -238,13 +259,12 @@ pub(super) async fn revoke_access_token(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let deleted: Option<(String, String)> = sqlx::query_as(
-        "DELETE FROM access_tokens WHERE token = $1 RETURNING user_id, device_name",
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let deleted: Option<(String, String)> =
+        sqlx::query_as("DELETE FROM access_tokens WHERE token = $1 RETURNING user_id, device_name")
+            .bind(&token)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if let Some((uid, dev)) = deleted {
         state
@@ -254,6 +274,31 @@ pub(super) async fn revoke_access_token(
     }
     state.caches.admin_stats_cache.invalidate_all();
 
-    Ok(Json(json!({ "status": "ok", "message": "已注销该客户端设备" })))
+    Ok(Json(
+        json!({ "status": "ok", "message": "已注销该客户端设备" }),
+    ))
 }
 
+#[cfg(test)]
+mod cache_tests {
+    use super::invalidate_user_permission_caches;
+    use moka::future::Cache;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn saving_or_deleting_user_permissions_invalidates_token_and_category_caches() {
+        let tokens: Cache<String, Arc<(String, bool)>> = Cache::new(4);
+        let categories: Cache<String, Option<Vec<String>>> = Cache::new(4);
+        tokens
+            .insert("token".into(), Arc::new(("user".into(), false)))
+            .await;
+        categories
+            .insert("user".into(), Some(vec!["电影".into()]))
+            .await;
+
+        invalidate_user_permission_caches(&tokens, &categories);
+
+        assert!(tokens.get(&"token".to_string()).await.is_none());
+        assert!(categories.get(&"user".to_string()).await.is_none());
+    }
+}
