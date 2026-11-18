@@ -732,6 +732,7 @@ pub(super) async fn session_playing_with_identity(
             client_name,
             current_episode_id: ep_id,
             position_ticks: body.position_ticks,
+            duration_ticks: body.run_time_ticks.max(0),
             next_ep_prewarmed: false,
             completed_in_session: false,
             last_activity: std::time::Instant::now(),
@@ -879,6 +880,7 @@ pub(super) async fn session_progress_with_identity(
                 client_name: client_name.clone(),
                 current_episode_id: ep_id,
                 position_ticks: body.position_ticks,
+                duration_ticks: body.run_time_ticks.max(0),
                 next_ep_prewarmed: false,
                 completed_in_session: false,
                 last_activity: std::time::Instant::now(),
@@ -956,6 +958,7 @@ pub(super) async fn session_progress_with_identity(
                     client_name: client_name.clone(),
                     current_episode_id: ep_id,
                     position_ticks: body.position_ticks,
+                    duration_ticks: body.run_time_ticks.max(0),
                     next_ep_prewarmed: false,
                     completed_in_session: false,
                     last_activity: std::time::Instant::now(),
@@ -967,6 +970,9 @@ pub(super) async fn session_progress_with_identity(
         entry.device_name.clone_from(&device_name);
         entry.client_name.clone_from(&client_name);
         entry.position_ticks = body.position_ticks;
+        if body.run_time_ticks > 0 {
+            entry.duration_ticks = body.run_time_ticks;
+        }
         entry.last_activity = std::time::Instant::now();
         if auto_completed {
             entry.completed_in_session = true;
@@ -1818,6 +1824,7 @@ mod session_fix_tests {
             client_name: "test".into(),
             current_episode_id: None,
             position_ticks: 0,
+            duration_ticks: 0,
             next_ep_prewarmed: false,
             completed_in_session: false,
             last_activity: std::time::Instant::now(),

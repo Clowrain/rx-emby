@@ -207,6 +207,7 @@ async fn non_admin_sessions_are_private() {
                 client_name: "test".into(),
                 current_episode_id: None,
                 position_ticks: 0,
+                duration_ticks: 0,
                 next_ep_prewarmed: false,
                 completed_in_session: false,
                 last_activity: std::time::Instant::now(),

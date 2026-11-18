@@ -13,7 +13,7 @@
         </div>
         <button
           type="button"
-          @click="loadSessions"
+          @click="loadSessions(false)"
           :disabled="loading"
           class="cursor-pointer bg-slate-800 hover:bg-slate-700 disabled:opacity-50 px-3.5 py-1.5 rounded-xl text-xs font-medium transition-colors flex items-center gap-1.5"
         >
@@ -55,11 +55,21 @@
             </span>
           </div>
           <div class="text-xs text-slate-300 flex items-center justify-between font-mono">
-            <span>已播放进度: {{ Math.floor(s.position_sec / 60) }}分{{ s.position_sec % 60 }}秒</span>
+            <span>
+              {{ formatDuration(s.position_sec) }}
+              <template v-if="s.duration_sec > 0"> / {{ formatDuration(s.duration_sec) }}</template>
+            </span>
             <span class="text-slate-500">心跳: {{ s.idle_sec }}s 前</span>
           </div>
-          <div class="text-[11px] text-slate-400 truncate">
-            客户端设备: {{ s.client_name }} · 用户 ID: <span class="font-mono">{{ s.user_id }}</span>
+          <div v-if="s.duration_sec > 0" class="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div
+              class="h-full bg-emerald-400 transition-all duration-300"
+              :style="{ width: Math.min(100, Math.round((s.position_sec / s.duration_sec) * 100)) + '%' }"
+            ></div>
+          </div>
+          <div class="text-[11px] text-slate-400 flex items-center justify-between gap-2 truncate">
+            <span class="truncate">{{ s.client_name }}<template v-if="s.device_name"> · {{ s.device_name }}</template></span>
+            <span class="font-mono text-slate-300 shrink-0">{{ s.username || s.user_id }}</span>
           </div>
         </div>
       </div>
@@ -68,7 +78,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { Activity, RefreshCw, FastForward, Play } from 'lucide-vue-next'
 import { adminApi } from '../api/admin'
 import { useToast } from '../composables/useToast'
@@ -76,20 +86,42 @@ import { useToast } from '../composables/useToast'
 const toast = useToast()
 const loading = ref(false)
 const activeSessions = ref([])
+let pollTimer = null
 
-async function loadSessions() {
-  if (activeSessions.value.length === 0) {
+function formatDuration(sec) {
+  const total = Math.max(0, Math.floor(sec || 0))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  const pad = (n) => String(n).padStart(2, '0')
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`
+}
+
+async function loadSessions(silent = false) {
+  if (!silent && activeSessions.value.length === 0) {
     loading.value = true
   }
   try {
     const data = await adminApi.listUsersAndSessions()
     activeSessions.value = data.active_sessions || []
   } catch (err) {
-    toast.error('加载实时会话失败：' + err.message)
+    if (!silent) {
+      toast.error('加载实时会话失败：' + err.message)
+    }
   } finally {
     loading.value = false
   }
 }
 
-onMounted(loadSessions)
+onMounted(() => {
+  loadSessions(false)
+  pollTimer = setInterval(() => loadSessions(true), 3000)
+})
+
+onUnmounted(() => {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+})
 </script>

@@ -90,12 +90,20 @@ pub(super) async fn list_users_and_sessions(
         .iter()
         .filter_map(|s| s.current_episode_id.filter(|id| *id < 0).map(|id| -id))
         .collect();
-    let file_labels: std::collections::HashMap<i64, String> = sqlx::query_as(
-        r#"SELECT sf.id, COALESCE(w.title, f.clean_title, '未知') || ' · S' || LPAD(sf.season_number::text, 2, '0') || 'E' || LPAD(sf.episode_number::text, 2, '0')
-           FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id LEFT JOIN media_works w ON w.id = f.work_id
+    let file_meta: std::collections::HashMap<i64, (String, i64)> = sqlx::query_as::<_, (i64, String, i64)>(
+        r#"SELECT sf.id,
+                  COALESCE(w.title, f.clean_title, '未知') || ' · S' || LPAD(sf.season_number::text, 2, '0') || 'E' || LPAD(sf.episode_number::text, 2, '0') || COALESCE(' - ' || NULLIF(we.title, ''), ''),
+                  COALESCE(we.runtime, 0)::bigint * 60
+           FROM sync_files sf
+           JOIN sync_folders f ON f.id = sf.folder_id
+           LEFT JOIN media_works w ON w.id = f.work_id
+           LEFT JOIN work_episodes we ON we.work_id = f.work_id AND we.season_number = sf.season_number AND we.episode_number = sf.episode_number
            WHERE sf.id = ANY($1)"#,
     ).bind(&file_ids).fetch_all(&state.db).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.into_iter().collect();
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|(id, label, dur)| (id, (label, dur)))
+        .collect();
     let work_labels: std::collections::HashMap<i64, String> =
         sqlx::query_as("SELECT id, title FROM media_works WHERE id = ANY($1)")
             .bind(&work_ids)
@@ -104,23 +112,41 @@ pub(super) async fn list_users_and_sessions(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .into_iter()
             .collect();
+    let user_names: std::collections::HashMap<&str, &str> = users
+        .iter()
+        .map(|u| (u.id.as_str(), u.username.as_str()))
+        .collect();
     let mut active_sessions = Vec::new();
     for s in sessions {
         let idle_sec = s.last_activity.elapsed().as_secs();
-        let ep_label = match s.current_episode_id {
-            Some(id) if id > 0 => file_labels.get(&id).cloned(),
-            Some(id) if id < 0 => work_labels.get(&(-id)).cloned(),
-            _ => None,
+        let (ep_label, fallback_dur_sec) = match s.current_episode_id {
+            Some(id) if id > 0 => file_meta
+                .get(&id)
+                .map(|(label, dur)| (Some(label.clone()), *dur))
+                .unwrap_or((None, 0)),
+            Some(id) if id < 0 => (work_labels.get(&(-id)).cloned(), 0),
+            _ => (None, 0),
         };
+        let duration_sec = if s.duration_ticks > 0 {
+            s.duration_ticks / 10_000_000
+        } else {
+            fallback_dur_sec
+        };
+        let username = user_names
+            .get(s.user_id.as_str())
+            .copied()
+            .unwrap_or(s.user_id.as_str());
 
         active_sessions.push(json!({
             "session_id": s.session_id,
             "user_id": s.user_id,
+            "username": username,
             "device_name": s.device_name,
             "client_name": s.client_name,
             "current_episode_id": s.current_episode_id,
             "playing_title": ep_label.unwrap_or_else(|| "未知剧集".to_string()),
             "position_sec": s.position_ticks / 10_000_000,
+            "duration_sec": duration_sec,
             "next_ep_prewarmed": s.next_ep_prewarmed,
             "idle_sec": idle_sec
         }));
