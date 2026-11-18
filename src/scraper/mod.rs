@@ -573,7 +573,7 @@ pub async fn scrape_single_folder_with_mode(
     }
 
     let (ep_count, max_season): (i64, i32) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(MAX(season_number), 0) FROM sync_files WHERE folder_id = $1",
+        "SELECT COUNT(DISTINCT (season_number, episode_number)), COALESCE(MAX(season_number), 0) FROM sync_files WHERE folder_id = $1",
     )
     .bind(folder.id)
     .fetch_one(&state.db)
