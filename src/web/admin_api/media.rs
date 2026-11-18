@@ -962,6 +962,221 @@ pub(super) async fn update_file_priority(
     })))
 }
 
+#[derive(Deserialize)]
+pub(super) struct UpdateFileEpisodeReq {
+    season_number: i32,
+    episode_number: i32,
+    episode_title: Option<String>,
+    convert_to_tv: Option<bool>,
+}
+
+/// 手动修正单个物理文件的季/集号（及可选单集标题），多集时自动切换作品为剧集并锁定
+pub(super) async fn update_file_episode(
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<i64>,
+    Json(payload): Json<UpdateFileEpisodeReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if payload.season_number < 0 || payload.episode_number < 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "季号必须 >= 0，集号必须 >= 1".into(),
+        ));
+    }
+    let ep_title = clean_opt_text(payload.episode_title);
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let work_id: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT f.work_id
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE sf.id = $1
+        "#,
+    )
+    .bind(file_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .flatten();
+
+    let Some(work_id) = work_id else {
+        return Err((StatusCode::NOT_FOUND, "物理文件不存在或尚未关联正式作品".into()));
+    };
+
+    sqlx::query("UPDATE sync_files SET season_number = $1, episode_number = $2 WHERE id = $3")
+        .bind(payload.season_number)
+        .bind(payload.episode_number)
+        .bind(file_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some(ref title) = ep_title {
+        sqlx::query(
+            r#"
+            INSERT INTO work_episodes (work_id, season_number, episode_number, title)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (work_id, season_number, episode_number) DO UPDATE
+            SET title = EXCLUDED.title
+            "#,
+        )
+        .bind(work_id)
+        .bind(payload.season_number)
+        .bind(payload.episode_number)
+        .bind(title)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    let distinct_ep_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(DISTINCT (sf.season_number, sf.episode_number))
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        "#,
+    )
+    .bind(work_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let should_tv = payload.convert_to_tv.unwrap_or(distinct_ep_count > 1);
+    if should_tv {
+        sqlx::query(
+            r#"
+            UPDATE media_works
+            SET media_type = 'tv',
+                is_locked = TRUE,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    invalidate_admin_stats(&state).await;
+    broadcast_work_visibility(&state, work_id, true).await;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "work_id": work_id,
+        "season_number": payload.season_number,
+        "episode_number": payload.episode_number,
+        "converted_to_tv": should_tv,
+        "message": format!(
+            "已将文件归入 S{:02}E{:02}{}",
+            payload.season_number,
+            payload.episode_number,
+            if should_tv { "（已切换为剧集并锁定）" } else { "" }
+        )
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct SplitWorkEpisodesReq {
+    file_ids: Vec<i64>,
+    season_number: Option<i32>,
+    start_episode: Option<i32>,
+}
+
+/// 将误合并为“同集多版本”的多个文件按顺序拆分为连续剧集（如上下集 -> S01E01, S01E02）
+pub(super) async fn split_work_group_to_episodes(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+    Json(payload): Json<SplitWorkEpisodesReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if payload.file_ids.len() < 2 {
+        return Err((StatusCode::BAD_REQUEST, "至少需要选择 2 个文件才能拆分为多集".into()));
+    }
+    let season_number = payload.season_number.unwrap_or(1);
+    let start_episode = payload.start_episode.unwrap_or(1);
+    if season_number < 0 || start_episode < 1 {
+        return Err((StatusCode::BAD_REQUEST, "季号必须 >= 0，起始集号必须 >= 1".into()));
+    }
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let valid_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND sf.id = ANY($2)
+        "#,
+    )
+    .bind(work_id)
+    .bind(&payload.file_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if valid_count != payload.file_ids.len() as i64 {
+        return Err((StatusCode::BAD_REQUEST, "部分文件不属于当前作品".into()));
+    }
+
+    for (idx, fid) in payload.file_ids.iter().enumerate() {
+        let ep_num = start_episode + idx as i32;
+        sqlx::query("UPDATE sync_files SET season_number = $1, episode_number = $2 WHERE id = $3")
+            .bind(season_number)
+            .bind(ep_num)
+            .bind(*fid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE media_works
+        SET media_type = 'tv',
+            is_locked = TRUE,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(work_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    invalidate_admin_stats(&state).await;
+    broadcast_work_visibility(&state, work_id, true).await;
+
+    let end_ep = start_episode + payload.file_ids.len() as i32 - 1;
+    Ok(Json(json!({
+        "status": "ok",
+        "message": format!(
+            "已将 {} 个文件拆分为 S{:02}E{:02}-E{:02}，并切换为剧集模式",
+            payload.file_ids.len(),
+            season_number,
+            start_episode,
+            end_ep
+        )
+    })))
+}
+
 // =========================================================================
 // Staging 中间表管理工作台 (`sync_folders`: pending / conflict / failed / ignored)
 // =========================================================================

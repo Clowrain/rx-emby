@@ -67,8 +67,16 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(media::split_folder_to_new_work),
         )
         .route(
+            "/api/admin/media/:id/split_episodes",
+            post(media::split_work_group_to_episodes),
+        )
+        .route(
             "/api/admin/files/:id/priority",
             post(media::update_file_priority),
+        )
+        .route(
+            "/api/admin/files/:id/episode",
+            axum::routing::put(media::update_file_episode),
         )
         .route(
             "/api/admin/staging/folders",

@@ -131,6 +131,20 @@ export const adminApi = {
       method: 'POST'
     })
   },
+  updateFileEpisode(fileId, payload) {
+    return requestJson(`/api/admin/files/${fileId}/episode`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+  },
+  splitWorkEpisodes(workId, payload) {
+    return requestJson(`/api/admin/media/${workId}/split_episodes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+  },
   retryFailedScrapes() {
     return requestJson('/api/admin/staging/retry_failed', { method: 'POST' })
   },

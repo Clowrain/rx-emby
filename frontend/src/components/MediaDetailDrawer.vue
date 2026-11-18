@@ -409,6 +409,17 @@
                       >
                         待补全剧照/简介
                       </span>
+                      <button
+                        v-if="grp.list.length > 1"
+                        type="button"
+                        :disabled="splittingGroupKey === grp.key"
+                        @click="handleSplitGroupToEpisodes(grp)"
+                        class="cursor-pointer disabled:opacity-50 px-2 py-0.5 rounded-md bg-amber-500/15 hover:bg-amber-500/25 text-amber-200 border border-amber-500/35 flex items-center gap-1 transition-colors"
+                        title="若这些文件不是同一集的不同版本，而是上下集/多集，点击按文件名顺序拆分为独立剧集（S01E01, S01E02...）"
+                      >
+                        <ListOrdered class="w-3 h-3" aria-hidden="true" />
+                        <span>{{ splittingGroupKey === grp.key ? '拆分中...' : '拆为独立剧集' }}</span>
+                      </button>
                     </div>
                   </div>
                   <p
@@ -483,6 +494,15 @@
                       >
                         恢复默认
                       </button>
+                      <button
+                        type="button"
+                        :disabled="busyFileId === src.id"
+                        @click="openFileEpisodeEditor(src)"
+                        class="cursor-pointer disabled:opacity-50 px-1.5 py-0.5 rounded bg-sky-950/80 hover:bg-sky-900 text-sky-300 border border-sky-500/30 text-[10px] font-mono"
+                        title="手动修改该文件归属的季号、集号及单集名称"
+                      >
+                        S{{ String(src.season_number).padStart(2, '0') }}E{{ String(src.episode_number).padStart(2, '0') }} · 调集
+                      </button>
                     </div>
                     <div>
                       <span v-if="!src.file_size_bytes || src.file_size_bytes <= 0" class="text-slate-500">
@@ -493,6 +513,57 @@
                       </span>
                     </div>
                   </div>
+                  <form
+                    v-if="editingFileId === src.id"
+                    @submit.prevent="saveFileEpisode(src)"
+                    class="flex flex-wrap items-center gap-2 pt-1.5 pb-1 border-t border-slate-800/80"
+                  >
+                    <label class="flex items-center gap-1 text-[11px] text-slate-300">
+                      <span>季</span>
+                      <input
+                        v-model.number="fileEpForm.season_number"
+                        type="number"
+                        min="0"
+                        max="999"
+                        required
+                        class="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-100 font-mono"
+                      />
+                    </label>
+                    <label class="flex items-center gap-1 text-[11px] text-slate-300">
+                      <span>集</span>
+                      <input
+                        v-model.number="fileEpForm.episode_number"
+                        type="number"
+                        min="1"
+                        max="9999"
+                        required
+                        class="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-100 font-mono"
+                      />
+                    </label>
+                    <label class="flex items-center gap-1 text-[11px] text-slate-300 flex-1 min-w-[140px]">
+                      <span>集名</span>
+                      <input
+                        v-model="fileEpForm.episode_title"
+                        type="text"
+                        placeholder="可选，如 上集 / 下集"
+                        class="w-full bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-slate-100"
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      :disabled="busyFileId === src.id"
+                      class="cursor-pointer disabled:opacity-50 px-2.5 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-medium"
+                    >
+                      保存
+                    </button>
+                    <button
+                      type="button"
+                      @click="editingFileId = null"
+                      class="cursor-pointer px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
+                    >
+                      取消
+                    </button>
+                  </form>
                   <div class="font-mono text-[11px] text-slate-400 break-all">
                     {{ src.alist_path }}
                   </div>
@@ -508,7 +579,7 @@
 
 <script setup>
 import { ref, reactive, computed, watch } from 'vue'
-import { Zap, X, Star, FolderGit2, HardDrive, Pencil, Unlink, Scissors } from 'lucide-vue-next'
+import { Zap, X, Star, FolderGit2, HardDrive, Pencil, Unlink, Scissors, ListOrdered } from 'lucide-vue-next'
 import { adminApi, embyImageUrl } from '../api/admin'
 import { useToast } from '../composables/useToast'
 
@@ -531,9 +602,17 @@ const siblingDirs = ref([])
 const episodes = ref([])
 const busyFolderId = ref(null)
 const busyFileId = ref(null)
+const editingFileId = ref(null)
+const splittingGroupKey = ref(null)
 const lastEditedFolderId = ref(null)
 const lastEditedFileId = ref(null)
 const selectedFolderId = ref(null)
+
+const fileEpForm = reactive({
+  season_number: 1,
+  episode_number: 1,
+  episode_title: ''
+})
 
 const metaForm = reactive({
   title: '',
@@ -733,6 +812,64 @@ async function setFilePriority(file, overrideVal) {
     toast.error('调整文件权重失败：' + err.message)
   } finally {
     busyFileId.value = null
+  }
+}
+
+function openFileEpisodeEditor(src) {
+  if (editingFileId.value === src.id) {
+    editingFileId.value = null
+    return
+  }
+  editingFileId.value = src.id
+  fileEpForm.season_number = src.season_number > 0 ? src.season_number : 1
+  fileEpForm.episode_number = src.episode_number > 0 ? src.episode_number : 1
+  fileEpForm.episode_title = src.title || ''
+}
+
+async function saveFileEpisode(src) {
+  if (busyFileId.value === src.id) return
+  busyFileId.value = src.id
+  lastEditedFileId.value = src.id
+  try {
+    const res = await adminApi.updateFileEpisode(src.id, {
+      season_number: Number(fileEpForm.season_number),
+      episode_number: Number(fileEpForm.episode_number),
+      episode_title: fileEpForm.episode_title.trim() || null
+    })
+    toast.success(res.message)
+    editingFileId.value = null
+    if (props.mediaId) await fetchDetail(props.mediaId, { silent: true })
+  } catch (err) {
+    toast.error('调整文件季集失败：' + err.message)
+  } finally {
+    busyFileId.value = null
+  }
+}
+
+async function handleSplitGroupToEpisodes(grp) {
+  if (!props.mediaId || splittingGroupKey.value) return
+  const ordered = [...grp.list].sort((a, b) =>
+    (a.file_name || a.alist_path || '').localeCompare(
+      b.file_name || b.alist_path || '',
+      'zh-CN',
+      { numeric: true }
+    )
+  )
+  splittingGroupKey.value = grp.key
+  try {
+    const seasonNum = grp.rep?.season_number > 0 ? grp.rep.season_number : 1
+    const res = await adminApi.splitWorkEpisodes(props.mediaId, {
+      file_ids: ordered.map(f => f.id),
+      season_number: seasonNum,
+      start_episode: 1
+    })
+    toast.success(res.message)
+    editingFileId.value = null
+    await fetchDetail(props.mediaId, { silent: true })
+  } catch (err) {
+    toast.error('拆分剧集失败：' + err.message)
+  } finally {
+    splittingGroupKey.value = null
   }
 }
 
