@@ -87,6 +87,51 @@ mod tests {
         );
         assert!(super::resolve_redirect_location("http://127.0.0.1:5678", "file:///etc/passwd").is_err());
     }
+
+    #[test]
+    fn internal_alist_redirect_is_detected_for_same_host_and_private_ips() {
+        assert!(super::is_internal_alist_redirect(
+            "http://172.23.0.2:45678",
+            "http://172.23.0.2:45678/d/test.mp4"
+        ));
+        assert!(super::is_internal_alist_redirect(
+            "http://xiaoya.host:5678",
+            "http://xiaoya.host:5678/p/test.mp4"
+        ));
+        assert!(!super::is_internal_alist_redirect(
+            "http://172.23.0.2:45678",
+            "https://cdnfhnfile.115cdn.net/test.mp4"
+        ));
+    }
+}
+
+fn is_internal_alist_redirect(base_url: &str, target_url: &str) -> bool {
+    let Ok(target) = reqwest::Url::parse(target_url) else {
+        return false;
+    };
+    let Some(target_host) = target.host_str() else {
+        return false;
+    };
+    if let Ok(base) = reqwest::Url::parse(base_url) {
+        if base
+            .host_str()
+            .is_some_and(|base_host| base_host.eq_ignore_ascii_case(target_host))
+        {
+            return true;
+        }
+    }
+    if target_host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = target_host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+        };
+    }
+    false
 }
 
 fn resolve_redirect_location(base_url: &str, location: &str) -> Result<String> {
@@ -518,38 +563,56 @@ impl AppState {
         full_path: &str,
         client_ua: &str,
     ) -> Result<Option<String>> {
+        const MAX_INTERNAL_HOPS: usize = 5;
+
         let cfg = self.config.load();
         let encoded_path = utf8_percent_encode(full_path, PATH_ENCODE_SET).to_string();
-        let unsigned_url = format!("{}/d{}", cfg.alist_base_url, encoded_path);
+        let mut current_url = format!("{}/d{}", cfg.alist_base_url, encoded_path);
         let client = self.alist_client.load();
+        let mut tried_signed = false;
 
-        let mut resp = client
-            .get(&unsigned_url)
-            .header("User-Agent", client_ua)
-            .header("Range", "bytes=0-0")
-            .send()
-            .await
-            .context("调用 AList /d/ 捕获直链失败")?;
-
-        if matches!(resp.status().as_u16(), 401 | 403) {
-            let token = self.get_alist_token(false).await?;
-            let signed_url = self.build_signed_d_url(full_path, &token, 14400)?;
-            resp = client
-                .get(&signed_url)
+        for hop in 0..MAX_INTERNAL_HOPS {
+            let mut resp = client
+                .get(&current_url)
                 .header("User-Agent", client_ua)
                 .header("Range", "bytes=0-0")
                 .send()
                 .await
-                .context("调用 AList 签名 /d/ 捕获直链失败")?;
-        }
+                .context("调用 AList /d/ 捕获直链失败")?;
 
-        if resp.status().is_redirection() {
+            if hop == 0 && !tried_signed && matches!(resp.status().as_u16(), 401 | 403) {
+                tried_signed = true;
+                let token = self.get_alist_token(false).await?;
+                current_url = self.build_signed_d_url(full_path, &token, 14400)?;
+                resp = client
+                    .get(&current_url)
+                    .header("User-Agent", client_ua)
+                    .header("Range", "bytes=0-0")
+                    .send()
+                    .await
+                    .context("调用 AList 签名 /d/ 捕获直链失败")?;
+            }
+
+            if !resp.status().is_redirection() {
+                warn!(
+                    "⚠️ [AList /d/ 未返回重定向] path={} | hop={} | status={}，回退 /api/fs/get",
+                    full_path,
+                    hop + 1,
+                    resp.status()
+                );
+                return Ok(None);
+            }
+
             let Some(location) = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
             else {
-                warn!("⚠️ [AList /d/ 重定向缺少 Location] path={}", full_path);
+                warn!(
+                    "⚠️ [AList /d/ 重定向缺少 Location] path={} | hop={}",
+                    full_path,
+                    hop + 1
+                );
                 return Ok(None);
             };
             let resolved = resolve_redirect_location(&cfg.alist_base_url, location)?;
@@ -557,9 +620,32 @@ impl AppState {
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_string))
                 .unwrap_or_else(|| "-".to_string());
+
+            if is_internal_alist_redirect(&cfg.alist_base_url, &resolved) {
+                if resolved == current_url {
+                    warn!(
+                        "⚠️ [AList /d/ 出现自跳转] path={} | hop={} | target_host={}，回退 /api/fs/get",
+                        full_path,
+                        hop + 1,
+                        host
+                    );
+                    return Ok(None);
+                }
+                info!(
+                    "↪️ [AList /d/ 内网跳] path={} | hop={} | status={} | target_host={}",
+                    full_path,
+                    hop + 1,
+                    resp.status(),
+                    host
+                );
+                current_url = resolved;
+                continue;
+            }
+
             info!(
-                "↪️ [AList /d/ 302] path={} | status={} | target_host={}",
+                "↪️ [AList /d/ 302] path={} | hop={} | status={} | target_host={}",
                 full_path,
+                hop + 1,
                 resp.status(),
                 host
             );
@@ -567,9 +653,8 @@ impl AppState {
         }
 
         warn!(
-            "⚠️ [AList /d/ 未返回重定向] path={} | status={}，回退 /api/fs/get",
-            full_path,
-            resp.status()
+            "⚠️ [AList /d/ 超过最大跳转次数] path={}，回退 /api/fs/get",
+            full_path
         );
         Ok(None)
     }

@@ -112,7 +112,8 @@ async fn get_item_detail_inner(
         let row: Option<WorkDetailRow> = sqlx::query_as(
             r#"
             SELECT media_type, tmdb_id, title, year, overview, rating, poster_path, backdrop_path,
-                   (tmdb_metadata->>'number_of_seasons')::int, (tmdb_metadata->>'number_of_episodes')::int,
+                   (tmdb_metadata->>'number_of_seasons')::int AS num_seasons,
+                   (tmdb_metadata->>'number_of_episodes')::int AS num_episodes,
                    original_title, sort_title
             FROM media_works WHERE id = $1
             "#,
@@ -120,7 +121,10 @@ async fn get_item_detail_inner(
         .bind(wid)
         .fetch_optional(&state.db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!("查询作品详情失败 (work_id={}): {}", wid, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
         let Some(work) = row else {
             return Err((StatusCode::NOT_FOUND, "条目不存在".to_string()));
@@ -531,6 +535,13 @@ mod access_tests {
         let allowed = vec!["电视剧".to_string()];
         let error = ensure_base_library_access("电影", Some(&allowed)).unwrap_err();
         assert_eq!(error.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn work_detail_query_aliases_jsonb_season_and_episode_counts() {
+        let source = include_str!("detail.rs");
+        assert!(source.contains("AS num_seasons"));
+        assert!(source.contains("AS num_episodes"));
     }
 }
 
