@@ -69,6 +69,37 @@ mod tests {
         assert!(!refresh_completed_since(started, Some(started)));
         assert!(!refresh_completed_since(started, None));
     }
+
+    #[test]
+    fn resolve_redirect_location_accepts_absolute_and_relative_http_urls() {
+        assert_eq!(
+            super::resolve_redirect_location(
+                "http://127.0.0.1:5678",
+                "https://cdnfhnfile.115cdn.net/test.mp4?t=1"
+            )
+            .unwrap(),
+            "https://cdnfhnfile.115cdn.net/test.mp4?t=1"
+        );
+        assert_eq!(
+            super::resolve_redirect_location("http://127.0.0.1:5678", "/p/test.mp4?sign=abc")
+                .unwrap(),
+            "http://127.0.0.1:5678/p/test.mp4?sign=abc"
+        );
+        assert!(super::resolve_redirect_location("http://127.0.0.1:5678", "file:///etc/passwd").is_err());
+    }
+}
+
+fn resolve_redirect_location(base_url: &str, location: &str) -> Result<String> {
+    let resolved = if location.starts_with('/') {
+        let base = reqwest::Url::parse(base_url).context("无效的 AList 基础地址")?;
+        base.join(location).context("拼接 AList 重定向地址失败")?
+    } else {
+        reqwest::Url::parse(location).context("无效的 AList 重定向地址")?
+    };
+    if !matches!(resolved.scheme(), "http" | "https") || resolved.host_str().is_none() {
+        return Err(anyhow!("非法的 AList 重定向协议: {}", resolved.scheme()));
+    }
+    Ok(resolved.to_string())
 }
 
 /// URL 路径段百分号编码字符集（保留 `/` 分隔符，安全编码中文、空格与 Emoji）
@@ -249,48 +280,70 @@ impl AppState {
 
         let full_path = self.build_full_alist_path(alist_path);
         let db = self.db.clone();
-        // Singleflight：当 PlaybackInfo (IsPlayback=true) 预热与播放器 stream.mp4 并发到达时，共享同一个换链请求
+        // Singleflight：当 PlaybackInfo (IsPlayback=true) 预热与播放器 stream 并发到达时，共享同一个换链请求
         let final_url = self
             .caches
             .alist_direct_urls
             .try_get_with(cache_key, async {
                 let total_start = Instant::now();
-                let fs_data = match self.call_alist_fs_get(&full_path, effective_ua, false).await {
-                    Ok(data) => data,
-                    Err(e) if is_unauthorized(&e) => {
-                        warn!("AList Token 失效，触发自动重登并重试 /api/fs/get");
-                        self.call_alist_fs_get(&full_path, effective_ua, true).await?
+                // 优先与 Emby 一致直接请求小雅 /d/ 路径捕获 302 Location（触发 ali2115 等转存直链）
+                let d_redirect = match self.call_alist_d_redirect(&full_path, effective_ua).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        warn!(
+                            "⚠️ [AList /d/ 失败] path={} | err={:#}，回退 /api/fs/get",
+                            full_path, e
+                        );
+                        None
                     }
-                    Err(e) => return Err(e),
                 };
+                let (url, source) = if let Some(redirect_url) = d_redirect {
+                    (redirect_url, "d_302")
+                } else {
+                    let fs_data =
+                        match self.call_alist_fs_get(&full_path, effective_ua, false).await {
+                            Ok(data) => data,
+                            Err(e) if is_unauthorized(&e) => {
+                                warn!("AList Token 失效，触发自动重登并重试 /api/fs/get");
+                                self.call_alist_fs_get(&full_path, effective_ua, true)
+                                    .await?
+                            }
+                            Err(e) => return Err(e),
+                        };
 
-                let file_size = if fs_data.size > 0 { Some(fs_data.size) } else { None };
-                if let Some(sz) = file_size {
-                    let db_clone = db.clone();
-                    tokio::spawn(async move {
-                        let _ = sqlx::query(
-                            "UPDATE sync_files SET file_size_bytes = $1 WHERE path_hash = $2 AND file_size_bytes IS NULL",
-                        )
-                        .bind(sz)
-                        .bind(path_hash)
-                        .execute(&db_clone)
-                        .await;
-                    });
-                }
-
-                // 优先使用单跳网盘 CDN raw_url；若为空（强制中转网盘）则降级走 AList /d/ 签名直链
-                let url = match fs_data.raw_url.filter(|u| !u.trim().is_empty()) {
-                    Some(raw_url) => raw_url,
-                    None => {
-                        let token = self.get_alist_token(false).await?;
-                        self.build_signed_d_url(&full_path, &token, 14400)?
+                    let file_size = if fs_data.size > 0 {
+                        Some(fs_data.size)
+                    } else {
+                        None
+                    };
+                    if let Some(sz) = file_size {
+                        let db_clone = db.clone();
+                        tokio::spawn(async move {
+                            let _ = sqlx::query(
+                                "UPDATE sync_files SET file_size_bytes = $1 WHERE path_hash = $2 AND file_size_bytes IS NULL",
+                            )
+                            .bind(sz)
+                            .bind(path_hash)
+                            .execute(&db_clone)
+                            .await;
+                        });
                     }
+
+                    // 优先使用单跳网盘 CDN raw_url；若为空（强制中转网盘）则降级走 AList /d/ 签名直链
+                    let fallback_url = match fs_data.raw_url.filter(|u| !u.trim().is_empty()) {
+                        Some(raw_url) => raw_url,
+                        None => {
+                            let token = self.get_alist_token(false).await?;
+                            self.build_signed_d_url(&full_path, &token, 14400)?
+                        }
+                    };
+                    (fallback_url, "fs_get")
                 };
 
                 info!(
-                    "🔗 [DirectURL FETCH] path={} | size={:?} | 换链总耗时={}ms",
+                    "🔗 [DirectURL FETCH] source={} | path={} | 换链总耗时={}ms",
+                    source,
                     full_path,
-                    file_size,
                     total_start.elapsed().as_millis()
                 );
                 Ok::<String, anyhow::Error>(url)
@@ -458,6 +511,67 @@ impl AppState {
         }
 
         Ok(body.data.and_then(|d| d.content).unwrap_or_default())
+    }
+
+    async fn call_alist_d_redirect(
+        &self,
+        full_path: &str,
+        client_ua: &str,
+    ) -> Result<Option<String>> {
+        let cfg = self.config.load();
+        let encoded_path = utf8_percent_encode(full_path, PATH_ENCODE_SET).to_string();
+        let unsigned_url = format!("{}/d{}", cfg.alist_base_url, encoded_path);
+        let client = self.alist_client.load();
+
+        let mut resp = client
+            .get(&unsigned_url)
+            .header("User-Agent", client_ua)
+            .header("Range", "bytes=0-0")
+            .send()
+            .await
+            .context("调用 AList /d/ 捕获直链失败")?;
+
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            let token = self.get_alist_token(false).await?;
+            let signed_url = self.build_signed_d_url(full_path, &token, 14400)?;
+            resp = client
+                .get(&signed_url)
+                .header("User-Agent", client_ua)
+                .header("Range", "bytes=0-0")
+                .send()
+                .await
+                .context("调用 AList 签名 /d/ 捕获直链失败")?;
+        }
+
+        if resp.status().is_redirection() {
+            let Some(location) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                warn!("⚠️ [AList /d/ 重定向缺少 Location] path={}", full_path);
+                return Ok(None);
+            };
+            let resolved = resolve_redirect_location(&cfg.alist_base_url, location)?;
+            let host = reqwest::Url::parse(&resolved)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "-".to_string());
+            info!(
+                "↪️ [AList /d/ 302] path={} | status={} | target_host={}",
+                full_path,
+                resp.status(),
+                host
+            );
+            return Ok(Some(resolved));
+        }
+
+        warn!(
+            "⚠️ [AList /d/ 未返回重定向] path={} | status={}，回退 /api/fs/get",
+            full_path,
+            resp.status()
+        );
+        Ok(None)
     }
 
     async fn call_alist_fs_get(
