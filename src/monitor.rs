@@ -289,27 +289,36 @@ async fn sample_current_process(state: &AppState, pid: u32) -> (f64, f64) {
 }
 
 #[cfg(target_os = "linux")]
-async fn read_proc_rss_mb() -> Option<f64> {
-    let status = tokio::fs::read_to_string("/proc/self/status").await.ok()?;
+fn parse_vm_rss_kb(status: &str) -> Option<f64> {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb = rest.split_whitespace().next()?.parse::<f64>().ok()?;
-            return Some(kb / 1024.0);
+            return rest.split_whitespace().next()?.parse::<f64>().ok();
         }
     }
     None
 }
 
 #[cfg(target_os = "linux")]
-async fn read_proc_cpu_pct(state: &AppState) -> Option<f64> {
-    let stat = tokio::fs::read_to_string("/proc/self/stat").await.ok()?;
+async fn read_proc_rss_mb() -> Option<f64> {
+    let status = tokio::fs::read_to_string("/proc/self/status").await.ok()?;
+    Some(parse_vm_rss_kb(&status)? / 1024.0)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_ticks(stat: &str) -> Option<u64> {
     let rparen = stat.rfind(')')?;
     let after = stat.get(rparen + 2..)?;
     let fields: Vec<&str> = after.split_whitespace().collect();
     // 跳过 state(0)..cmajflt(10)，utime=11, stime=12
     let utime = fields.get(11)?.parse::<u64>().ok()?;
     let stime = fields.get(12)?.parse::<u64>().ok()?;
-    let total_ticks = utime + stime;
+    Some(utime + stime)
+}
+
+#[cfg(target_os = "linux")]
+async fn read_proc_cpu_pct(state: &AppState) -> Option<f64> {
+    let stat = tokio::fs::read_to_string("/proc/self/stat").await.ok()?;
+    let total_ticks = parse_proc_stat_ticks(&stat)?;
     let now = Instant::now();
 
     let mut guard = state.monitor.prev_cpu_sample.lock().await;
@@ -352,6 +361,92 @@ async fn sample_process_ps(pid: u32) -> Option<(f64, f64)> {
     Some((round2(cpu), round2(rss_kb / 1024.0)))
 }
 
+fn is_postgres_comm(comm: &str) -> bool {
+    let lower = comm.trim().to_ascii_lowercase();
+    lower.ends_with("postgres") || lower.contains("postgres:")
+}
+
+#[cfg(target_os = "linux")]
+async fn sample_postgres_processes() -> (bool, f64, f64) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static PREV_PG_CPU: OnceLock<Mutex<Option<(HashMap<u32, u64>, Instant)>>> = OnceLock::new();
+
+    let Ok(mut dir) = tokio::fs::read_dir("/proc").await else {
+        return (false, 0.0, 0.0);
+    };
+
+    let mut found = false;
+    let mut rss_kb_sum = 0.0;
+    let mut cur_ticks: HashMap<u32, u64> = HashMap::new();
+
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let proc_dir = entry.path();
+        let Ok(comm) = tokio::fs::read_to_string(proc_dir.join("comm")).await else {
+            continue;
+        };
+        if !is_postgres_comm(&comm) {
+            continue;
+        }
+        found = true;
+        if let Ok(status) = tokio::fs::read_to_string(proc_dir.join("status")).await {
+            if let Some(kb) = parse_vm_rss_kb(&status) {
+                rss_kb_sum += kb;
+            }
+        }
+        if let Ok(stat) = tokio::fs::read_to_string(proc_dir.join("stat")).await {
+            if let Some(ticks) = parse_proc_stat_ticks(&stat) {
+                cur_ticks.insert(pid, ticks);
+            }
+        }
+    }
+
+    if !found {
+        if let Ok(mut guard) = PREV_PG_CPU.get_or_init(|| Mutex::new(None)).lock() {
+            *guard = None;
+        }
+        return (false, 0.0, 0.0);
+    }
+
+    let now = Instant::now();
+    let cpu_pct = if let Ok(mut guard) = PREV_PG_CPU.get_or_init(|| Mutex::new(None)).lock() {
+        let pct = if let Some((ref prev_map, prev_at)) = *guard {
+            let elapsed = now.duration_since(prev_at).as_secs_f64();
+            if elapsed > 0.05 {
+                let delta_ticks: u64 = cur_ticks
+                    .iter()
+                    .map(|(pid, ticks)| {
+                        prev_map
+                            .get(pid)
+                            .map(|prev| ticks.saturating_sub(*prev))
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                (delta_ticks as f64 / 100.0 / elapsed) * 100.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        *guard = Some((cur_ticks, now));
+        pct
+    } else {
+        0.0
+    };
+
+    (true, round2(cpu_pct), round2(rss_kb_sum / 1024.0))
+}
+
+#[cfg(not(target_os = "linux"))]
 async fn sample_postgres_processes() -> (bool, f64, f64) {
     let out = match Command::new("ps")
         .args(["-Ao", "%cpu=,rss=,comm="])
@@ -362,6 +457,10 @@ async fn sample_postgres_processes() -> (bool, f64, f64) {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             warn!("ps 采集 PostgreSQL 进程指标退出异常: {}", o.status);
+            return (false, 0.0, 0.0);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("未找到 ps 命令，跳过 PostgreSQL 进程指标采集");
             return (false, 0.0, 0.0);
         }
         Err(error) => {
@@ -381,8 +480,7 @@ async fn sample_postgres_processes() -> (bool, f64, f64) {
         else {
             continue;
         };
-        let lower = comm.to_lowercase();
-        if lower.ends_with("postgres") || lower.contains("postgres:") {
+        if is_postgres_comm(comm) {
             if let (Ok(c), Ok(r)) = (cpu_s.parse::<f64>(), rss_s.parse::<f64>()) {
                 found = true;
                 cpu_sum += c;
