@@ -35,14 +35,21 @@
 
 <script setup>
 import { ref, computed } from 'vue'
-import { Link2, Crosshair } from 'lucide-vue-next'
+import { SlidersHorizontal, Link2, Crosshair } from 'lucide-vue-next'
 import ConfigGroupPanel from './ConfigGroupPanel.vue'
 
 defineEmits(['saved'])
 
-const activeSection = ref('alist')
+const activeSection = ref('sync')
 
 const sections = [
+  {
+    key: 'sync',
+    icon: SlidersHorizontal,
+    title: '同步策略与过滤',
+    prefix: 'sync.',
+    desc: '配置 strm.txt 索引源路径、定时同步周期、目录白名单前缀、排除关键词与调试行数上限。'
+  },
   {
     key: 'alist',
     icon: Link2,

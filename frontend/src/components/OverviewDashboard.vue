@@ -94,7 +94,7 @@
       <!-- KPI 4: 本地图片缓存水位 -->
       <button
         type="button"
-        @click="$emit('navigate', { tab: 'sync' })"
+        @click="$emit('navigate', { tab: 'cache' })"
         class="card card-interactive p-5 rounded-2xl text-left cursor-pointer relative overflow-hidden group"
       >
         <div class="absolute inset-x-0 top-0 h-0.5 bg-gradient-to-r from-amber-500/80 to-transparent"></div>

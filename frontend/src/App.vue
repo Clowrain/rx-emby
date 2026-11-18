@@ -38,7 +38,6 @@ import BaseCoversTab from './components/BaseCoversTab.vue'
 import ActiveSessionsTab from './components/ActiveSessionsTab.vue'
 import UsersAndSessionsTab from './components/UsersAndSessionsTab.vue'
 import TaskCenterTab from './components/TaskCenterTab.vue'
-import SyncAndScrapeTab from './components/SyncAndScrapeTab.vue'
 import ImageCacheTab from './components/ImageCacheTab.vue'
 import HotConfigTab from './components/HotConfigTab.vue'
 import ResourceMonitorTab from './components/ResourceMonitorTab.vue'
@@ -82,10 +81,6 @@ const tabMetas = {
     title: '任务中心',
     subtitle: '统一管理 TMDB 刮削调度、扩展元数据补齐、媒体库同步进度及历史执行记录'
   },
-  sync: {
-    title: '同步策略与过滤',
-    subtitle: '配置 strm.txt 索引源路径、定时同步周期、目录白名单前缀、排除关键词与调试行数上限'
-  },
   cache: {
     title: '图片缓存',
     subtitle: '监控本地磁盘图片缓存水位，一键清理过期缓存并配置空间配额上限'
@@ -96,7 +91,7 @@ const tabMetas = {
   },
   config: {
     title: '系统设置',
-    subtitle: '配置小雅 / AList 网关连接与 TMDB 刮削代理等全局核心服务，保存后立即生效'
+    subtitle: '配置同步策略与过滤、小雅 / AList 网关连接与 TMDB 刮削代理等全局核心服务，保存后立即生效'
   }
 }
 
@@ -149,7 +144,6 @@ const navGroups = computed(() => [
     title: '运维与设置',
     items: [
       { key: 'tasks', label: '任务中心', icon: ListTodo },
-      { key: 'sync', label: '同步策略与过滤', icon: RefreshCw },
       { key: 'cache', label: '图片缓存', icon: HardDrive },
       { key: 'resources', label: '资源监控', icon: Cpu },
       { key: 'config', label: '系统设置', icon: SlidersHorizontal }
@@ -369,7 +363,6 @@ onUnmounted(() => {
         <ActiveSessionsTab v-else-if="activeTab === 'sessions'" />
         <UsersAndSessionsTab v-else-if="activeTab === 'users'" />
         <TaskCenterTab v-else-if="activeTab === 'tasks'" />
-        <SyncAndScrapeTab v-else-if="activeTab === 'sync'" @saved="fetchOverview" />
         <ImageCacheTab v-else-if="activeTab === 'cache'" @saved="fetchOverview" />
         <ResourceMonitorTab v-else-if="activeTab === 'resources'" />
         <HotConfigTab v-else-if="activeTab === 'config'" @saved="fetchOverview" />
