@@ -45,6 +45,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(media::prewarm_admin_media_dirs),
         )
         .route("/api/admin/media/:id/bind_tmdb", post(media::bind_tmdb_id))
+        .route(
+            "/api/admin/media/:id/metadata",
+            axum::routing::put(media::update_media_metadata),
+        )
+        .route(
+            "/api/admin/media/:id/unbind_tmdb",
+            post(media::unbind_media_tmdb),
+        )
         .route("/api/admin/media/:id/scrape", post(media::scrape_one_now))
         .route(
             "/api/admin/media/:id/ignore",
@@ -53,6 +61,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/admin/folders/:id/priority",
             post(media::update_folder_priority),
+        )
+        .route(
+            "/api/admin/folders/:id/split",
+            post(media::split_folder_to_new_work),
         )
         .route(
             "/api/admin/files/:id/priority",

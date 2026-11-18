@@ -112,6 +112,25 @@ export const adminApi = {
       body: JSON.stringify(payload)
     })
   },
+  updateMediaMetadata(id, payload) {
+    return requestJson(`/api/admin/media/${id}/metadata`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+  },
+  unbindMediaTmdb(id, payload = {}) {
+    return requestJson(`/api/admin/media/${id}/unbind_tmdb`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+  },
+  splitFolder(folderId) {
+    return requestJson(`/api/admin/folders/${folderId}/split`, {
+      method: 'POST'
+    })
+  },
   retryFailedScrapes() {
     return requestJson('/api/admin/staging/retry_failed', { method: 'POST' })
   },

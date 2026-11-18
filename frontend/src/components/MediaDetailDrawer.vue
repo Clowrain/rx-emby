@@ -19,8 +19,34 @@
           >
             {{ media.category }} · {{ media.media_type === 'movie' ? '电影' : '剧集' }}
           </span>
+          <span
+            v-if="media && (media.is_locked || !media.tmdb_id)"
+            class="shrink-0 text-xs px-2 py-0.5 rounded-md bg-amber-950/80 text-amber-300 border border-amber-500/35"
+          >
+            {{ media.tmdb_id ? '已锁定' : '手动维护' }}
+          </span>
         </div>
         <div class="flex items-center gap-2 shrink-0">
+          <button
+            v-if="media"
+            type="button"
+            @click="toggleEditMetadata"
+            class="cursor-pointer bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 px-3 py-1.5 rounded-xl text-xs font-medium text-indigo-200 transition-colors flex items-center gap-1.5"
+          >
+            <Pencil class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>{{ editingMetadata ? '收起编辑' : '编辑信息' }}</span>
+          </button>
+          <button
+            v-if="media && media.tmdb_id"
+            type="button"
+            @click="handleUnbindTmdb(false)"
+            :disabled="savingMetadata"
+            class="cursor-pointer bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 disabled:opacity-50 px-3 py-1.5 rounded-xl text-xs font-medium text-amber-200 transition-colors flex items-center gap-1.5"
+            title="取消 TMDB 关联并转为手动维护（仍保留在海报墙）"
+          >
+            <Unlink class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>取消刮削</span>
+          </button>
           <button
             type="button"
             @click="handlePrewarmDirs"
@@ -102,6 +128,148 @@
             </div>
           </div>
 
+          <!-- 手动维护元数据表单 -->
+          <form
+            v-if="editingMetadata"
+            @submit.prevent="submitManualMetadata"
+            class="bg-slate-950/80 border border-indigo-500/40 rounded-2xl p-4 space-y-3 text-xs"
+          >
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-semibold text-indigo-200">手动维护作品信息（保存后自动锁定，不被后台刮削覆盖）</span>
+              <button
+                type="button"
+                @click="handleUnbindTmdb(true)"
+                :disabled="savingMetadata"
+                class="cursor-pointer text-[11px] text-rose-300 hover:underline disabled:opacity-50"
+              >
+                退回待刮削中间表
+              </button>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">片名 *</span>
+                <input
+                  v-model="metaForm.title"
+                  required
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">原名 / 英文名</span>
+                <input
+                  v-model="metaForm.original_title"
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">年份</span>
+                <input
+                  v-model="metaForm.year"
+                  type="number"
+                  placeholder="例如 2026"
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">评分 (0-10)</span>
+                <input
+                  v-model="metaForm.rating"
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="10"
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">媒体类型</span>
+                <select
+                  v-model="metaForm.media_type"
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="movie">电影 (movie)</option>
+                  <option value="tv">剧集 (tv)</option>
+                </select>
+              </label>
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">所属分类</span>
+                <select
+                  v-model="metaForm.category"
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="电影">电影</option>
+                  <option value="电视剧">电视剧</option>
+                  <option value="动漫">动漫</option>
+                  <option value="纪录片">纪录片</option>
+                  <option value="综艺">综艺</option>
+                </select>
+              </label>
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">类型标签（逗号分隔）</span>
+                <input
+                  v-model="metaForm.genres"
+                  placeholder="剧情, 悬疑"
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label class="space-y-1 block">
+                <span class="text-[11px] text-slate-400">国家/地区（逗号分隔）</span>
+                <input
+                  v-model="metaForm.countries"
+                  placeholder="中国大陆"
+                  class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+            </div>
+
+            <label class="space-y-1 block">
+              <span class="text-[11px] text-slate-400">海报路径（TMDB path 如 /xxx.jpg，留空则显示默认占位）</span>
+              <input
+                v-model="metaForm.poster_path"
+                class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white font-mono focus:outline-none focus:border-indigo-500"
+              />
+            </label>
+
+            <label class="space-y-1 block">
+              <span class="text-[11px] text-slate-400">剧情简介</span>
+              <textarea
+                v-model="metaForm.overview"
+                rows="3"
+                class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-white focus:outline-none focus:border-indigo-500"
+              ></textarea>
+            </label>
+
+            <div class="flex flex-wrap items-center justify-between gap-3 pt-1">
+              <div class="flex flex-wrap items-center gap-4">
+                <label class="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer">
+                  <input v-model="metaForm.is_locked" type="checkbox" class="rounded border-slate-600" />
+                  <span>锁定元数据（禁止自动刮削覆盖）</span>
+                </label>
+                <label v-if="media.tmdb_id" class="inline-flex items-center gap-1.5 text-amber-300 cursor-pointer">
+                  <input v-model="metaForm.detach_tmdb" type="checkbox" class="rounded border-slate-600" />
+                  <span>同时解除 TMDB #{{ media.tmdb_id }} 关联</span>
+                </label>
+              </div>
+              <div class="flex items-center gap-2">
+                <button
+                  type="button"
+                  @click="editingMetadata = false"
+                  class="cursor-pointer px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  :disabled="savingMetadata"
+                  class="cursor-pointer px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium"
+                >
+                  {{ savingMetadata ? '保存中…' : '保存手动维护' }}
+                </button>
+              </div>
+            </div>
+          </form>
+
           <!-- 聚合兄弟目录列表 -->
           <div class="space-y-2">
             <div class="text-xs font-semibold text-slate-400 flex items-center gap-1.5 tabular-nums">
@@ -175,6 +343,17 @@
                       归零
                     </button>
                   </div>
+                  <button
+                    v-if="siblingDirs.length > 1 && !d.is_ignored"
+                    type="button"
+                    :disabled="busyFolderId === d.id"
+                    @click="handleSplitFolder(d)"
+                    class="cursor-pointer disabled:opacity-50 px-2 py-0.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 text-amber-200 text-[11px] flex items-center gap-1 transition-colors"
+                    title="将该目录从当前多版本合并中拆分为独立手动维护条目"
+                  >
+                    <Scissors class="w-3 h-3" aria-hidden="true" />
+                    <span>拆分独立</span>
+                  </button>
                   <span class="px-2 py-0.5 rounded-md bg-slate-800 text-emerald-400 font-mono">
                     {{ d.file_count }} 个源
                   </span>
@@ -328,8 +507,8 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue'
-import { Zap, X, Star, FolderGit2, HardDrive } from 'lucide-vue-next'
+import { ref, reactive, computed, watch } from 'vue'
+import { Zap, X, Star, FolderGit2, HardDrive, Pencil, Unlink, Scissors } from 'lucide-vue-next'
 import { adminApi, embyImageUrl } from '../api/admin'
 import { useToast } from '../composables/useToast'
 
@@ -345,6 +524,8 @@ defineEmits(['close'])
 const toast = useToast()
 const loading = ref(false)
 const prewarming = ref(false)
+const savingMetadata = ref(false)
+const editingMetadata = ref(false)
 const media = ref(null)
 const siblingDirs = ref([])
 const episodes = ref([])
@@ -353,6 +534,118 @@ const busyFileId = ref(null)
 const lastEditedFolderId = ref(null)
 const lastEditedFileId = ref(null)
 const selectedFolderId = ref(null)
+
+const metaForm = reactive({
+  title: '',
+  original_title: '',
+  year: '',
+  media_type: 'movie',
+  category: '电影',
+  rating: '0',
+  genres: '',
+  countries: '',
+  poster_path: '',
+  overview: '',
+  is_locked: true,
+  detach_tmdb: false
+})
+
+function syncMetaForm(m) {
+  if (!m) return
+  metaForm.title = m.title || ''
+  metaForm.original_title = m.original_title || ''
+  metaForm.year = m.year ? String(m.year) : ''
+  metaForm.media_type = m.media_type || 'movie'
+  metaForm.category = m.category || '电影'
+  metaForm.rating = m.rating != null ? String(m.rating) : '0'
+  metaForm.genres = (m.genres || []).join(', ')
+  metaForm.countries = (m.countries || []).join(', ')
+  metaForm.poster_path = m.poster_path || ''
+  metaForm.overview = m.overview || ''
+  metaForm.is_locked = true
+  metaForm.detach_tmdb = false
+}
+
+function toggleEditMetadata() {
+  if (!editingMetadata.value && media.value) {
+    syncMetaForm(media.value)
+  }
+  editingMetadata.value = !editingMetadata.value
+}
+
+async function submitManualMetadata() {
+  if (!media.value) return
+  savingMetadata.value = true
+  try {
+    const parseList = (s) =>
+      String(s || '')
+        .split(/[,，]/)
+        .map((x) => x.trim())
+        .filter(Boolean)
+    const yearNum = metaForm.year ? parseInt(metaForm.year, 10) : null
+    const ratingNum = metaForm.rating !== '' ? parseFloat(metaForm.rating) : 0
+    const res = await adminApi.updateMediaMetadata(media.value.id, {
+      title: metaForm.title,
+      original_title: metaForm.original_title || null,
+      year: Number.isFinite(yearNum) ? yearNum : null,
+      media_type: metaForm.media_type,
+      category: metaForm.category,
+      rating: Number.isFinite(ratingNum) ? ratingNum : 0,
+      genres: parseList(metaForm.genres),
+      countries: parseList(metaForm.countries),
+      poster_path: metaForm.poster_path || null,
+      overview: metaForm.overview || null,
+      is_locked: metaForm.is_locked,
+      detach_tmdb: metaForm.detach_tmdb
+    })
+    toast.success(res.message)
+    editingMetadata.value = false
+    await fetchDetail(media.value.id, { silent: true })
+  } catch (err) {
+    toast.error('保存失败：' + err.message)
+  } finally {
+    savingMetadata.value = false
+  }
+}
+
+async function handleUnbindTmdb(resetToStaging = false) {
+  if (!media.value) return
+  savingMetadata.value = true
+  try {
+    const res = await adminApi.unbindMediaTmdb(media.value.id, {
+      clear_poster: false,
+      reset_to_staging: resetToStaging
+    })
+    toast.success(res.message)
+    if (!resetToStaging) {
+      await fetchDetail(media.value.id, { silent: true })
+      syncMetaForm(media.value)
+      editingMetadata.value = true
+    } else {
+      editingMetadata.value = false
+      await fetchDetail(media.value.id, { silent: true })
+    }
+  } catch (err) {
+    toast.error('操作失败：' + err.message)
+  } finally {
+    savingMetadata.value = false
+  }
+}
+
+async function handleSplitFolder(folder) {
+  busyFolderId.value = folder.id
+  try {
+    const res = await adminApi.splitFolder(folder.id)
+    toast.success(`${res.message}（新作品 #${res.new_work_id}）`)
+    if (media.value) {
+      await fetchDetail(media.value.id, { silent: true })
+    }
+  } catch (err) {
+    toast.error('拆分失败：' + err.message)
+  } finally {
+    busyFolderId.value = null
+  }
+}
 
 const activeFolderHighlightId = computed(() => selectedFolderId.value ?? lastEditedFolderId.value)
 

@@ -479,6 +479,369 @@ pub(super) async fn bind_tmdb_id(
     })))
 }
 
+#[derive(Deserialize)]
+pub(super) struct UpdateMediaMetadataReq {
+    title: String,
+    original_title: Option<String>,
+    year: Option<i32>,
+    media_type: String,
+    category: String,
+    overview: Option<String>,
+    rating: Option<f32>,
+    genres: Option<Vec<String>>,
+    countries: Option<Vec<String>>,
+    networks: Option<Vec<String>>,
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
+    is_locked: Option<bool>,
+    detach_tmdb: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct UnbindTmdbReq {
+    clear_poster: Option<bool>,
+    reset_to_staging: Option<bool>,
+}
+
+fn clean_opt_text(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn clean_string_list(v: Option<Vec<String>>) -> Vec<String> {
+    v.unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 手动维护正式作品元数据，并默认锁定防止被自动刮削覆盖
+pub(super) async fn update_media_metadata(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+    Json(payload): Json<UpdateMediaMetadataReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let title = payload.title.trim().to_string();
+    if title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "片名不能为空".into()));
+    }
+    let media_type = match payload.media_type.trim() {
+        "movie" | "tv" => payload.media_type.trim().to_string(),
+        _ => return Err((StatusCode::BAD_REQUEST, "媒体类型仅支持 movie 或 tv".into())),
+    };
+    let category = match payload.category.trim() {
+        "电影" | "电视剧" | "动漫" | "纪录片" | "综艺" => {
+            payload.category.trim().to_string()
+        }
+        _ => return Err((StatusCode::BAD_REQUEST, "无效的媒体分类".into())),
+    };
+
+    let original_title = clean_opt_text(payload.original_title);
+    let overview = clean_opt_text(payload.overview);
+    let poster_path = clean_opt_text(payload.poster_path);
+    let backdrop_path = clean_opt_text(payload.backdrop_path);
+    let rating = payload.rating.unwrap_or(0.0).clamp(0.0, 10.0);
+    let genres = clean_string_list(payload.genres);
+    let countries = clean_string_list(payload.countries);
+    let networks = clean_string_list(payload.networks);
+    let is_locked = payload.is_locked.unwrap_or(true);
+    let detach_tmdb = payload.detach_tmdb.unwrap_or(false);
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let updated: Option<i64> = sqlx::query_scalar(
+        r#"
+        UPDATE media_works
+        SET title = $1,
+            sort_title = $1,
+            original_title = $2,
+            year = $3,
+            media_type = $4,
+            category = $5,
+            overview = $6,
+            rating = $7,
+            genres = $8,
+            countries = $9,
+            networks = $10,
+            poster_path = $11,
+            backdrop_path = $12,
+            is_locked = $13,
+            tmdb_id = CASE WHEN $14 THEN NULL ELSE tmdb_id END,
+            metadata_version = 2,
+            metadata_refresh_requested = FALSE,
+            updated_at = NOW()
+        WHERE id = $15
+        RETURNING id
+        "#,
+    )
+    .bind(&title)
+    .bind(&original_title)
+    .bind(payload.year)
+    .bind(&media_type)
+    .bind(&category)
+    .bind(&overview)
+    .bind(rating)
+    .bind(&genres)
+    .bind(&countries)
+    .bind(&networks)
+    .bind(&poster_path)
+    .bind(&backdrop_path)
+    .bind(is_locked)
+    .bind(detach_tmdb)
+    .bind(work_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if updated.is_none() {
+        return Err((StatusCode::NOT_FOUND, "作品条目不存在".into()));
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE sync_folders
+        SET category = $1,
+            inferred_media_type = $2,
+            parsed_tmdb_id = CASE WHEN $3 THEN NULL ELSE parsed_tmdb_id END,
+            is_locked = CASE WHEN $3 OR $4 THEN TRUE ELSE is_locked END,
+            updated_at = NOW()
+        WHERE work_id = $5
+        "#,
+    )
+    .bind(&category)
+    .bind(&media_type)
+    .bind(detach_tmdb)
+    .bind(is_locked)
+    .bind(work_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    invalidate_admin_stats(&state).await;
+    invalidate_work_image_meta(&state, work_id).await;
+    broadcast_work_visibility(&state, work_id, true).await;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "work_id": work_id,
+        "message": "已保存手动维护信息并锁定防覆盖"
+    })))
+}
+
+/// 取消作品的 TMDB 刮削关联：默认保留在海报墙并转为手动维护；可选退回待处理中间表
+pub(super) async fn unbind_media_tmdb(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+    Json(payload): Json<UnbindTmdbReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let clear_poster = payload.clear_poster.unwrap_or(false);
+    let reset_to_staging = payload.reset_to_staging.unwrap_or(false);
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if reset_to_staging {
+        sqlx::query(
+            r#"
+            UPDATE sync_folders
+            SET work_id = NULL,
+                parsed_tmdb_id = NULL,
+                scrape_state = 'pending',
+                is_locked = FALSE,
+                retry_count = 0,
+                next_retry_at = NULL,
+                conflict_reason = NULL,
+                updated_at = NOW()
+            WHERE work_id = $1
+            "#,
+        )
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        invalidate_admin_stats(&state).await;
+        invalidate_work_image_meta(&state, work_id).await;
+        broadcast_work_visibility(&state, work_id, false).await;
+
+        return Ok(Json(json!({
+            "status": "ok",
+            "reset_to_staging": true,
+            "message": "已取消刮削并将关联目录退回待处理中间表"
+        })));
+    }
+
+    let updated: Option<i64> = sqlx::query_scalar(
+        r#"
+        UPDATE media_works
+        SET tmdb_id = NULL,
+            is_locked = TRUE,
+            metadata_version = 2,
+            metadata_refresh_requested = FALSE,
+            poster_path = CASE WHEN $2 THEN NULL ELSE poster_path END,
+            backdrop_path = CASE WHEN $2 THEN NULL ELSE backdrop_path END,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id
+        "#,
+    )
+    .bind(work_id)
+    .bind(clear_poster)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if updated.is_none() {
+        return Err((StatusCode::NOT_FOUND, "作品条目不存在".into()));
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE sync_folders
+        SET parsed_tmdb_id = NULL,
+            is_locked = TRUE,
+            scrape_state = 'verified',
+            conflict_reason = NULL,
+            updated_at = NOW()
+        WHERE work_id = $1
+        "#,
+    )
+    .bind(work_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    invalidate_admin_stats(&state).await;
+    invalidate_work_image_meta(&state, work_id).await;
+    broadcast_work_visibility(&state, work_id, true).await;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "reset_to_staging": false,
+        "message": "已取消 TMDB 刮削关联并转为手动维护（保留在海报墙）"
+    })))
+}
+
+/// 将已合并在多目录作品中的某个物理目录拆分为独立的手动维护作品（保留在海报墙）
+pub(super) async fn split_folder_to_new_work(
+    State(state): State<Arc<AppState>>,
+    Path(folder_id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    #[derive(sqlx::FromRow)]
+    struct FolderSplitSource {
+        work_id: Option<i64>,
+        clean_title: String,
+        year: Option<i32>,
+        inferred_media_type: String,
+        category: String,
+    }
+
+    let src: Option<FolderSplitSource> = sqlx::query_as(
+        "SELECT work_id, clean_title, year, inferred_media_type, category FROM sync_folders WHERE id = $1",
+    )
+    .bind(folder_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some(src) = src else {
+        return Err((StatusCode::NOT_FOUND, "物理目录不存在".into()));
+    };
+    let Some(old_work_id) = src.work_id else {
+        return Err((StatusCode::BAD_REQUEST, "该目录尚未关联正式作品".into()));
+    };
+
+    let sibling_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_folders WHERE work_id = $1 AND is_ignored = FALSE",
+    )
+    .bind(old_work_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if sibling_count <= 1 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "当前作品仅关联这一个目录，无需拆分；可直接「取消 TMDB 刮削」或「编辑信息」".into(),
+        ));
+    }
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let new_work_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO media_works (media_type, tmdb_id, title, sort_title, year, category, is_locked, metadata_version)
+        VALUES ($1, NULL, $2, $2, $3, $4, TRUE, 2)
+        RETURNING id
+        "#,
+    )
+    .bind(&src.inferred_media_type)
+    .bind(&src.clean_title)
+    .bind(src.year)
+    .bind(&src.category)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    sqlx::query(
+        r#"
+        UPDATE sync_folders
+        SET work_id = $1,
+            parsed_tmdb_id = NULL,
+            scrape_state = 'verified',
+            conflict_reason = NULL,
+            is_locked = TRUE,
+            updated_at = NOW()
+        WHERE id = $2
+        "#,
+    )
+    .bind(new_work_id)
+    .bind(folder_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    invalidate_admin_stats(&state).await;
+    invalidate_work_image_meta(&state, old_work_id).await;
+    invalidate_work_image_meta(&state, new_work_id).await;
+    broadcast_work_visibility(&state, old_work_id, true).await;
+    broadcast_work_visibility(&state, new_work_id, true).await;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "old_work_id": old_work_id,
+        "new_work_id": new_work_id,
+        "message": "已将该目录拆分为独立手动维护条目并保留在海报墙"
+    })))
+}
+
 /// 单部作品立即刷新分集/季元数据
 pub(super) async fn scrape_one_now(
     State(state): State<Arc<AppState>>,
