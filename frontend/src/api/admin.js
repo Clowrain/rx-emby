@@ -145,6 +145,18 @@ export const adminApi = {
       body: JSON.stringify(payload)
     })
   },
+  previewReparseStrm(workId) {
+    return requestJson(`/api/admin/media/${workId}/reparse_strm/preview`, {
+      method: 'POST'
+    })
+  },
+  applyReparseStrm(workId, payload) {
+    return requestJson(`/api/admin/media/${workId}/reparse_strm/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+  },
   retryFailedScrapes() {
     return requestJson('/api/admin/staging/retry_failed', { method: 'POST' })
   },

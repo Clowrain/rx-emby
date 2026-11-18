@@ -1177,6 +1177,240 @@ pub(super) async fn split_work_group_to_episodes(
     })))
 }
 
+#[derive(sqlx::FromRow)]
+struct ReparseFileRow {
+    file_id: i64,
+    folder_id: i64,
+    file_name: String,
+    alist_path: String,
+    container: String,
+    season_number: i32,
+    episode_number: i32,
+    version_tag: String,
+    priority_score: i32,
+}
+
+/// 预览对当前作品关联物理文件的 STRM 重新解析结果（不写入数据库）
+pub(super) async fn preview_reparse_media_strm(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let work: Option<(String, String)> =
+        sqlx::query_as("SELECT title, media_type FROM media_works WHERE id = $1")
+            .bind(work_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let Some((work_title, current_media_type)) = work else {
+        return Err((StatusCode::NOT_FOUND, "作品不存在".into()));
+    };
+
+    let rows: Vec<ReparseFileRow> = sqlx::query_as(
+        r#"
+        SELECT sf.id AS file_id, sf.folder_id, sf.file_name, sf.alist_path, sf.container,
+               sf.season_number, sf.episode_number, sf.version_tag, sf.priority_score
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        ORDER BY sf.folder_id ASC, sf.file_name ASC, sf.id ASC
+        "#,
+    )
+    .bind(work_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut folder_counts: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for r in &rows {
+        *folder_counts.entry(r.folder_id).or_insert(0) += 1;
+    }
+
+    let mut distinct_proposed = std::collections::HashSet::new();
+    let mut changed_count = 0usize;
+    let mut items = Vec::with_capacity(rows.len());
+
+    for r in rows {
+        let f_count = folder_counts.get(&r.folder_id).copied().unwrap_or(1);
+        let sug = crate::sync::parser::reparse_file_for_manual_preview(
+            &r.alist_path,
+            &r.file_name,
+            &r.container,
+            &work_title,
+            f_count,
+        );
+        distinct_proposed.insert((sug.season_number, sug.episode_number));
+        let changed = r.season_number != sug.season_number
+            || r.episode_number != sug.episode_number
+            || r.version_tag != sug.version_tag
+            || r.priority_score != sug.priority_score;
+        if changed {
+            changed_count += 1;
+        }
+        items.push(json!({
+            "file_id": r.file_id,
+            "folder_id": r.folder_id,
+            "file_name": r.file_name,
+            "alist_path": r.alist_path,
+            "current": {
+                "season_number": r.season_number,
+                "episode_number": r.episode_number,
+                "version_tag": r.version_tag,
+                "priority_score": r.priority_score,
+            },
+            "proposed": sug,
+            "changed": changed,
+        }));
+    }
+
+    let suggested_media_type = if distinct_proposed.len() > 1 {
+        "tv"
+    } else {
+        current_media_type.as_str()
+    };
+
+    Ok(Json(json!({
+        "work_id": work_id,
+        "current_media_type": current_media_type,
+        "suggested_media_type": suggested_media_type,
+        "changed_count": changed_count,
+        "items": items,
+    })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct ApplyReparseItem {
+    file_id: i64,
+    season_number: i32,
+    episode_number: i32,
+    version_tag: Option<String>,
+    priority_score: Option<i32>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ApplyReparseReq {
+    convert_to_tv: Option<bool>,
+    items: Vec<ApplyReparseItem>,
+}
+
+/// 确认实施手动 STRM 重新解析结果
+pub(super) async fn apply_reparse_media_strm(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+    Json(payload): Json<ApplyReparseReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if payload.items.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "未提交任何需要应用的文件项".into()));
+    }
+    for item in &payload.items {
+        if item.season_number < 0 || item.episode_number < 1 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "季号必须 >= 0，集号必须 >= 1".into(),
+            ));
+        }
+    }
+
+    let file_ids: Vec<i64> = payload.items.iter().map(|i| i.file_id).collect();
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let valid_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND sf.id = ANY($2)
+        "#,
+    )
+    .bind(work_id)
+    .bind(&file_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if valid_count != file_ids.len() as i64 {
+        return Err((StatusCode::BAD_REQUEST, "部分文件不属于当前作品或存在重复项".into()));
+    }
+
+    for item in &payload.items {
+        let vtag = item
+            .version_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        sqlx::query(
+            r#"
+            UPDATE sync_files
+            SET season_number = $1,
+                episode_number = $2,
+                version_tag = COALESCE($3, version_tag),
+                priority_score = COALESCE($4, priority_score)
+            WHERE id = $5
+            "#,
+        )
+        .bind(item.season_number)
+        .bind(item.episode_number)
+        .bind(vtag)
+        .bind(item.priority_score)
+        .bind(item.file_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    let distinct_ep_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(DISTINCT (sf.season_number, sf.episode_number))
+        FROM sync_files sf
+        JOIN sync_folders f ON f.id = sf.folder_id
+        WHERE f.work_id = $1 AND f.is_ignored = FALSE
+        "#,
+    )
+    .bind(work_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let should_tv = payload.convert_to_tv.unwrap_or(distinct_ep_count > 1);
+    if should_tv {
+        sqlx::query(
+            r#"
+            UPDATE media_works
+            SET media_type = 'tv',
+                is_locked = TRUE,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(work_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    invalidate_admin_stats(&state).await;
+    broadcast_work_visibility(&state, work_id, true).await;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "updated_count": payload.items.len(),
+        "converted_to_tv": should_tv,
+        "message": format!(
+            "已应用 {} 个文件的 STRM 重新解析结果{}",
+            payload.items.len(),
+            if should_tv { "（已切换为剧集并锁定）" } else { "" }
+        )
+    })))
+}
+
 // =========================================================================
 // Staging 中间表管理工作台 (`sync_folders`: pending / conflict / failed / ignored)
 // =========================================================================

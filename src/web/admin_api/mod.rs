@@ -71,6 +71,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(media::split_work_group_to_episodes),
         )
         .route(
+            "/api/admin/media/:id/reparse_strm/preview",
+            post(media::preview_reparse_media_strm),
+        )
+        .route(
+            "/api/admin/media/:id/reparse_strm/apply",
+            post(media::apply_reparse_media_strm),
+        )
+        .route(
             "/api/admin/files/:id/priority",
             post(media::update_file_priority),
         )

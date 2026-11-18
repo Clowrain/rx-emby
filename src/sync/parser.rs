@@ -10,6 +10,18 @@ static YEAR_RE: Lazy<Regex> =
 static SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(?:S(\d{1,3})E(\d{1,4})|(?:^|[^A-Za-z0-9])E(\d{1,4})(?:$|[^0-9])|第\s*(\d{1,4})\s*[集话期])").unwrap()
 });
+static CN_PART_EP_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:(?:^|[\s._\-\[\(（])(上|中|下)[集篇部卷]|[\(\[（](上|中|下)[\)\]）])(?:$|[\s._\-\]\)）])").unwrap()
+});
+static PART_CD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|[\s._\-\[\(（])(?:PART|PT|CD|DISC)[\s._\-]*(\d{1,2})(?:$|[\s._\-\]\)）])").unwrap()
+});
+static BARE_NUM_START_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^0*(\d{1,3})(?:$|[\s._\-\[\(])").unwrap()
+});
+static BARE_NUM_END_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:^|[\s._\-])(?:EP?)?0*(\d{1,3})$").unwrap()
+});
 static SEASON_DIR_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(?:(?:^|[\s._\-\[\(])Season\s*(\d{1,3})(?:$|[\s._\-\]\)])|(?:^|[\s._\-\[\(])S0*(\d{1,3})(?:$|[\s._\-\]\)])|第\s*(\d{1,3})\s*季)").unwrap()
 });
@@ -274,6 +286,111 @@ fn extract_season_episode(name: &str) -> Option<(Option<i32>, Option<i32>)> {
         Some((None, Some(e)))
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ManualReparseSuggestion {
+    pub season_number: i32,
+    pub episode_number: i32,
+    pub version_tag: String,
+    pub priority_score: i32,
+    pub detected_rule: String,
+}
+
+/// 供后台“手动维护 -> 重新解析 STRM 预览”使用的增强解析器：
+/// 在标准 SxxExx / 第x集 之外，额外识别中文上下集、Part/CD 分部以及多文件目录中的纯数字集号。
+pub fn reparse_file_for_manual_preview(
+    alist_path: &str,
+    file_name: &str,
+    container: &str,
+    clean_title: &str,
+    folder_file_count: usize,
+) -> ManualReparseSuggestion {
+    let (version_tag, priority_score) =
+        extract_version_tag_and_score(alist_path, file_name, clean_title, container);
+
+    let mut parent_season: Option<i32> = None;
+    let path_segs: Vec<&str> = alist_path.split('/').filter(|s| !s.is_empty()).collect();
+    if path_segs.len() >= 2 {
+        for seg in path_segs.iter().rev().skip(1).take(2) {
+            if let Some(s) = extract_season_from_dir(seg) {
+                parent_season = Some(s);
+                break;
+            }
+        }
+    }
+
+    if let Some((s_opt, e_opt)) = extract_season_episode(file_name) {
+        return ManualReparseSuggestion {
+            season_number: s_opt.or(parent_season).unwrap_or(1),
+            episode_number: e_opt.unwrap_or(1),
+            version_tag,
+            priority_score,
+            detected_rule: "标准季集 (SxxExx/第x集)".to_string(),
+        };
+    }
+
+    if let Some(caps) = CN_PART_EP_RE.captures(file_name) {
+        if let Some(marker) = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()) {
+            let ep = match marker {
+                "上" => 1,
+                "中" | "下" => 2,
+                _ => 1,
+            };
+            return ManualReparseSuggestion {
+                season_number: parent_season.unwrap_or(1),
+                episode_number: ep,
+                version_tag,
+                priority_score,
+                detected_rule: "中文分部 (上下集/上下篇)".to_string(),
+            };
+        }
+    }
+
+    if let Some(caps) = PART_CD_RE.captures(file_name) {
+        if let Some(ep) = caps.get(1).and_then(|m| m.as_str().parse::<i32>().ok()) {
+            if ep >= 1 {
+                return ManualReparseSuggestion {
+                    season_number: parent_season.unwrap_or(1),
+                    episode_number: ep,
+                    version_tag,
+                    priority_score,
+                    detected_rule: "分部编号 (Part/CD/Disc)".to_string(),
+                };
+            }
+        }
+    }
+
+    if folder_file_count > 1 {
+        let stem = file_name
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(file_name)
+            .trim();
+        let bare_ep = BARE_NUM_START_RE
+            .captures(stem)
+            .or_else(|| BARE_NUM_END_RE.captures(stem))
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<i32>().ok())
+            .filter(|&n| (1..=999).contains(&n) && !matches!(n, 264 | 265 | 480 | 720));
+        if let Some(ep) = bare_ep {
+            return ManualReparseSuggestion {
+                season_number: parent_season.unwrap_or(1),
+                episode_number: ep,
+                version_tag,
+                priority_score,
+                detected_rule: "多文件纯数字集号".to_string(),
+            };
+        }
+    }
+
+    ManualReparseSuggestion {
+        season_number: parent_season.unwrap_or(0),
+        episode_number: 1,
+        version_tag,
+        priority_score,
+        detected_rule: "单片/未识别集号".to_string(),
     }
 }
 
@@ -1016,5 +1133,52 @@ mod tests {
             ),
             Some(("Killing Bono".to_string(), Some(2011)))
         );
+    }
+
+    #[test]
+    fn test_manual_reparse_preview_detection() {
+        let up = reparse_file_for_manual_preview(
+            "/纪录片/故宫/故宫.上集.1080p.mp4",
+            "故宫.上集.1080p.mp4",
+            "mp4",
+            "故宫",
+            2,
+        );
+        let down = reparse_file_for_manual_preview(
+            "/纪录片/故宫/故宫.下集.1080p.mp4",
+            "故宫.下集.1080p.mp4",
+            "mp4",
+            "故宫",
+            2,
+        );
+        assert_eq!((up.season_number, up.episode_number), (1, 1));
+        assert_eq!((down.season_number, down.episode_number), (1, 2));
+
+        let bracket_down = reparse_file_for_manual_preview(
+            "/电影/赤壁/赤壁（下）.mkv",
+            "赤壁（下）.mkv",
+            "mkv",
+            "赤壁",
+            2,
+        );
+        assert_eq!((bracket_down.season_number, bracket_down.episode_number), (1, 2));
+
+        let part2 = reparse_file_for_manual_preview(
+            "/电影/Dune/Dune.Part2.2160p.mkv",
+            "Dune.Part2.2160p.mkv",
+            "mkv",
+            "Dune",
+            2,
+        );
+        assert_eq!((part2.season_number, part2.episode_number), (1, 2));
+
+        let bare = reparse_file_for_manual_preview(
+            "/纪录片/地球/03.1080p.mp4",
+            "03.1080p.mp4",
+            "mp4",
+            "地球",
+            5,
+        );
+        assert_eq!((bare.season_number, bare.episode_number), (1, 3));
     }
 }

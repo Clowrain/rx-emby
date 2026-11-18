@@ -364,9 +364,117 @@
 
           <!-- 分集与多版本源明细 -->
           <div class="space-y-3">
-            <div class="text-xs font-semibold text-slate-400 flex items-center gap-1.5 tabular-nums">
-              <HardDrive class="w-3.5 h-3.5 text-slate-400" aria-hidden="true" />
-              <span>视频源明细 (共 {{ episodes.length }} 个文件 · 已按画质优先级排序)</span>
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+              <div class="text-xs font-semibold text-slate-400 flex items-center gap-1.5 tabular-nums">
+                <HardDrive class="w-3.5 h-3.5 text-slate-400" aria-hidden="true" />
+                <span>视频源明细 (共 {{ episodes.length }} 个文件 · 已按画质优先级排序)</span>
+              </div>
+              <button
+                v-if="episodes.length > 0"
+                type="button"
+                :disabled="reparseLoading"
+                @click="handlePreviewReparseStrm"
+                class="cursor-pointer disabled:opacity-50 px-2.5 py-1 rounded-lg bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/35 text-indigo-200 text-[11px] flex items-center gap-1.5 transition-colors"
+                title="使用增强规则重新解析当前作品的 STRM 文件，先预览差异再确认实施"
+              >
+                <RefreshCw class="w-3 h-3" :class="reparseLoading ? 'animate-spin' : ''" aria-hidden="true" />
+                <span>{{ reparseLoading ? '解析预览中...' : '重解析 STRM (预览)' }}</span>
+              </button>
+            </div>
+
+            <!-- STRM 重解析预览与确认面板 -->
+            <div
+              v-if="reparsePreview"
+              class="card rounded-2xl p-4 space-y-3 border border-indigo-500/40 bg-indigo-950/20"
+            >
+              <div class="flex items-center justify-between gap-2 flex-wrap">
+                <div class="text-xs text-slate-200 space-y-0.5">
+                  <div class="font-semibold text-indigo-200">
+                    STRM 重解析预览（共 {{ reparsePreview.items.length }} 项 · 预计变更 {{ reparsePreview.changed_count }} 项）
+                  </div>
+                  <div class="text-[11px] text-slate-400">
+                    确认前可直接微调每行的季号 (S) / 集号 (E)，确认后才会写入数据库。
+                  </div>
+                </div>
+                <label class="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer">
+                  <input
+                    v-model="reparseConvertToTv"
+                    type="checkbox"
+                    class="rounded border-slate-600 bg-slate-900 text-indigo-500"
+                  />
+                  <span>切换为剧集 (TV) 并锁定防覆盖</span>
+                </label>
+              </div>
+              <div class="max-h-72 overflow-y-auto space-y-1.5 pr-1">
+                <div
+                  v-for="item in reparsePreview.items"
+                  :key="item.file_id"
+                  class="rounded-xl p-2.5 border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                  :class="
+                    item.changed
+                      ? 'bg-amber-950/20 border-amber-500/35'
+                      : 'bg-slate-950/60 border-slate-800/80'
+                  "
+                >
+                  <div class="min-w-0 flex-1 space-y-0.5">
+                    <div class="font-mono text-[11px] text-slate-200 truncate" :title="item.alist_path">
+                      {{ item.file_name }}
+                    </div>
+                    <div class="flex items-center gap-1.5 flex-wrap text-[10px]">
+                      <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
+                        当前 S{{ String(item.current.season_number).padStart(2, '0') }}E{{ String(item.current.episode_number).padStart(2, '0') }}
+                      </span>
+                      <span class="px-1.5 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-500/30">
+                        {{ item.proposed.detected_rule }}
+                      </span>
+                      <span
+                        v-if="item.changed"
+                        class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200 border border-amber-500/35"
+                      >
+                        有变更
+                      </span>
+                      <span class="text-slate-400 font-mono">
+                        {{ item.proposed.version_tag }}
+                      </span>
+                    </div>
+                  </div>
+                  <div class="flex items-center gap-1.5 shrink-0 tabular-nums">
+                    <span class="text-[11px] text-slate-400">S</span>
+                    <input
+                      v-model.number="item.editSeason"
+                      type="number"
+                      min="0"
+                      max="999"
+                      class="w-13 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-100 font-mono"
+                    />
+                    <span class="text-[11px] text-slate-400">E</span>
+                    <input
+                      v-model.number="item.editEpisode"
+                      type="number"
+                      min="1"
+                      max="9999"
+                      class="w-15 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-100 font-mono"
+                    />
+                  </div>
+                </div>
+              </div>
+              <div class="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  @click="reparsePreview = null"
+                  class="cursor-pointer px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  :disabled="reparseApplying"
+                  @click="handleApplyReparseStrm"
+                  class="cursor-pointer disabled:opacity-50 px-3.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium"
+                >
+                  {{ reparseApplying ? '应用中...' : '确认实施' }}
+                </button>
+              </div>
             </div>
             <div v-if="groupedEpisodes.length === 0" class="text-xs text-slate-500">
               暂无关联视频源
@@ -579,7 +687,7 @@
 
 <script setup>
 import { ref, reactive, computed, watch } from 'vue'
-import { Zap, X, Star, FolderGit2, HardDrive, Pencil, Unlink, Scissors, ListOrdered } from 'lucide-vue-next'
+import { Zap, X, Star, FolderGit2, HardDrive, Pencil, Unlink, Scissors, ListOrdered, RefreshCw } from 'lucide-vue-next'
 import { adminApi, embyImageUrl } from '../api/admin'
 import { useToast } from '../composables/useToast'
 
@@ -604,6 +712,10 @@ const busyFolderId = ref(null)
 const busyFileId = ref(null)
 const editingFileId = ref(null)
 const splittingGroupKey = ref(null)
+const reparseLoading = ref(false)
+const reparseApplying = ref(false)
+const reparsePreview = ref(null)
+const reparseConvertToTv = ref(false)
 const lastEditedFolderId = ref(null)
 const lastEditedFileId = ref(null)
 const selectedFolderId = ref(null)
@@ -873,6 +985,52 @@ async function handleSplitGroupToEpisodes(grp) {
   }
 }
 
+async function handlePreviewReparseStrm() {
+  if (!props.mediaId || reparseLoading.value) return
+  reparseLoading.value = true
+  try {
+    const res = await adminApi.previewReparseStrm(props.mediaId)
+    reparseConvertToTv.value = res.suggested_media_type === 'tv'
+    reparsePreview.value = {
+      ...res,
+      items: (res.items || []).map(it => ({
+        ...it,
+        editSeason: it.proposed?.season_number ?? it.current?.season_number ?? 0,
+        editEpisode: it.proposed?.episode_number ?? it.current?.episode_number ?? 1
+      }))
+    }
+  } catch (err) {
+    toast.error('STRM 预览解析失败：' + err.message)
+  } finally {
+    reparseLoading.value = false
+  }
+}
+
+async function handleApplyReparseStrm() {
+  if (!props.mediaId || !reparsePreview.value || reparseApplying.value) return
+  reparseApplying.value = true
+  try {
+    const payload = {
+      convert_to_tv: reparseConvertToTv.value,
+      items: reparsePreview.value.items.map(it => ({
+        file_id: it.file_id,
+        season_number: Number(it.editSeason),
+        episode_number: Number(it.editEpisode),
+        version_tag: it.proposed?.version_tag || null,
+        priority_score: it.proposed?.priority_score ?? null
+      }))
+    }
+    const res = await adminApi.applyReparseStrm(props.mediaId, payload)
+    toast.success(res.message)
+    reparsePreview.value = null
+    await fetchDetail(props.mediaId, { silent: true })
+  } catch (err) {
+    toast.error('应用 STRM 解析失败：' + err.message)
+  } finally {
+    reparseApplying.value = false
+  }
+}
+
 async function handlePrewarmDirs() {
   if (!props.mediaId) return
   prewarming.value = true
@@ -895,6 +1053,8 @@ watch(
     lastEditedFolderId.value = null
     lastEditedFileId.value = null
     selectedFolderId.value = null
+    reparsePreview.value = null
+    editingFileId.value = null
     if (newId) {
       fetchDetail(newId)
     } else {
