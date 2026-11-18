@@ -1,3 +1,4 @@
+import { embyImageUrl } from '../api/admin'
 import {
   COUNTRY_NAME_MAP,
   LANGUAGE_NAME_MAP,
@@ -39,7 +40,7 @@ export function dynamicCoverLabel(val) {
 
 export function coverImageUrl(viewId, coverImage, fallbackKey, bust) {
   if (isDynamicCover(coverImage)) {
-    return `/Items/${viewId}/Images/Primary?tag=${encodeURIComponent(coverImage)}&_t=${bust}`
+    return embyImageUrl(`/Items/${viewId}/Images/Primary?tag=${encodeURIComponent(coverImage)}&_t=${bust}`)
   }
   const key = coverImage || fallbackKey
   return `/covers/${key}.jpg?_t=${bust}`

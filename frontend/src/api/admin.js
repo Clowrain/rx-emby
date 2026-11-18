@@ -160,6 +160,18 @@ export const adminApi = {
   retryFailedScrapes() {
     return requestJson('/api/admin/staging/retry_failed', { method: 'POST' })
   },
+  getScrapeStatus() {
+    return requestJson('/api/admin/scrape/status')
+  },
+  pauseScrapeTask() {
+    return requestJson('/api/admin/scrape/pause', { method: 'POST' })
+  },
+  resumeScrapeTask() {
+    return requestJson('/api/admin/scrape/resume', { method: 'POST' })
+  },
+  cancelScrapeTask() {
+    return requestJson('/api/admin/scrape/cancel', { method: 'POST' })
+  },
   updateFolderPriority(folderId, priorityBoost) {
     return requestJson(`/api/admin/folders/${folderId}/priority`, {
       method: 'POST',
@@ -239,6 +251,9 @@ export const adminApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     })
+  },
+  refreshDynamicCovers() {
+    return requestJson('/api/admin/covers/refresh', { method: 'POST' })
   },
 
   // 3. 多用户账号、分类权限与在线会话

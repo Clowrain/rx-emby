@@ -584,12 +584,30 @@ pub(super) async fn queue_metadata_backfill(
     }
     let result = sqlx::query("UPDATE media_works SET metadata_refresh_requested=TRUE, metadata_retry_count=0, metadata_retry_at=NULL WHERE NOT is_locked AND tmdb_id IS NOT NULL AND (metadata_version<2 OR metadata_retry_count>0)")
         .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+    if result.rows_affected() > 0 {
+        state
+            .scraper
+            .runtime
+            .start_batch("深度元数据补齐", result.rows_affected() as usize);
+    }
     invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
     state.caches.admin_stats_cache.invalidate_all();
     state.caches.collage_cache.invalidate_all();
     Ok(Json(
         json!({"queued":result.rows_affected(),"message":format!("已将 {} 部作品加入深度元数据补齐队列",result.rows_affected())}),
     ))
+}
+
+/// 手动使全部动态封面缓存（1天TTL）立即失效，用于后台调整后立刻预览最新封面
+pub(super) async fn refresh_dynamic_covers(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    state.caches.collage_cache.invalidate_all();
+    state.caches.image_meta_cache.invalidate_all();
+    Json(json!({
+        "status": "ok",
+        "message": "已刷新动态封面缓存，将按最新发布时间重新检查并生成预览"
+    }))
 }
 
 #[cfg(test)]

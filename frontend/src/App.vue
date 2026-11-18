@@ -14,7 +14,8 @@ import {
   Image as ImageIcon,
   Radio,
   Server,
-  Cpu
+  Cpu,
+  ListTodo
 } from 'lucide-vue-next'
 import {
   adminApi,
@@ -26,6 +27,7 @@ import { confirmState, resolveConfirm } from './composables/useToast'
 import LoginView from './components/LoginView.vue'
 import AdminSidebar from './components/layout/AdminSidebar.vue'
 import BuildVersionBadge from './components/layout/BuildVersionBadge.vue'
+import ScrapeTaskBanner from './components/layout/ScrapeTaskBanner.vue'
 import ToastContainer from './components/layout/ToastContainer.vue'
 import ConfirmModal from './components/layout/ConfirmModal.vue'
 import OverviewDashboard from './components/OverviewDashboard.vue'
@@ -35,6 +37,7 @@ import VirtualLibrariesTab from './components/VirtualLibrariesTab.vue'
 import BaseCoversTab from './components/BaseCoversTab.vue'
 import ActiveSessionsTab from './components/ActiveSessionsTab.vue'
 import UsersAndSessionsTab from './components/UsersAndSessionsTab.vue'
+import TaskCenterTab from './components/TaskCenterTab.vue'
 import SyncAndScrapeTab from './components/SyncAndScrapeTab.vue'
 import ImageCacheTab from './components/ImageCacheTab.vue'
 import HotConfigTab from './components/HotConfigTab.vue'
@@ -75,9 +78,13 @@ const tabMetas = {
     title: '用户与设备',
     subtitle: '管理家庭成员账号与分类访问权限，管理客户端已登录设备令牌'
   },
+  tasks: {
+    title: '任务中心',
+    subtitle: '统一管理 TMDB 刮削调度、扩展元数据补齐、媒体库同步进度及历史执行记录'
+  },
   sync: {
-    title: '同步与刮削',
-    subtitle: '管理 strm.txt 增量同步任务、TMDB 刮削维护、同步记录与过滤策略'
+    title: '同步策略与过滤',
+    subtitle: '配置 strm.txt 索引源路径、定时同步周期、目录白名单前缀、排除关键词与调试行数上限'
   },
   cache: {
     title: '图片缓存',
@@ -141,7 +148,8 @@ const navGroups = computed(() => [
   {
     title: '运维与设置',
     items: [
-      { key: 'sync', label: '同步与刮削', icon: RefreshCw },
+      { key: 'tasks', label: '任务中心', icon: ListTodo },
+      { key: 'sync', label: '同步策略与过滤', icon: RefreshCw },
       { key: 'cache', label: '图片缓存', icon: HardDrive },
       { key: 'resources', label: '资源监控', icon: Cpu },
       { key: 'config', label: '系统设置', icon: SlidersHorizontal }
@@ -341,6 +349,8 @@ onUnmounted(() => {
         </div>
       </header>
 
+      <ScrapeTaskBanner @completed="fetchOverview" @open-tasks="switchTab('tasks')" />
+
       <main class="flex-1 p-8 max-w-[1600px] w-full mx-auto">
         <OverviewDashboard
           v-if="activeTab === 'overview'"
@@ -358,6 +368,7 @@ onUnmounted(() => {
         <BaseCoversTab v-else-if="activeTab === 'covers'" />
         <ActiveSessionsTab v-else-if="activeTab === 'sessions'" />
         <UsersAndSessionsTab v-else-if="activeTab === 'users'" />
+        <TaskCenterTab v-else-if="activeTab === 'tasks'" />
         <SyncAndScrapeTab v-else-if="activeTab === 'sync'" @saved="fetchOverview" />
         <ImageCacheTab v-else-if="activeTab === 'cache'" @saved="fetchOverview" />
         <ResourceMonitorTab v-else-if="activeTab === 'resources'" />

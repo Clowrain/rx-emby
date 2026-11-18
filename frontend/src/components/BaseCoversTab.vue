@@ -10,7 +10,18 @@
           自定义电影、电视剧、动漫、纪录片与综艺的 16:9 客户端首页封面，支持动态剧照拼贴或内置精选图。
         </p>
       </div>
-      <span class="text-xs text-slate-400">已自动挂载至 Emby / Infuse / VidHub 首页</span>
+      <div class="flex items-center gap-3">
+        <span class="text-xs text-slate-400">动态封面默认缓存 24 小时，按最新发布时间更新</span>
+        <button
+          type="button"
+          :disabled="refreshingCovers"
+          @click="handleRefreshDynamicCovers"
+          class="cursor-pointer disabled:opacity-50 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors"
+        >
+          <RefreshCw class="w-3.5 h-3.5 text-emerald-400" :class="refreshingCovers ? 'animate-spin' : ''" aria-hidden="true" />
+          <span>{{ refreshingCovers ? '刷新中…' : '刷新动态封面' }}</span>
+        </button>
+      </div>
     </div>
 
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
@@ -171,12 +182,13 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { Image as ImageIcon, Pencil, X } from 'lucide-vue-next'
-import { adminApi } from '../api/admin'
+import { Image as ImageIcon, Pencil, X, RefreshCw } from 'lucide-vue-next'
+import { adminApi, embyImageUrl } from '../api/admin'
 import { useToast } from '../composables/useToast'
 
 const toast = useToast()
 const baseSaving = ref(false)
+const refreshingCovers = ref(false)
 const coverBust = ref(Date.now())
 
 const baseLibraryCovers = ref([
@@ -235,7 +247,7 @@ function coverStyleSummary(val: any) {
 
 function coverImageUrl(viewId: string, coverImage: any, fallbackKey: string) {
   if (isDynamicCover(coverImage)) {
-    return `/Items/${viewId}/Images/Primary?tag=${encodeURIComponent(coverImage)}&_t=${coverBust.value}`
+    return embyImageUrl(`/Items/${viewId}/Images/Primary?tag=${encodeURIComponent(coverImage)}&_t=${coverBust.value}`)
   }
   const key = coverImage || fallbackKey
   return `/covers/${key}.jpg?_t=${coverBust.value}`
@@ -275,6 +287,20 @@ async function submitBaseCoverModal() {
     toast.error('保存失败：' + err.message)
   } finally {
     baseSaving.value = false
+  }
+}
+
+async function handleRefreshDynamicCovers() {
+  if (refreshingCovers.value) return
+  refreshingCovers.value = true
+  try {
+    const res = await adminApi.refreshDynamicCovers()
+    coverBust.value = Date.now()
+    toast.success(res.message)
+  } catch (err: any) {
+    toast.error('刷新失败：' + err.message)
+  } finally {
+    refreshingCovers.value = false
   }
 }
 

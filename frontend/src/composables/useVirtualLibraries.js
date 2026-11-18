@@ -203,6 +203,7 @@ export function useVirtualLibraries(deps = {}) {
     try {
       const res = await api.backfillSmartViewMetadata()
       toast.success(res.message)
+      window.dispatchEvent(new CustomEvent('rx-scrape-task-started'))
       await loadRuleOptions()
     } catch (err) {
       toast.error('补齐失败：' + err.message)

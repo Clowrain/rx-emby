@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
-import { Sparkles, Plus, Film, Tv, SlidersHorizontal, Trash2, Pencil, Power } from 'lucide-vue-next'
+import { ref, onMounted } from 'vue'
+import { Sparkles, Plus, Film, Tv, SlidersHorizontal, Trash2, Pencil, Power, RefreshCw } from 'lucide-vue-next'
+import { adminApi } from '../api/admin'
+import { useToast } from '../composables/useToast'
 import VirtualLibraryFormModal from './virtual-libraries/VirtualLibraryFormModal.vue'
 import { useVirtualLibraries } from '../composables/useVirtualLibraries.js'
 import {
@@ -43,6 +45,23 @@ const {
   toggleEnabled,
   handleDelete
 } = useVirtualLibraries()
+
+const toast = useToast()
+const refreshingCovers = ref(false)
+
+async function handleRefreshDynamicCovers() {
+  if (refreshingCovers.value) return
+  refreshingCovers.value = true
+  try {
+    const res = await adminApi.refreshDynamicCovers()
+    coverBust.value = Date.now()
+    toast.success(res.message)
+  } catch (err: any) {
+    toast.error('刷新失败：' + err.message)
+  } finally {
+    refreshingCovers.value = false
+  }
+}
 
 onMounted(() => {
   loadLibraries()
@@ -157,14 +176,26 @@ onMounted(() => {
             {{ tab.label }}（{{ tab.count }}）
           </button>
         </div>
-        <div class="relative w-full sm:w-64">
-          <input
-            v-model="listQuery"
-            type="search"
-            aria-label="搜索智能视图"
-            placeholder="搜索视图名称或规则…"
-            class="w-full px-3.5 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 focus:border-emerald-500 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none"
-          />
+        <div class="flex items-center gap-2 w-full sm:w-auto">
+          <button
+            type="button"
+            :disabled="refreshingCovers"
+            @click="handleRefreshDynamicCovers"
+            class="cursor-pointer disabled:opacity-50 px-3 py-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-200 flex items-center gap-1.5 shrink-0 transition-colors"
+            title="清理 1 天动态封面缓存，立即按最新发布时间重新生成预览"
+          >
+            <RefreshCw class="w-3.5 h-3.5 text-emerald-400" :class="refreshingCovers ? 'animate-spin' : ''" aria-hidden="true" />
+            <span>{{ refreshingCovers ? '刷新中…' : '刷新动态封面' }}</span>
+          </button>
+          <div class="relative flex-1 sm:w-64">
+            <input
+              v-model="listQuery"
+              type="search"
+              aria-label="搜索智能视图"
+              placeholder="搜索视图名称或规则…"
+              class="w-full px-3.5 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 focus:border-emerald-500 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none"
+            />
+          </div>
         </div>
       </div>
 

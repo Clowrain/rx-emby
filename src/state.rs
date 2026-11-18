@@ -328,7 +328,7 @@ impl AppState {
 
         let collage_cache = Cache::builder()
             .max_capacity(128)
-            .time_to_live(Duration::from_secs(300))
+            .time_to_live(Duration::from_secs(86400))
             .build();
 
         let image_meta_cache = Cache::builder()

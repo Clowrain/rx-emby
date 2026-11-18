@@ -1752,6 +1752,12 @@ pub(super) async fn batch_scrape_staging_folders(
             }
         }
     }
+    if queued > 0 {
+        state
+            .scraper
+            .runtime
+            .add_batch_items("批量刮削指定目录", queued);
+    }
     Ok(Json(json!({
         "status": if rejected == 0 { "ok" } else { "partial" },
         "queued": queued,
@@ -1774,13 +1780,89 @@ pub(super) async fn retry_failed_scrapes(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let reset_count = res.rows_affected();
+    if reset_count > 0 {
+        state
+            .scraper
+            .runtime
+            .start_batch("重试全部失败/存疑项", reset_count as usize);
+    }
     invalidate_admin_stats(&state).await;
 
     Ok(Json(json!({
         "status": "ok",
-        "reset_count": res.rows_affected(),
-        "message": format!("已将 {} 个失败/冲突目录重新加入待刮削队列", res.rows_affected())
+        "reset_count": reset_count,
+        "message": format!("已将 {} 个失败/冲突目录重新加入待刮削队列", reset_count)
     })))
+}
+
+async fn build_scrape_status_json(state: &AppState) -> Result<Value, (StatusCode, String)> {
+    let pending_db: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_folders WHERE scrape_state = 'pending' AND is_ignored = FALSE AND is_locked = FALSE",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let refresh_db: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_works WHERE NOT is_locked AND metadata_refresh_requested = TRUE AND metadata_retry_count < 3",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let auto_bg = state.config.load().scraper_auto_background;
+    Ok(state
+        .scraper
+        .runtime
+        .status_json(pending_db, refresh_db, auto_bg))
+}
+
+pub(super) async fn get_scrape_task_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    Ok(Json(build_scrape_status_json(&state).await?))
+}
+
+pub(super) async fn pause_scrape_task(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    state.scraper.runtime.pause();
+    let mut status = build_scrape_status_json(&state).await?;
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("message".to_string(), json!("已暂停刮削任务，当前正在处理的单条请求结束后将停止拉取下一项"));
+    }
+    Ok(Json(status))
+}
+
+pub(super) async fn resume_scrape_task(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    state.scraper.runtime.resume();
+    let mut status = build_scrape_status_json(&state).await?;
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("message".to_string(), json!("已恢复后台刮削任务"));
+    }
+    Ok(Json(status))
+}
+
+pub(super) async fn cancel_scrape_task(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    state.scraper.runtime.cancel();
+    sqlx::query(
+        "UPDATE media_works SET metadata_refresh_requested = FALSE WHERE metadata_refresh_requested = TRUE",
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    invalidate_admin_stats(&state).await;
+    let mut status = build_scrape_status_json(&state).await?;
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("message".to_string(), json!("已取消当前刮削队列并停止继续拉取"));
+    }
+    Ok(Json(status))
 }
 
 #[cfg(test)]

@@ -545,25 +545,35 @@ async fn try_serve_dynamic_cover(
     rule: &VirtualLibraryRule,
 ) -> Option<Response> {
     if custom_cover == Some("auto") {
-        if let Some(file_path) = fetch_virtual_library_auto_image(state, rule).await {
-            let clean_name = file_path.trim_start_matches('/');
-            if let Ok(bytes) = state.get_or_fetch_tmdb_image("w1280", clean_name).await {
-                let content_type = if clean_name.ends_with(".png") {
-                    "image/png"
-                } else {
-                    "image/jpeg"
-                };
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, content_type)
-                    .header(header::CACHE_CONTROL, "public, max-age=300")
-                    .body(axum::body::Body::from(bytes))
-                    .map_err(|e| {
-                        tracing::warn!("构建动态封面响应失败: {}", e);
-                        e
-                    })
-                    .ok();
-            }
+        let cache_key = format!("auto:{}", view_id);
+        let state2 = state.clone();
+        let rule2 = rule.clone();
+        let rendered = state
+            .caches
+            .collage_cache
+            .try_get_with(cache_key, async move {
+                let file_path = fetch_virtual_library_auto_image(&state2, &rule2)
+                    .await
+                    .ok_or_else(|| "无匹配媒体".to_string())?;
+                let clean_name = file_path.trim_start_matches('/');
+                state2
+                    .get_or_fetch_tmdb_image("w1280", clean_name)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .ok();
+        if let Some(bytes) = rendered {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/jpeg")
+                .header(header::CACHE_CONTROL, "public, max-age=86400")
+                .body(axum::body::Body::from(bytes))
+                .map_err(|e| {
+                    tracing::warn!("构建动态封面响应失败: {}", e);
+                    e
+                })
+                .ok();
         }
     } else if let Some(style) =
         custom_cover.and_then(crate::image_cache::collage::CollageStyle::from_key)
@@ -574,7 +584,7 @@ async fn try_serve_dynamic_cover(
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/jpeg")
-                .header(header::CACHE_CONTROL, "public, max-age=300")
+                .header(header::CACHE_CONTROL, "public, max-age=86400")
                 .body(axum::body::Body::from(bytes))
                 .map_err(|e| {
                     tracing::warn!("构建拼接封面响应失败: {}", e);
@@ -679,7 +689,10 @@ pub(super) async fn fetch_virtual_library_top_media_images(
         )
           AND (m.backdrop_path IS NOT NULL OR m.poster_path IS NOT NULL)
           AND $1::jsonb IS NOT NULL AND {}
-        ORDER BY m.rating DESC, m.year DESC NULLS LAST, m.id DESC
+        ORDER BY COALESCE(
+            NULLIF(m.premiered_at, ''),
+            CASE WHEN m.year IS NOT NULL THEN m.year::text || '-01-01' ELSE NULL END
+        ) DESC NULLS LAST, m.rating DESC, m.id DESC
         LIMIT $2
         "#,
         rule.sql_predicate("$1::jsonb")
@@ -721,41 +734,44 @@ async fn fetch_or_build_virtual_library_collage(
     rule: &VirtualLibraryRule,
     style: crate::image_cache::collage::CollageStyle,
 ) -> Option<Bytes> {
-    let rows = fetch_virtual_library_top_media_images(state, rule, 4).await;
-    if rows.is_empty() {
-        return None;
-    }
-
-    let mut sig = String::from(style.as_str());
-    for (b, p) in &rows {
-        sig.push('|');
-        if let Some(s) = b {
-            sig.push_str(s);
-        }
-        sig.push(',');
-        if let Some(s) = p {
-            sig.push_str(s);
-        }
-    }
-    let hash = xxhash_rust::xxh3::xxh3_64(sig.as_bytes());
-
-    let cfg = state.config.load();
-    let covers_dir = cfg.image_cache_dir.join("covers");
-    let cache_path = covers_dir.join(format!("{}_{}_{:016x}.jpg", view_id, style.as_str(), hash));
-
-    let inflight_key = format!("collage:{}:{}:{:016x}", view_id, style.as_str(), hash);
+    let inflight_key = format!("collage:{}:{}", view_id, style.as_str());
     let state2 = state.clone();
-    let covers_dir2 = covers_dir.clone();
-    let cache_path2 = cache_path.clone();
+    let rule2 = rule.clone();
+    let view_id2 = view_id.to_string();
 
     let rendered = state
         .caches
         .collage_cache
         .try_get_with(inflight_key, async move {
+            let rows = fetch_virtual_library_top_media_images(&state2, &rule2, 4).await;
+            if rows.is_empty() {
+                return Err(anyhow::anyhow!("无匹配媒体"));
+            }
+
+            let mut sig = String::from(style.as_str());
+            for (b, p) in &rows {
+                sig.push('|');
+                if let Some(s) = b {
+                    sig.push_str(s);
+                }
+                sig.push(',');
+                if let Some(s) = p {
+                    sig.push_str(s);
+                }
+            }
+            let hash = xxhash_rust::xxh3::xxh3_64(sig.as_bytes());
+
+            let cfg = state2.config.load();
+            let covers_dir = cfg.image_cache_dir.join("covers");
+            let cache_path = covers_dir.join(format!("{}_{}_{:016x}.jpg", view_id2, style.as_str(), hash));
+
             // 磁盘已有同签名渲染结果则直接复用
-            if let Ok(bytes) = tokio::fs::read(&cache_path2).await {
+            if let Ok(bytes) = tokio::fs::read(&cache_path).await {
                 return Ok(Bytes::from(bytes));
             }
+
+            let covers_dir2 = covers_dir;
+            let cache_path2 = cache_path;
 
             // 组装并发拉取请求：第 1 行的背景图作主视觉，每行取海报（缺失时退回背景图）
             let mut requests: Vec<CollageImageRequest> = Vec::new();

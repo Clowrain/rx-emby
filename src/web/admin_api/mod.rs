@@ -119,6 +119,22 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(media::retry_failed_scrapes),
         )
         .route(
+            "/api/admin/scrape/status",
+            get(media::get_scrape_task_status),
+        )
+        .route(
+            "/api/admin/scrape/pause",
+            post(media::pause_scrape_task),
+        )
+        .route(
+            "/api/admin/scrape/resume",
+            post(media::resume_scrape_task),
+        )
+        .route(
+            "/api/admin/scrape/cancel",
+            post(media::cancel_scrape_task),
+        )
+        .route(
             "/api/admin/virtual_libraries",
             get(virtual_libraries::list_virtual_libraries)
                 .post(virtual_libraries::save_virtual_library),
@@ -147,6 +163,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/admin/base_libraries/covers",
             get(virtual_libraries::list_base_library_covers)
                 .post(virtual_libraries::save_base_library_cover),
+        )
+        .route(
+            "/api/admin/covers/refresh",
+            post(virtual_libraries::refresh_dynamic_covers),
         )
         .route(
             "/api/admin/users",

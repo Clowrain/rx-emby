@@ -33,9 +33,9 @@ use crate::state::{AppState, ScrapeTask};
 use anyhow::Result;
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -90,12 +90,35 @@ struct WorkSummaryRow {
     metadata_retry_count: i16,
 }
 
-/// 所有刮削入口共享活动状态；任务未提供可计量总量时不推算百分比。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScrapeTaskRecord {
+    pub id: u64,
+    pub task_name: String,
+    pub status: String,
+    pub started_at: chrono::DateTime<Utc>,
+    pub finished_at: Option<chrono::DateTime<Utc>>,
+    pub total: usize,
+    pub done: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+}
+
+/// 所有刮削入口共享活动状态与暂停/取消/批次进度控制
 #[derive(Default)]
 pub struct ScrapeRuntime {
     active: AtomicUsize,
     manual_sweep: AtomicBool,
+    paused: AtomicBool,
+    auto_suppressed: AtomicBool,
     last_finished_unix: AtomicI64,
+    batch_total: AtomicUsize,
+    batch_done: AtomicUsize,
+    batch_succeeded: AtomicUsize,
+    batch_failed: AtomicUsize,
+    next_history_id: AtomicU64,
+    task_name: std::sync::Mutex<Option<String>>,
+    current_item: std::sync::Mutex<Option<String>>,
+    history: std::sync::Mutex<VecDeque<ScrapeTaskRecord>>,
     wake: Notify,
 }
 
@@ -121,9 +144,16 @@ impl ScrapeRuntime {
     pub fn snapshot(&self) -> ScrapeSnapshot {
         let running = self.active.load(Ordering::Relaxed) > 0;
         let finished = self.last_finished_unix.load(Ordering::Relaxed);
+        let total = self.batch_total.load(Ordering::Relaxed);
+        let done = self.batch_done.load(Ordering::Relaxed);
+        let pct = if running && total > 0 {
+            Some(((done as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+        } else {
+            running.then_some(0.0)
+        };
         ScrapeSnapshot {
             running,
-            current_progress_percentage: running.then_some(0.0),
+            current_progress_percentage: pct,
             last_execution_finished: (finished > 0)
                 .then(|| chrono::DateTime::from_timestamp(finished, 0))
                 .flatten(),
@@ -136,8 +166,286 @@ impl ScrapeRuntime {
     }
 
     pub fn request_sweep(&self) {
+        self.auto_suppressed.store(false, Ordering::SeqCst);
         self.manual_sweep.store(true, Ordering::Relaxed);
         self.wake.notify_one();
+    }
+
+    fn push_history_record(&self, name: &str, total: usize) {
+        let id = self.next_history_id.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut hist) = self.history.lock() {
+            if let Some(front) = hist.front_mut() {
+                if matches!(front.status.as_str(), "running" | "paused") {
+                    front.status = "completed".to_string();
+                    front.finished_at = Some(Utc::now());
+                }
+            }
+            hist.push_front(ScrapeTaskRecord {
+                id,
+                task_name: name.to_string(),
+                status: "running".to_string(),
+                started_at: Utc::now(),
+                finished_at: None,
+                total,
+                done: 0,
+                succeeded: 0,
+                failed: 0,
+            });
+            while hist.len() > 20 {
+                hist.pop_back();
+            }
+        }
+    }
+
+    fn sync_front_history(&self, new_status: Option<&str>) {
+        if let Ok(mut hist) = self.history.lock() {
+            let done = self.batch_done.load(Ordering::Relaxed);
+            let succeeded = self.batch_succeeded.load(Ordering::Relaxed);
+            let failed = self.batch_failed.load(Ordering::Relaxed);
+            let total = self.batch_total.load(Ordering::Relaxed);
+            if let Some(front) = hist.front_mut() {
+                if matches!(front.status.as_str(), "running" | "paused") {
+                    front.done = done;
+                    front.succeeded = succeeded;
+                    front.failed = failed;
+                    if total > 0 {
+                        front.total = total;
+                    } else if done > front.total {
+                        front.total = done;
+                    }
+                    if let Some(st) = new_status {
+                        front.status = st.to_string();
+                        if matches!(st, "completed" | "cancelled") {
+                            front.finished_at = Some(Utc::now());
+                        } else {
+                            front.finished_at = None;
+                        }
+                    }
+                }
+            } else if new_status.is_none() && done > 0 {
+                let id = self.next_history_id.fetch_add(1, Ordering::Relaxed) + 1;
+                hist.push_front(ScrapeTaskRecord {
+                    id,
+                    task_name: "后台全库自动刮削".to_string(),
+                    status: "running".to_string(),
+                    started_at: Utc::now(),
+                    finished_at: None,
+                    total: total.max(done),
+                    done,
+                    succeeded,
+                    failed,
+                });
+            }
+        }
+    }
+
+    pub fn start_batch(&self, name: impl Into<String>, total: usize) {
+        let name_str = name.into();
+        self.paused.store(false, Ordering::SeqCst);
+        self.auto_suppressed.store(false, Ordering::SeqCst);
+        self.batch_total.store(total, Ordering::SeqCst);
+        self.batch_done.store(0, Ordering::SeqCst);
+        self.batch_succeeded.store(0, Ordering::SeqCst);
+        self.batch_failed.store(0, Ordering::SeqCst);
+        if let Ok(mut guard) = self.task_name.lock() {
+            *guard = Some(name_str.clone());
+        }
+        if let Ok(mut guard) = self.current_item.lock() {
+            *guard = None;
+        }
+        self.push_history_record(&name_str, total);
+        self.manual_sweep.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    pub fn add_batch_items(&self, name: impl Into<String>, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let name_str = name.into();
+        self.paused.store(false, Ordering::SeqCst);
+        self.auto_suppressed.store(false, Ordering::SeqCst);
+        let prev_total = self.batch_total.load(Ordering::SeqCst);
+        let prev_done = self.batch_done.load(Ordering::SeqCst);
+        if prev_total == 0 || prev_done >= prev_total {
+            self.batch_total.store(count, Ordering::SeqCst);
+            self.batch_done.store(0, Ordering::SeqCst);
+            self.batch_succeeded.store(0, Ordering::SeqCst);
+            self.batch_failed.store(0, Ordering::SeqCst);
+            if let Ok(mut guard) = self.task_name.lock() {
+                *guard = Some(name_str.clone());
+            }
+            self.push_history_record(&name_str, count);
+        } else {
+            self.batch_total.fetch_add(count, Ordering::SeqCst);
+            self.sync_front_history(Some("running"));
+        }
+        self.manual_sweep.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    pub fn set_current_item(&self, label: Option<String>) {
+        if let Ok(mut guard) = self.current_item.lock() {
+            *guard = label;
+        }
+    }
+
+    pub fn record_item_result(&self, succeeded: bool) {
+        self.batch_done.fetch_add(1, Ordering::Relaxed);
+        if succeeded {
+            self.batch_succeeded.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.batch_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sync_front_history(None);
+        self.set_current_item(None);
+    }
+
+    pub fn clear_idle_counters_if_done(&self) {
+        if self.active.load(Ordering::Relaxed) == 0 && !self.paused.load(Ordering::Relaxed) {
+            let total = self.batch_total.load(Ordering::Relaxed);
+            let done = self.batch_done.load(Ordering::Relaxed);
+            if total == 0 || done >= total {
+                self.sync_front_history(Some("completed"));
+                if total == 0 {
+                    self.batch_done.store(0, Ordering::Relaxed);
+                    self.batch_succeeded.store(0, Ordering::Relaxed);
+                    self.batch_failed.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        self.sync_front_history(Some("paused"));
+        self.wake.notify_one();
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.auto_suppressed.store(false, Ordering::SeqCst);
+        self.sync_front_history(Some("running"));
+        self.manual_sweep.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    pub fn cancel(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.manual_sweep.store(false, Ordering::SeqCst);
+        self.auto_suppressed.store(true, Ordering::SeqCst);
+        self.sync_front_history(Some("cancelled"));
+        self.batch_total.store(0, Ordering::SeqCst);
+        self.batch_done.store(0, Ordering::SeqCst);
+        self.batch_succeeded.store(0, Ordering::SeqCst);
+        self.batch_failed.store(0, Ordering::SeqCst);
+        if let Ok(mut guard) = self.task_name.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.current_item.lock() {
+            *guard = None;
+        }
+        self.wake.notify_one();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn is_auto_suppressed(&self) -> bool {
+        self.auto_suppressed.load(Ordering::Relaxed)
+    }
+
+    pub fn status_json(
+        &self,
+        pending_db_count: i64,
+        refresh_db_count: i64,
+        auto_bg: bool,
+    ) -> serde_json::Value {
+        let active = self.active.load(Ordering::Relaxed) > 0;
+        let paused = self.paused.load(Ordering::Relaxed);
+        let manual_sweep = self.manual_sweep.load(Ordering::Relaxed);
+        let auto_suppressed = self.auto_suppressed.load(Ordering::Relaxed);
+        let batch_total = self.batch_total.load(Ordering::Relaxed);
+        let batch_done = self.batch_done.load(Ordering::Relaxed);
+        let batch_succeeded = self.batch_succeeded.load(Ordering::Relaxed);
+        let batch_failed = self.batch_failed.load(Ordering::Relaxed);
+        let task_name = self.task_name.lock().ok().and_then(|g| g.clone());
+        let current_item = self.current_item.lock().ok().and_then(|g| g.clone());
+        let pending_remaining = (pending_db_count + refresh_db_count).max(0);
+
+        let batch_active = batch_total > 0 && batch_done < batch_total;
+        let auto_active = auto_bg && !auto_suppressed && pending_remaining > 0;
+        let refresh_active = !auto_suppressed && refresh_db_count > 0;
+        let running = !paused
+            && (active
+                || batch_active
+                || (manual_sweep && pending_remaining > 0)
+                || auto_active
+                || refresh_active);
+        let status = if paused {
+            "paused"
+        } else if running {
+            "running"
+        } else {
+            "idle"
+        };
+
+        let effective_total = if batch_total > 0 {
+            batch_total.max(batch_done + pending_remaining as usize)
+        } else if auto_active
+            || refresh_active
+            || (paused && pending_remaining > 0)
+            || (active && pending_remaining > 0)
+        {
+            batch_done + pending_remaining as usize
+        } else {
+            0
+        };
+
+        let effective_task_name = task_name.or_else(|| {
+            if refresh_active {
+                Some("补齐 TMDB 扩展信息".to_string())
+            } else if auto_active || (paused && auto_bg && pending_remaining > 0) {
+                Some("后台全库自动刮削".to_string())
+            } else {
+                None
+            }
+        });
+
+        let percent = if effective_total > 0 {
+            Some(
+                ((batch_done.min(effective_total) as f64 / effective_total as f64) * 100.0 * 10.0)
+                    .round()
+                    / 10.0,
+            )
+        } else {
+            None
+        };
+
+        let can_resume_auto = status == "idle" && auto_suppressed && pending_remaining > 0;
+        let history: Vec<ScrapeTaskRecord> = self
+            .history
+            .lock()
+            .map(|h| h.iter().cloned().collect())
+            .unwrap_or_default();
+
+        serde_json::json!({
+            "status": status,
+            "running": status == "running",
+            "paused": paused,
+            "auto_suppressed": auto_suppressed,
+            "can_resume_auto": can_resume_auto,
+            "task_name": effective_task_name,
+            "current_item": current_item,
+            "batch_total": effective_total,
+            "batch_done": batch_done.min(effective_total),
+            "batch_succeeded": batch_succeeded,
+            "batch_failed": batch_failed,
+            "pending_remaining": pending_remaining,
+            "percent": percent,
+            "history": history,
+        })
     }
 }
 
@@ -148,7 +456,7 @@ pub async fn request_scheduled_scrape(state: &AppState) -> Result<()> {
         !cfg.tmdb_api_key.is_empty() && cfg.tmdb_api_key != "your_tmdb_api_key",
         "尚未配置 TMDB API Key"
     );
-    sqlx::query(
+    let res = sqlx::query(
         r#"
         UPDATE media_works
         SET metadata_refresh_requested = TRUE,
@@ -160,7 +468,14 @@ pub async fn request_scheduled_scrape(state: &AppState) -> Result<()> {
     )
     .execute(&state.db)
     .await?;
-    state.scraper.runtime.request_sweep();
+    if res.rows_affected() > 0 {
+        state
+            .scraper
+            .runtime
+            .add_batch_items("补齐正式作品 TMDB 元数据", res.rows_affected() as usize);
+    } else {
+        state.scraper.runtime.request_sweep();
+    }
     Ok(())
 }
 
@@ -173,6 +488,19 @@ pub fn spawn_scrape_worker(
         info!("TMDB 智能刮削调度器已启动（支持 Staging 校验、P0 实时插队与分集追更补齐）");
         let mut poll_delay = Duration::from_millis(200);
         loop {
+            if state.scraper.runtime.is_auto_suppressed() {
+                while priority_rx.try_recv().is_ok() {}
+            }
+            if state.scraper.runtime.is_paused() {
+                tokio::select! {
+                    _ = state.shutdown_token.cancelled() => {
+                        info!("收到停机信号，刮削调度器退出");
+                        break;
+                    }
+                    _ = state.scraper.runtime.wake.notified() => continue,
+                    _ = sleep(Duration::from_secs(2)) => continue,
+                }
+            }
             let task = tokio::select! {
                 _ = state.shutdown_token.cancelled() => {
                     info!("收到停机信号，刮削调度器退出");
@@ -182,6 +510,17 @@ pub fn spawn_scrape_worker(
                 _ = state.scraper.runtime.wake.notified() => None,
                 _ = sleep(poll_delay) => None,
             };
+            if state.scraper.runtime.is_auto_suppressed() {
+                while priority_rx.try_recv().is_ok() {}
+                poll_delay = Duration::from_secs(3);
+                continue;
+            }
+            if state.scraper.runtime.is_paused() {
+                if let Some((t, _)) = task {
+                    let _ = state.scraper.priority_tx.try_send(t);
+                }
+                continue;
+            }
             let next_task = match task {
                 Some(task) => Some(task),
                 None => match fetch_next_pending_task(&state).await {
@@ -194,6 +533,8 @@ pub fn spawn_scrape_worker(
                 },
             };
             let Some((task, priority)) = next_task else {
+                state.scraper.runtime.set_current_item(None);
+                state.scraper.runtime.clear_idle_counters_if_done();
                 poll_delay = Duration::from_secs(3);
                 continue;
             };
@@ -205,6 +546,10 @@ pub fn spawn_scrape_worker(
                     scrape_work_seasons_by_id(&state, wid, priority).await
                 }
             };
+            state
+                .scraper
+                .runtime
+                .record_item_result(result.is_ok());
             poll_delay = if let Err(e) = result {
                 debug!("刮削任务 {:?} 失败: {:#}", task, e);
                 Duration::from_secs(1)
@@ -244,6 +589,9 @@ async fn fetch_next_pending_task_with_mode(
 ) -> Result<Option<ScrapeTask>> {
     let cfg = state.config.load();
     if cfg.tmdb_api_key.is_empty() || cfg.tmdb_api_key == "your_tmdb_api_key" {
+        return Ok(None);
+    }
+    if state.scraper.runtime.is_auto_suppressed() && !manual_sweep {
         return Ok(None);
     }
 
@@ -555,6 +903,10 @@ pub async fn scrape_single_folder_with_mode(
     let Some(mut folder) = row else {
         return Ok(());
     };
+    state
+        .scraper
+        .runtime
+        .set_current_item(Some(folder.clean_title.clone()));
 
     if folder.is_locked {
         if let Some(wid) = folder.work_id {
@@ -854,6 +1206,10 @@ pub async fn scrape_work_seasons_by_id(state: &AppState, work_id: i64, is_p0: bo
     let Some(work) = row else {
         return Ok(());
     };
+    state
+        .scraper
+        .runtime
+        .set_current_item(Some(work.title.clone()));
 
     let Some(tid) = work.tmdb_id else {
         return Ok(());

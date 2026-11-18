@@ -283,6 +283,7 @@ async function handleBatchScrapeCurrentPage() {
   try {
     const res = await adminApi.batchScrapeStagingFolders(ids)
     toast.success(res.message)
+    window.dispatchEvent(new CustomEvent('rx-scrape-task-started'))
   } catch (err) {
     toast.error('批量入队失败：' + err.message)
   }
@@ -292,6 +293,7 @@ async function handleRetryFailed() {
   try {
     const data = await adminApi.retryFailedScrapes()
     toast.success(data.message)
+    window.dispatchEvent(new CustomEvent('rx-scrape-task-started'))
     await loadData({ silent: true })
   } catch (err) {
     toast.error('重置失败：' + err.message)
