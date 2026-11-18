@@ -141,10 +141,13 @@
                 class="rounded-xl border border-slate-800 bg-slate-950/70 p-3 space-y-1.5"
               >
                 <div class="flex items-start justify-between gap-2">
-                  <span class="text-xs font-mono text-slate-200 break-all">{{ file.file_name }}</span>
+                  <span class="text-xs font-medium text-slate-100 break-all">{{ file.file_name }}</span>
                   <span class="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono text-sky-300 shrink-0">
                     S{{ String(file.season_number).padStart(2, '0') }}E{{ String(file.episode_number).padStart(2, '0') }}
                   </span>
+                </div>
+                <div class="text-[11px] font-mono text-slate-400 bg-slate-900/80 border border-slate-800/80 rounded-lg px-2.5 py-1.5 break-all select-all">
+                  {{ file.alist_path }}
                 </div>
                 <div class="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
                   <span class="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300">
