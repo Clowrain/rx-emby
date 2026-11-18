@@ -1,18 +1,24 @@
 pub mod batch_db;
 pub mod parser;
+pub mod scanner;
 
 use crate::state::AppState;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use batch_db::{apply_sync_diff, deduplicate_records};
 use chrono::Utc;
 use parser::parse_strm_line;
 use reqwest::{Client, Proxy, StatusCode};
 use std::{
+    collections::HashMap,
     io::{Cursor, Read},
-    sync::{Arc, atomic::Ordering},
+    sync::{atomic::Ordering, Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tokio::{fs, io::AsyncBufReadExt, time::sleep};
+use tokio::{
+    fs,
+    io::{AsyncBufReadExt, AsyncReadExt},
+    time::sleep,
+};
 use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -21,6 +27,16 @@ const STARTUP_OVERDUE_GRACE: Duration = Duration::from_secs(15);
 const CONFIG_RELOAD_GRACE: Duration = Duration::from_secs(1);
 const SYNC_ERROR_RETRY_SEC: u64 = 300;
 const SYNC_LAST_CHECK_KEY: &str = "sync.last_check_at";
+const MAX_SYNC_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ZIP_TXT_BYTES: usize = 256 * 1024 * 1024;
+
+pub fn try_trigger_sync(state: &AppState) -> bool {
+    if state.sync_ctrl.is_syncing.load(Ordering::SeqCst) {
+        return false;
+    }
+    state.sync_ctrl.manual_trigger.notify_one();
+    true
+}
 
 enum FetchedSource {
     NotModified,
@@ -97,7 +113,7 @@ async fn load_last_sync_utc(state: &AppState) -> Option<chrono::DateTime<Utc>> {
     }
 }
 
-pub fn spawn_sync_worker(state: Arc<AppState>) {
+pub fn spawn_sync_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut config_rx = state.config_tx.subscribe();
         let (mut current_interval_sec, mut current_source) = {
@@ -134,7 +150,14 @@ pub fn spawn_sync_worker(state: Arc<AppState>) {
                 }
                 _ = &mut timer => {
                     info!("定时同步周期到达，开始执行索引增量同步");
-                    let ok = match run_sync_once(&state, false).await {
+                    let result = tokio::select! {
+                        _ = state.shutdown_token.cancelled() => {
+                            info!("停机时取消正在运行的定时同步");
+                            break;
+                        }
+                        result = run_sync_once(&state, false) => result,
+                    };
+                    let ok = match result {
                         Ok(()) => true,
                         Err(e) => {
                             error!("定时增量同步执行失败: {:#}", e);
@@ -145,7 +168,14 @@ pub fn spawn_sync_worker(state: Arc<AppState>) {
                 }
                 _ = state.sync_ctrl.manual_trigger.notified() => {
                     info!("收到手动触发指令，立即执行全量对账同步");
-                    let ok = match run_sync_once(&state, true).await {
+                    let result = tokio::select! {
+                        _ = state.shutdown_token.cancelled() => {
+                            info!("停机时取消正在运行的手动同步");
+                            break;
+                        }
+                        result = run_sync_once(&state, true) => result,
+                    };
+                    let ok = match result {
                         Ok(()) => true,
                         Err(e) => {
                             error!("手动触发同步执行失败: {:#}", e);
@@ -201,7 +231,15 @@ pub fn spawn_sync_worker(state: Arc<AppState>) {
                 }
             }
         }
-    });
+    })
+}
+
+struct SyncFlagGuard<'a>(&'a AppState);
+
+impl Drop for SyncFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.sync_ctrl.is_syncing.store(false, Ordering::SeqCst);
+    }
 }
 
 pub async fn run_sync_once(state: &AppState, force: bool) -> Result<()> {
@@ -215,10 +253,18 @@ pub async fn run_sync_once(state: &AppState, force: bool) -> Result<()> {
         return Ok(());
     }
 
+    let _sync_flag = SyncFlagGuard(state);
     let res = execute_sync_pipeline(state, force).await;
     *state.sync_ctrl.progress.write().await = None;
-    state.sync_ctrl.is_syncing.store(false, Ordering::SeqCst);
     res
+}
+
+struct SyncPipelineOutcome {
+    total_lines: i32,
+    added_episodes: i32,
+    deleted_episodes: i32,
+    new_media_items: i32,
+    updated_folder_ids: Vec<i64>,
 }
 
 struct SyncProgressUpdate {
@@ -285,13 +331,30 @@ async fn save_persisted_cursor(state: &AppState, key: &str, val: &str, desc: &st
     }
 }
 
+static SYNC_HTTP_CLIENTS: OnceLock<Mutex<HashMap<Option<String>, Client>>> = OnceLock::new();
+
 fn build_sync_http_client(proxy_url: Option<&str>) -> Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(120));
+    let key = proxy_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let clients = SYNC_HTTP_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(client) = clients.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Ok(client.clone());
+    }
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::limited(3));
     if let Some(p) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) {
         let proxy = Proxy::all(p).with_context(|| format!("无效的同步代理地址: {}", p))?;
         builder = builder.proxy(proxy);
     }
-    builder.build().context("构建同步 HTTP Client 失败")
+    let client = builder.build().context("构建同步 HTTP Client 失败")?;
+    let mut cache = clients.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 8 {
+        cache.clear();
+    }
+    Ok(cache.entry(key).or_insert(client).clone())
 }
 
 async fn fetch_source_bytes(
@@ -349,7 +412,14 @@ async fn fetch_source_bytes(
             .get(reqwest::header::ETAG)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        let data = resp.bytes().await?.to_vec();
+        let mut resp = resp;
+        let mut data = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if data.len().saturating_add(chunk.len()) > MAX_SYNC_DOWNLOAD_BYTES {
+                return Err(anyhow!("远程索引超过 {} 字节上限", MAX_SYNC_DOWNLOAD_BYTES));
+            }
+            data.extend_from_slice(&chunk);
+        }
         Ok(FetchedSource::Bytes {
             data,
             etag: new_etag,
@@ -358,6 +428,12 @@ async fn fetch_source_bytes(
         let meta1 = fs::metadata(source)
             .await
             .with_context(|| format!("读取本地索引文件失败: {}", source))?;
+        if !meta1.is_file() {
+            return Err(anyhow!("本地索引源不是常规文件: {}", source));
+        }
+        if meta1.len() > MAX_SYNC_DOWNLOAD_BYTES as u64 {
+            return Err(anyhow!("本地索引超过 {} 字节上限", MAX_SYNC_DOWNLOAD_BYTES));
+        }
         sleep(Duration::from_millis(300)).await;
         let meta2 = fs::metadata(source)
             .await
@@ -370,9 +446,17 @@ async fn fetch_source_bytes(
                 meta2.len()
             ));
         }
-        let data = fs::read(source)
+        let file = fs::File::open(source)
             .await
             .with_context(|| format!("读取本地索引文件失败: {}", source))?;
+        let mut data = Vec::new();
+        file.take(MAX_SYNC_DOWNLOAD_BYTES as u64 + 1)
+            .read_to_end(&mut data)
+            .await
+            .with_context(|| format!("读取本地索引文件失败: {}", source))?;
+        if data.len() > MAX_SYNC_DOWNLOAD_BYTES {
+            return Err(anyhow!("本地索引超过 {} 字节上限", MAX_SYNC_DOWNLOAD_BYTES));
+        }
         Ok(FetchedSource::Bytes { data, etag: None })
     }
 }
@@ -407,15 +491,40 @@ async fn extract_txt_from_zip(raw_bytes: Vec<u8>) -> Result<Vec<u8>> {
         }
 
         let idx = target_idx.ok_or_else(|| anyhow!(".zip 压缩包内未找到 .txt 索引文件"))?;
-        let mut entry = archive.by_index(idx)?;
-        let mut out = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut out).context("解压 .txt 内容失败")?;
+        let entry = archive.by_index(idx)?;
+        if entry.size() > MAX_ZIP_TXT_BYTES as u64 {
+            return Err(anyhow!("zip 内 .txt 超过 {} 字节上限", MAX_ZIP_TXT_BYTES));
+        }
+        let mut out = Vec::new();
+        entry
+            .take(MAX_ZIP_TXT_BYTES as u64 + 1)
+            .read_to_end(&mut out)
+            .context("解压 .txt 内容失败")?;
+        if out.len() > MAX_ZIP_TXT_BYTES {
+            return Err(anyhow!("zip 内 .txt 超过 {} 字节上限", MAX_ZIP_TXT_BYTES));
+        }
         Ok(out)
     })
     .await?
 }
 
+fn trim_process_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+struct SyncMemoryTrimGuard;
+
+impl Drop for SyncMemoryTrimGuard {
+    fn drop(&mut self) {
+        trim_process_memory();
+    }
+}
+
 async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
+    let _mem_trim_guard = SyncMemoryTrimGuard;
     let start_instant = Instant::now();
     let started_at = Utc::now();
     let cfg = state.config.load();
@@ -536,7 +645,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    let pipeline_res: Result<(i32, i32, i32, i32, Vec<i64>)> = async {
+    let pipeline_res: Result<SyncPipelineOutcome> = async {
         let txt_bytes = if is_zip_payload(&source, &raw_bytes) {
             set_sync_progress(
                 state,
@@ -576,6 +685,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         let mut lines = tokio::io::BufReader::new(txt_bytes.as_slice()).lines();
         let mut total_lines = 0_i32;
         let mut parsed_records = Vec::with_capacity(100_000);
+        let mut subtitle_index = scanner::SubtitleIndex::default();
 
         while let Some(line) = lines.next_line().await? {
             if max_lines > 0 && (total_lines as usize) >= max_lines {
@@ -583,6 +693,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             }
             total_lines += 1;
 
+            subtitle_index.add_line(&line);
             if let Some(rec) = parse_strm_line(&line) {
                 if !includes.is_empty() && !includes.iter().any(|inc| rec.root_dir.starts_with(inc))
                 {
@@ -620,6 +731,10 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             }
         }
 
+        drop(lines);
+        drop(txt_bytes);
+        trim_process_memory();
+
         info!(
             "索引解析完成：读取行数 {}，命中有效视频行 {}，开始择优去重...",
             total_lines,
@@ -641,6 +756,8 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         )
         .await;
 
+        subtitle_index.attach(&mut parsed_records);
+        drop(subtitle_index);
         let deduped = deduplicate_records(parsed_records);
 
         set_sync_progress(
@@ -659,7 +776,21 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         .await;
 
         let stats = apply_sync_diff(&state.db, deduped, total_lines, batch_size, force).await?;
-        state.caches.image_meta_cache.invalidate_all();
+        if stats.deleted_episodes > 0 {
+            state.caches.collage_cache.invalidate_all();
+        }
+        if !stats.deleted_work_ids.is_empty() {
+            for work_id in &stats.deleted_work_ids {
+                for key in [
+                    format!("work_{work_id}:Primary"),
+                    format!("work_{work_id}:Backdrop"),
+                    format!("media_{work_id}:Primary"),
+                    format!("media_{work_id}:Backdrop"),
+                ] {
+                    state.caches.image_meta_cache.invalidate(&key).await;
+                }
+            }
+        }
 
         *state.sync_ctrl.last_file_hash.write().await = Some(file_hash);
         *state.sync_ctrl.last_sync_time.write().await = Some(Utc::now());
@@ -674,13 +805,13 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             save_persisted_cursor(state, "sync.last_etag", etag, "最近一次同步远程索引 ETag").await;
         }
 
-        Ok((
-            stats.total_lines,
-            stats.added_episodes,
-            stats.deleted_episodes,
-            stats.new_media_items,
-            stats.updated_folder_ids,
-        ))
+        Ok(SyncPipelineOutcome {
+            total_lines: stats.total_lines,
+            added_episodes: stats.added_episodes,
+            deleted_episodes: stats.deleted_episodes,
+            new_media_items: stats.new_media_items,
+            updated_folder_ids: stats.updated_folder_ids,
+        })
     }
     .await;
 
@@ -688,7 +819,13 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
     let finished_at = Utc::now();
 
     match pipeline_res {
-        Ok((total_lines, added, deleted, new_media, updated_folder_ids)) => {
+        Ok(SyncPipelineOutcome {
+            total_lines,
+            added_episodes: added,
+            deleted_episodes: deleted,
+            new_media_items: new_media,
+            updated_folder_ids,
+        }) => {
             sqlx::query(
                 r#"
                 UPDATE sync_logs SET
@@ -709,13 +846,32 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
             .await?;
 
             for fid in updated_folder_ids {
-                let _ = state
+                if let Err(error) = state
                     .scraper
                     .priority_tx
-                    .try_send(crate::state::ScrapeTask::Folder(fid));
+                    .try_send(crate::state::ScrapeTask::Folder(fid))
+                {
+                    warn!(folder_id = fid, %error, "无法将同步变更的目录加入刮削队列");
+                }
             }
 
             state.caches.admin_stats_cache.invalidate_all();
+            if added > 0 || deleted > 0 {
+                state.caches.metadata_tag_map_cache.invalidate_all();
+            }
+            // Newly inserted staging folders are not visible in /Items until scraping verifies them.
+            // Only announce a broad library refresh when indexed content was actually removed.
+            if deleted > 0 {
+                state.session_hub.broadcast(
+                    None,
+                    "LibraryChanged",
+                    serde_json::json!({
+                        "ItemsAdded": [], "ItemsRemoved": [], "ItemsUpdated": [],
+                        "FoldersAddedTo": [],
+                        "FoldersRemovedFrom": ["lib_movie", "lib_tv", "lib_anime", "lib_doc", "lib_variety"]
+                    }),
+                );
+            }
 
             info!(
                 "同步任务完成 (耗时 {}ms): 新增视频源 {}, 清理失效 {}, 新增目录分组 {}",
@@ -745,7 +901,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SYNC_ERROR_RETRY_SEC, compute_next_run_at, remaining_wait_secs, schedule_after_sync,
+        compute_next_run_at, remaining_wait_secs, schedule_after_sync, SYNC_ERROR_RETRY_SEC,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;

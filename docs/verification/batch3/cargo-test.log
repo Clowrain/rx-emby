@@ -1,0 +1,121 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running unittests src/main.rs (target/debug/deps/rx_emby-cb5dcda6a2bcc620)
+
+running 114 tests
+test alist::tests::recognizes_refresh_completed_after_request_started ... ok
+test scraper::scheduled_task_tests::scheduled_scrape_enqueues_missing_metadata_and_manually_drains_pending_folders ... ignored, 需要 TEST_DATABASE_URL；使用单连接临时表隔离队列数据
+test scraper::scheduled_task_tests::activity_guard_reports_running_until_last_concurrent_task_finishes ... ok
+test image_cache::tests::test_image_shard_rel_path ... ok
+test smart_views::tests::keyword_search_requires_a_non_ignored_sync_folder_and_limits_overview ... ok
+test smart_views::tests::invalid_ranges_are_rejected ... ok
+test scraper::scheduled_task_tests::manual_request_wakes_worker_and_enables_sweep ... ok
+test smart_views::tests::legacy_rules_and_explicit_view_grants ... ok
+test scraper::tmdb::tests::detail_fields_survive_deserialization ... ok
+test state::session_hub_tests::hub_scopes_push_and_revokes_all_connections_for_token ... ok
+test sync::parser::tests::rejects_decoded_parent_segments_before_hashing_paths ... ok
+test sync::parser::tests::test_multi_version_disambiguation ... ok
+test sync::parser::tests::test_filter_sample_and_audio ... ok
+test image_cache::tests::hot_cache_capacity_is_weighted_by_image_bytes ... ok
+test state::session_hub_tests::hub_evicts_slow_connections_when_queue_is_full ... ok
+test image_cache::tests::atomic_image_write_leaves_no_temporary_files ... ok
+test sync::scanner::tests::external_subtitles_match_folder_and_stem_in_any_order ... ok
+test sync::parser::tests::test_parse_dirty_xiaoya_line_with_emoji_and_prefix ... ok
+test sync::parser::tests::test_numeric_movie_title_not_mistaken_for_year ... ok
+test sync::parser::tests::test_parse_untagged_episode_fallback ... ok
+test sync::parser::tests::test_lossy_percent_and_hash_in_filename ... ok
+test sync::tests::compute_next_run_waits_full_interval_when_never_synced ... ok
+test sync::tests::compute_next_run_triggers_after_grace_when_overdue ... ok
+test sync::tests::compute_next_run_waits_remaining_interval_when_recent ... ok
+test sync::tests::schedule_after_sync_advances_anchor_on_success ... ok
+test sync::tests::schedule_after_sync_uses_short_backoff_on_failure_and_keeps_anchor ... ok
+test web::admin_api::media::tests::year_sort_prefers_premiered_at_with_year_fallback ... ok
+test web::admin_api::users::cache_tests::deleting_the_last_admin_is_rejected ... ok
+test sync::parser::tests::test_specials_season_zero_and_boundary_safety ... ok
+test web::admin_api::virtual_libraries::cache_tests::virtual_library_mutations_invalidate_enabled_library_cache ... ok
+test web::emby_api::auth::cache_tests::auth_fields_require_token_boundary_and_match_key_case_insensitively ... ok
+test web::admin_api::users::cache_tests::saving_or_deleting_user_permissions_invalidates_token_and_category_caches ... ok
+test web::emby_api::auth::cache_tests::bearer_scheme_is_case_insensitive ... ok
+test web::emby_api::auth::cache_tests::detail_token_extraction_supports_emby_authorization_and_api_key ... ok
+test web::emby_api::auth::cache_tests::devices_sharing_a_client_name_have_distinct_identities ... ok
+test web::emby_api::auth::cache_tests::revoking_a_token_invalidates_only_that_token_entry ... ok
+test sync::parser::tests::test_pure_tmdb_folder_under_collection_uses_filename ... ok
+test web::emby_api::compat_tests::token_headers_override_query_and_authorization_headers_fall_back ... ok
+test web::emby_api::compat_tests::trace_uri_redacts_all_token_aliases ... ok
+test web::emby_api::ids::tests::test_escape_like_and_pattern ... ok
+test web::emby_api::ids::tests::test_parse_episode_id_allows_zero_episode_number ... ok
+test web::emby_api::ids::tests::test_parse_season_id_includes_specials ... ok
+test web::emby_api::ids::tests::test_parse_work_id_variants ... ok
+test web::emby_api::images::tests::image_path_tag_differs_for_distinct_paths ... ok
+test web::emby_api::images::tests::matching_if_none_match_returns_304 ... ok
+test web::emby_api::items::detail::access_tests::forbidden_for_base_library_outside_allowed_categories ... ok
+test web::emby_api::items::episode_json::tests::episode_user_data_includes_last_played_date ... ok
+test web::emby_api::items::episodes::sql_tests::global_episode_history_falls_back_by_tmdb_even_with_legacy_work_id ... ok
+test web::emby_api::items::episodes::sql_tests::global_episode_sql_uses_flat_top_n_and_folder_work_id ... ok
+test web::emby_api::items::history::tests::next_up_deduplicates_by_resolved_work_and_orders_distinct_selection ... ok
+test web::emby_api::items::history::tests::resume_and_next_up_apply_access_scope_before_limit ... ok
+test sync::parser::tests::test_strm_real_world_pure_tmdb_specimens ... ok
+test web::emby_api::items::list::tests::favorite_filter_only_short_circuits_when_types_are_explicitly_unsupported ... ok
+test web::emby_api::items::list::tests::date_played_and_play_count_share_one_user_bind ... ok
+test web::emby_api::items::list::tests::main_media_list_uses_flat_top_n_query ... ok
+test web::emby_api::items::list::tests::test_emby_sort_priority_with_multi_fields ... ok
+test web::emby_api::items::list::tests::test_parse_explicit_work_ids_supports_typed_ids ... ok
+test web::emby_api::items::sql::metadata_filter_tests::items_query_deserializes_metadata_filters_with_compatible_names ... ok
+test web::emby_api::items::sql::metadata_filter_tests::invalid_years_are_errors_and_ratings_use_stored_certifications ... ok
+test web::emby_api::items::sql::metadata_filter_tests::metadata_filters_split_both_delimiters_and_bind_arrays ... ok
+test web::emby_api::items::sql::tests::dyn_sql_bind_returns_a_parameter_or_an_http_error ... ok
+test web::emby_api::items::sql::tests::dyn_sql_pagination_preserves_existing_parameter_numbers ... ok
+test web::emby_api::items::sql::tests::dyn_sql_push_bind_push_inserts_numbered_parameter ... ok
+test web::emby_api::items::sql::tests::folder_name_search_excludes_ignored_folders ... ok
+test web::emby_api::items::sql::tests::list_access_sql_combines_categories_and_virtual_library_rules ... ok
+test web::emby_api::items::sql::tests::no_category_scope_skips_virtual_library_rule_validation ... ok
+test web::emby_api::items::sql::tests::user_access_scope_shared_sql_helper_appends_validated_rules ... ok
+test web::emby_api::metadata_lists::tests::metadata_ids_match_list_ids_and_unknown_ids_stay_empty ... ok
+test web::emby_api::metadata_lists::tests::metadata_names_accept_plain_values_and_generated_ids_together ... ok
+test web::emby_api::metadata_lists::tests::metadata_pagination_reports_total_before_slicing_even_past_end ... ok
+test web::emby_api::playback::path_tests::canonical_path_rejects_dot_segments_and_normalizes_leading_slashes ... ok
+test web::emby_api::playback::path_tests::canonical_path_rejects_encoded_traversal_without_decoding_twice ... ok
+test web::emby_api::playback::path_tests::d_path_rejects_missing_ignored_and_unindexed_sources ... ok
+test web::emby_api::playlists::database_tests::collections_and_playlists_acl_atomic_insert_and_reorder ... ignored, 需要 TEST_DATABASE_URL；为每次测试创建独立 PostgreSQL schema
+test web::emby_api::playlists::mixed_page_tests::mixed_page_crosses_media_boundary_without_repeating_collections ... ok
+test web::emby_api::playback::subtitle_tests::playback_streams_declare_real_external_subtitles ... ok
+test web::emby_api::playlists::tests::json_ids_support_array_csv_and_query_override ... ok
+test web::emby_api::playlists::tests::list_identifiers_reject_nonpositive_database_keys ... ok
+test web::emby_api::playlists::tests::media_target_rejects_unknown_types_and_preserves_specials ... ok
+test web::emby_api::playlists::tests::owner_admin_and_legacy_collections_are_accessible ... ok
+test web::emby_api::playlists::tests::move_entry_id_disambiguates_duplicates_and_keeps_other_entries_in_order ... ok
+test web::emby_api::search::tests::access_scope_filters_categories_and_permitted_virtual_libraries_in_sql ... ok
+test web::emby_api::search::tests::episode_search_uses_one_exists_and_matches_series_sort_title ... ok
+test web::emby_api::search::tests::numeric_search_matches_tmdb_id_as_an_alternative_to_title ... ok
+test web::emby_api::sessions::history_database_tests::history_mutations_preserve_scope_progress_and_atomicity ... ignored, 设置 TEST_DATABASE_URL，使用单连接临时表验证事务和播放历史
+test web::emby_api::search::tests::search_type_filters_normalize_supported_media_types ... ok
+test web::emby_api::sessions::session_fix_tests::favorite_upsert_updates_only_favorite_identity ... ok
+test web::emby_api::sessions::session_fix_tests::partial_unique_conflict_clauses_match_migration_indexes ... ok
+test web::emby_api::sessions::session_fix_tests::played_history_scope_preserves_zero_season_and_episode_one ... ok
+test web::emby_api::sessions::session_fix_tests::session_item_ids_match_by_normalized_work_and_episode ... ok
+test web::emby_api::sessions::session_fix_tests::session_item_matching_does_not_treat_zero_season_as_wildcard ... ok
+test web::emby_api::sessions::session_fix_tests::session_removal_requires_matching_authenticated_owner ... ok
+test web::emby_api::sessions::session_fix_tests::source_ids_use_episode_scope_for_tv_and_work_scope_for_movies ... ok
+test web::emby_api::sessions::session_fix_tests::work_history_uses_work_level_key_and_season_uses_season_key ... ok
+test web::emby_api::smart_view_tests::smart_view_end_to_end ... ignored, 需要隔离 PostgreSQL：设置 TEST_DATABASE_URL 后运行 --ignored
+test web::emby_api::subtitles::tests::subtitle_proxy_returns_bytes_and_head_metadata ... ok
+test web::emby_api::subtitles::tests::subtitle_stream_indices_reserve_video_and_audio ... ok
+test image_cache::tests::same_key_concurrent_loads_are_coalesced ... ok
+test web::emby_api::system_ops::scheduled_task_tests::scheduled_scrape_requires_admin_before_any_queue_action ... ok
+test web::emby_api::sessions::session_fix_tests::session_and_user_data_pushes_filter_users_and_expired_entries ... ok
+test web::emby_api::views::access_scope_tests::empty_restricted_categories_and_no_libraries_means_no_access ... ok
+test web::emby_api::ws::tests::handshake_device_uses_registered_identity_and_rejects_spoofing ... ok
+test web::emby_api::ws::tests::playback_report_cannot_replace_handshake_authority ... ok
+test web::emby_api::ws::tests::ws_reports_persist_progress_and_completion ... ignored, 设置 TEST_DATABASE_URL 验证 WS 上报复用 HTTP 持久化、预热和完成逻辑
+test web::emby_api::system_ops::scheduled_task_tests::scheduled_scrape_without_tmdb_key_reports_unavailable ... ok
+test state::session_hub_tests::background_cleanup_removes_stale_sessions_and_stops_on_shutdown ... ok
+test web::emby_api::system_ops::scheduled_task_tests::scheduled_tasks_idle_scrape_has_unknown_progress ... ok
+test web::emby_api::ws::tests::ws_reports_share_http_lifecycle_and_user_scoped_session_pushes ... ok
+test web::emby_api::compat_tests::bitrate_head_preserves_length_without_body ... ok
+test web::emby_api::compat_tests::public_p0_to_p3_routes_respond_on_both_root_and_emby_prefix ... ok
+test web::emby_api::compat_tests::batch2_closed_loop_routes_require_auth_on_both_prefixes ... ok
+test web::emby_api::compat_tests::protected_p0_to_p3_routes_are_mounted_and_require_auth ... ok
+test web::emby_api::compat_tests::anonymous_user_image_is_consistent_and_cacheable ... ok
+test web::emby_api::compat_tests::non_admin_sessions_are_private ... ok
+
+test result: ok. 109 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.22s
+

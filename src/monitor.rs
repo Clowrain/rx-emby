@@ -76,11 +76,16 @@ impl Default for MonitorState {
     }
 }
 
-pub fn spawn_resource_monitor(state: Arc<AppState>) {
+pub fn spawn_resource_monitor(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // 启动后先采样一次基线数据
-        if let Err(e) = collect_and_record(&state).await {
-            warn!("⚠️ [Monitor] 初始资源采样失败: {}", e);
+        // 启动后先采样一次基线数据；停机时丢弃未完成的采样与其子进程。
+        tokio::select! {
+            _ = state.shutdown_token.cancelled() => return,
+            result = collect_and_record(&state) => {
+                if let Err(error) = result {
+                    warn!("⚠️ [Monitor] 初始资源采样失败: {}", error);
+                }
+            }
         }
 
         let mut ticker = interval(Duration::from_secs(SAMPLE_INTERVAL_SECS));
@@ -92,21 +97,29 @@ pub fn spawn_resource_monitor(state: Arc<AppState>) {
                     break;
                 }
                 _ = ticker.tick() => {
-                    if let Err(e) = collect_and_record(&state).await {
-                        debug!("资源监控定时采样异常: {}", e);
+                    tokio::select! {
+                        _ = state.shutdown_token.cancelled() => break,
+                        result = collect_and_record(&state) => {
+                            if let Err(error) = result {
+                                debug!("资源监控定时采样异常: {}", error);
+                            }
+                        }
                     }
                 }
             }
         }
-    });
+    })
 }
 
 pub fn detect_current_scenario(state: &AppState) -> String {
     if state.sync_ctrl.is_syncing.load(Ordering::Relaxed) {
         return "媒体库同步中".to_string();
     }
-    state.prune_stale_sessions();
-    let sessions = state.sessions.len();
+    let sessions = state
+        .sessions
+        .iter()
+        .filter(|entry| entry.is_active())
+        .count();
     if sessions > 0 {
         return format!("并发播放 ({}路)", sessions);
     }
@@ -320,10 +333,16 @@ async fn read_proc_cpu_pct(state: &AppState) -> Option<f64> {
 async fn sample_process_ps(pid: u32) -> Option<(f64, f64)> {
     let out = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "%cpu=,rss="])
+        .kill_on_drop(true)
         .output()
         .await
+        .map_err(|error| {
+            warn!("执行 ps 采集当前进程指标失败: {}", error);
+            error
+        })
         .ok()?;
     if !out.status.success() {
+        warn!("ps 采集当前进程指标退出异常: {}", out.status);
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -336,11 +355,19 @@ async fn sample_process_ps(pid: u32) -> Option<(f64, f64)> {
 async fn sample_postgres_processes() -> (bool, f64, f64) {
     let out = match Command::new("ps")
         .args(["-Ao", "%cpu=,rss=,comm="])
+        .kill_on_drop(true)
         .output()
         .await
     {
         Ok(o) if o.status.success() => o,
-        _ => return (false, 0.0, 0.0),
+        Ok(o) => {
+            warn!("ps 采集 PostgreSQL 进程指标退出异常: {}", o.status);
+            return (false, 0.0, 0.0);
+        }
+        Err(error) => {
+            warn!("执行 ps 采集 PostgreSQL 进程指标失败: {}", error);
+            return (false, 0.0, 0.0);
+        }
     };
 
     let text = String::from_utf8_lossy(&out.stdout);
@@ -368,7 +395,7 @@ async fn sample_postgres_processes() -> (bool, f64, f64) {
 }
 
 async fn sample_disk_df(path: &std::path::Path) -> Option<(f64, f64, f64, f64)> {
-    let target = if path.exists() {
+    let target = if tokio::fs::try_exists(path).await.unwrap_or(false) {
         path
     } else {
         std::path::Path::new(".")
@@ -376,10 +403,16 @@ async fn sample_disk_df(path: &std::path::Path) -> Option<(f64, f64, f64, f64)> 
     let out = Command::new("df")
         .arg("-k")
         .arg(target)
+        .kill_on_drop(true)
         .output()
         .await
+        .map_err(|error| {
+            warn!("执行 df 采集磁盘指标失败: {}", error);
+            error
+        })
         .ok()?;
     if !out.status.success() {
+        warn!("df 采集磁盘指标退出异常: {}", out.status);
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);

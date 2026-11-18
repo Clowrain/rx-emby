@@ -1,6 +1,7 @@
 use super::sql::*;
 use super::*;
 use serde_json::json;
+use std::collections::HashMap;
 pub async fn get_user_items(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -14,7 +15,7 @@ pub async fn get_user_items(
         q.api_key.as_deref(),
     )
     .await?;
-    Ok(Json(get_user_items_inner(&state, &user_id, &q).await?))
+    Ok(Json(get_user_items_inner(&state, &user_id, &headers, &q).await?))
 }
 
 /// 用户视图根条目（`GET /Users/:user_id/Items/Root`）：
@@ -61,17 +62,39 @@ pub async fn get_items_unscoped(
         q.api_key.as_deref(),
     )
     .await?;
-    Ok(Json(get_user_items_inner(&state, &user_id, &q).await?))
+    Ok(Json(get_user_items_inner(&state, &user_id, &headers, &q).await?))
 }
 
 pub(in crate::web::emby_api) async fn get_user_items_inner(
     state: &AppState,
     user_id: &str,
+    headers: &HeaderMap,
     q: &ItemsQuery,
 ) -> Result<Value, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = q.start_index.max(0);
+    // Media works are already the direct children of base-library folders; this
+    // flag is consumed here without changing the stable default response shape.
+    let _recursive = q.recursive;
     let cfg = state.config.load();
+
+    if let Some(parent) = q
+        .parent_id
+        .as_deref()
+        .filter(|p| p.starts_with("pl_") || p.starts_with("col_"))
+    {
+        return crate::web::emby_api::playlists::list_items(
+            state,
+            user_id,
+            parent,
+            parent.starts_with("col_"),
+            offset as usize,
+            Some(limit as usize),
+        )
+        .await;
+    }
+
+    let merge_discovery = discovery_merge_allowed(q);
 
     // 1. 解析 Filters 参数（如 IsFavorite, IsResumable, IsPlayed, IsUnplayed）
     let filter_set: HashSet<&str> = q
@@ -88,7 +111,7 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
     }
 
     // 2. 解析 IncludeItemTypes 参数（如 Series, Movie, Episode, Season, Video）
-    let type_set: HashSet<&str> = q
+    let mut type_set: HashSet<&str> = q
         .include_item_types
         .as_deref()
         .unwrap_or("")
@@ -96,18 +119,40 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
+    if let Some(excluded) = q.exclude_item_types.as_deref() {
+        for kind in excluded
+            .split(',')
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+        {
+            type_set.remove(kind);
+        }
+    }
 
     let has_media_type = type_set
         .iter()
         .any(|t| matches!(*t, "Series" | "Movie" | "Episode" | "Season" | "Video"));
 
-    // 若客户端仅请求 Playlist / BoxSet / MusicAlbum 等不支持的集合类型，直接返回空集
+    if !has_media_type && (type_set.contains("Playlist") || type_set.contains("BoxSet")) {
+        return crate::web::emby_api::playlists::discover(
+            state,
+            user_id,
+            type_set.contains("Playlist"),
+            type_set.contains("BoxSet"),
+            offset as usize,
+            limit as usize,
+            q.search_term.as_deref(),
+        )
+        .await;
+    }
+
+    // 客户端仅请求尚未支持的集合类型时返回空集
     if !type_set.is_empty() && !has_media_type {
-        return Ok(json!({ "Items": [], "TotalRecordCount": 0 }));
+        return Ok(json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": offset }));
     }
     // 收藏的 Episode/Season/Video 按整部影视维度收藏，直接返回空列表防止把剧集主条目混入
     if favorite_filter_has_no_supported_media_type(filter_set.contains("IsFavorite"), &type_set) {
-        return Ok(json!({ "Items": [], "TotalRecordCount": 0 }));
+        return Ok(json!({ "Items": [], "TotalRecordCount": 0, "StartIndex": offset }));
     }
 
     // 3. 展开某部剧/某季的子列表（ParentId = work_123 / media_123 / season_123_2）
@@ -123,9 +168,26 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
                 && !type_set.contains("Episode")
                 && !type_set.contains("Video")
             {
-                return get_seasons_for_media(state, user_id, mid, search_term).await;
+                return get_seasons_for_media(
+                    state,
+                    user_id,
+                    mid,
+                    search_term,
+                    q.start_index,
+                    limit,
+                )
+                .await;
             }
-            return get_episodes_for_media(state, user_id, mid, None, search_term).await;
+            return get_episodes_for_media(
+                state,
+                user_id,
+                mid,
+                None,
+                search_term,
+                q.start_index,
+                limit,
+            )
+            .await;
         }
         if let Some((wid, snum)) = parse_season_id(pid) {
             ensure_media_accessible(state, user_id, wid).await?;
@@ -135,6 +197,8 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
                 wid,
                 Some(snum),
                 q.search_term.as_deref(),
+                q.start_index,
+                limit,
             )
             .await;
         }
@@ -150,7 +214,8 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         .filter(|p| p.starts_with("lib_vlib_"))
     {
         let vid = pid
-            .trim_start_matches("lib_vlib_")
+            .strip_prefix("lib_vlib_")
+            .unwrap_or(pid)
             .parse::<i32>()
             .map_err(|_| (StatusCode::BAD_REQUEST, "无效的智能视图 ID".into()))?;
         let row: Option<(String, Value)> = sqlx::query_as(
@@ -177,7 +242,15 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         vlib_rule = Some(rule);
     }
     if access_scope.has_no_access() {
-        return Ok(json!({ "Items": [], "TotalRecordCount": 0 }));
+        return crate::web::emby_api::playlists::merge_discovery_page(
+            state,
+            user_id,
+            json!({"Items":[], "TotalRecordCount":0,"StartIndex":offset}),
+            type_set.contains("Playlist") && merge_discovery,
+            type_set.contains("BoxSet") && merge_discovery,
+            q,
+        )
+        .await;
     }
 
     let rule_json = vlib_rule
@@ -204,7 +277,7 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
 
     // 全局单集列表（IncludeItemTypes=Episode 无剧集父级）：真正查询 sync_files + work_episodes
     if type_set.contains("Episode") && !type_set.contains("Series") && !type_set.contains("Movie") {
-        return get_episodes_listing(
+        let media = get_episodes_listing(
             state,
             user_id,
             q,
@@ -215,6 +288,15 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
                 limit,
                 offset,
             },
+        )
+        .await?;
+        return crate::web::emby_api::playlists::merge_discovery_page(
+            state,
+            user_id,
+            media,
+            type_set.contains("Playlist") && merge_discovery,
+            type_set.contains("BoxSet") && merge_discovery,
+            q,
         )
         .await;
     }
@@ -242,6 +324,51 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         .split(',')
         .any(|f| f.trim().eq_ignore_ascii_case("Popularity"));
 
+    let normalized =
+        super::super::metadata_lists::normalize_metadata_query(state, user_id, q).await?;
+    let q = &normalized;
+    let requested_fields: HashSet<String> = q
+        .fields
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let genre_names = super::super::metadata_lists::resolve_metadata_ids(
+        state,
+        user_id,
+        q.genre_ids.as_deref(),
+        "m.genres",
+        "genre",
+    )
+    .await?;
+    let studio_names = super::super::metadata_lists::resolve_metadata_ids(
+        state,
+        user_id,
+        q.studio_ids.as_deref(),
+        "m.networks",
+        "studio",
+    )
+    .await?;
+    let person_names = super::super::metadata_lists::resolve_metadata_ids(
+        state,
+        user_id,
+        q.person_ids.as_deref(),
+        super::super::metadata_lists::PERSON_NAMES,
+        "person",
+    )
+    .await?;
+    let mut person_values = split_metadata_values(q.persons.as_deref());
+    person_values.extend(person_names.unwrap_or_default());
+    let person_filter = person_values.join("|");
+    let artists_filter = [q.artists.as_deref(), q.artist_ids.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("|");
     let filters = MediaListFilters {
         user_id,
         access_scope: access_scope.as_ref(),
@@ -250,6 +377,15 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         search_pattern: search_pattern.as_deref(),
         search_tmdb,
         explicit_ids: explicit_ids.as_deref(),
+        genres: q.genres.as_deref(),
+        studios: q.studios.as_deref(),
+        tags: q.tags.as_deref(),
+        years: q.years.as_deref(),
+        official_ratings: q.official_ratings.as_deref(),
+        persons: (!person_filter.is_empty()).then_some(person_filter.as_str()),
+        artists: (!artists_filter.is_empty()).then_some(artists_filter.as_str()),
+        genre_ids: genre_names.as_deref(),
+        studio_ids: studio_names.as_deref(),
         only_favorite,
         only_played,
         only_unplayed,
@@ -266,7 +402,7 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
 
     let mut sql = DynSql::new("");
     sql.push(&format!(
-        r#"SELECT m.id, m.media_type, m.tmdb_id, m.title, m.original_title, m.year, m.premiered_at, m.overview,
+        r#"SELECT m.id, m.media_type, m.tmdb_id, m.title, m.sort_title, m.original_title, m.year, m.premiered_at, m.overview, m.genres,
                   m.rating, m.poster_path, m.backdrop_path, m.created_at,
                   CASE WHEN m.media_type = 'tv' THEN (m.tmdb_metadata->>'number_of_seasons')::int END AS num_seasons,
                   CASE WHEN m.media_type = 'tv' THEN (m.tmdb_metadata->>'number_of_episodes')::int END AS num_episodes{popularity_select}
@@ -286,10 +422,7 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         let _ = sql.bind(user_id.to_string())?;
     }
 
-    sql.push(" LIMIT ");
-    let _ = sql.bind(limit)?;
-    sql.push(" OFFSET ");
-    let _ = sql.bind(offset)?;
+    sql.push_pagination(limit, offset)?;
 
     let rows: Vec<MediaListRow> =
         sqlx::query_as_with::<Postgres, MediaListRow, _>(&sql.sql, sql.args)
@@ -324,19 +457,26 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
-    let fav_set: (HashSet<i64>, HashSet<(i32, String)>) = (
-        fav_rows.iter().filter_map(|(wid, _, _)| *wid).collect(),
-        fav_rows
-            .iter()
-            .filter_map(|(_, tid, mt)| tid.map(|id| (id, mt.clone())))
-            .collect(),
-    );
+    let mut favorite_work_ids = HashSet::new();
+    let mut favorite_tmdb_ids: HashMap<String, HashSet<i32>> = HashMap::new();
+    for (work_id, tmdb_id, media_type) in &fav_rows {
+        if let Some(work_id) = work_id {
+            favorite_work_ids.insert(*work_id);
+        }
+        if let Some(tmdb_id) = tmdb_id {
+            favorite_tmdb_ids
+                .entry(media_type.clone())
+                .or_default()
+                .insert(*tmdb_id);
+        }
+    }
+    let fav_set = (favorite_work_ids, favorite_tmdb_ids);
     let hist_rows: Vec<PageHistoryRow> = if page_mids.is_empty() {
         vec![]
     } else {
-        match sqlx::query_as(
+        sqlx::query_as(
             r#"
-            SELECT work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, is_played
+            SELECT work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, is_played, play_count, last_played_at
             FROM play_histories
             WHERE user_id = $1
               AND (work_id = ANY($2) OR (tmdb_id IS NOT NULL AND tmdb_id = ANY($3)))
@@ -347,16 +487,67 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         .bind(&page_tids)
         .fetch_all(&state.db)
         .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!("批量查询页面播放历史失败: {}", e);
-                vec![]
-            }
-        }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
-    let items: Vec<Value> = rows
+    let tv_present_counts: std::collections::HashMap<i64, (i64, i64)> = if page_mids.is_empty() {
+        Default::default()
+    } else {
+        let present: Vec<(i64, i32, i32)> = sqlx::query_as("SELECT DISTINCT f.work_id, sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id=sf.folder_id WHERE f.work_id=ANY($1) AND f.is_ignored=FALSE")
+            .bind(&page_mids).fetch_all(&state.db).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+        let mut played_by_work: HashMap<i64, HashSet<(i32, i32)>> = HashMap::new();
+        let mut played_by_tmdb: HashMap<(i32, String), HashSet<(i32, i32)>> = HashMap::new();
+        for h in hist_rows.iter().filter(|h| h.is_played) {
+            let key = (h.season_number, h.episode_number);
+            if let Some(wid) = h.work_id {
+                played_by_work.entry(wid).or_default().insert(key);
+            }
+            if let Some(tid) = h.tmdb_id {
+                played_by_tmdb
+                    .entry((tid, h.media_type.clone()))
+                    .or_default()
+                    .insert(key);
+            }
+        }
+        let work_tmdb_keys: HashMap<i64, (i32, &str)> = rows
+            .iter()
+            .filter_map(|r| r.tmdb_id.map(|tid| (r.id, (tid, r.media_type.as_str()))))
+            .collect();
+        let mut result: HashMap<i64, (i64, i64)> = HashMap::new();
+        for (wid, season, episode) in present {
+            let entry = result.entry(wid).or_default();
+            entry.0 += 1;
+            let tmdb_played = work_tmdb_keys
+                .get(&wid)
+                .and_then(|(tmdb_id, media_type)| {
+                    played_by_tmdb.get(&(*tmdb_id, (*media_type).to_string()))
+                })
+                .is_some_and(|eps| eps.contains(&(season, episode)));
+            let played = played_by_work
+                .get(&wid)
+                .is_some_and(|eps| eps.contains(&(season, episode)))
+                || tmdb_played;
+            if played {
+                entry.1 += 1;
+            }
+        }
+        result
+    };
+    let mut histories_by_work: HashMap<i64, Vec<&PageHistoryRow>> = HashMap::new();
+    let mut histories_by_tmdb: HashMap<(i32, &str), Vec<&PageHistoryRow>> = HashMap::new();
+    for history in &hist_rows {
+        if let Some(wid) = history.work_id {
+            histories_by_work.entry(wid).or_default().push(history);
+        }
+        if let Some(tid) = history.tmdb_id {
+            histories_by_tmdb
+                .entry((tid, history.media_type.as_str()))
+                .or_default()
+                .push(history);
+        }
+    }
+    let mut items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             let emby_type = if r.media_type == "movie" {
@@ -374,32 +565,33 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
 
             let is_fav =
                 only_favorite || is_media_favorited(&fav_set, r.id, r.tmdb_id, &r.media_type);
+            let mut matching_histories: Vec<&PageHistoryRow> = histories_by_work.get(&r.id).into_iter().flatten().copied().collect();
+            if let Some(tid) = r.tmdb_id {
+                matching_histories.extend(histories_by_tmdb.get(&(tid, r.media_type.as_str())).into_iter().flatten().copied());
+            }
+            matching_histories.retain(|h| r.media_type != "movie" || (h.season_number == 0 && h.episode_number == 1));
+            let play_count = matching_histories
+                .iter()
+                .map(|h| h.play_count)
+                .max()
+                .unwrap_or(0);
+            let last_played_date = matching_histories.iter().map(|h| h.last_played_at).max();
             let (pos_ticks, is_played) = if r.media_type == "movie" {
-                hist_rows
+                matching_histories
                     .iter()
-                    .find(|h| {
-                        h.season_number == 0
-                            && h.episode_number == 1
-                            && ((r.tmdb_id.is_some()
-                                && h.tmdb_id == r.tmdb_id
-                                && h.media_type == "movie")
-                                || h.work_id == Some(r.id))
-                    })
+                    .find(|h| h.season_number == 0 && h.episode_number == 1)
                     .map(|h| (h.position_ticks, h.is_played))
                     .unwrap_or((0, false))
             } else {
-                let any_played = hist_rows.iter().any(|h| {
-                    h.is_played
-                        && ((r.tmdb_id.is_some() && h.tmdb_id == r.tmdb_id && h.media_type == "tv")
-                            || h.work_id == Some(r.id))
-                });
-                (0, any_played)
+                let present = tv_present_counts.get(&r.id).copied().unwrap_or((0, 0));
+                (0, present.0 > 0 && present.0 == present.1)
             };
 
+            let tv_present = tv_present_counts.get(&r.id).copied().unwrap_or((0, 0));
             let mut obj = json!({
                 "Id": format!("work_{}", r.id),
                 "Name": r.title,
-                "SortName": r.title,
+                "SortName": r.sort_title.as_deref().filter(|name| !name.is_empty()).unwrap_or(&r.title),
                 "OriginalTitle": r.original_title,
                 "ServerId": cfg.server_id,
                 "Type": emby_type,
@@ -411,11 +603,16 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
                 "ImageTags": image_tags,
                 "UserData": {
                     "PlaybackPositionTicks": pos_ticks,
-                    "PlayCount": if is_played { 1 } else { 0 },
+                    "PlayCount": play_count,
+                    "LastPlayedDate": last_played_date,
                     "IsFavorite": is_fav,
-                    "Played": is_played
+                    "Played": is_played,
+                    "UnplayedItemCount": if r.media_type == "tv" { tv_present.0.saturating_sub(tv_present.1) } else { 0 }
                 }
             });
+            if requested_fields.contains("genres") {
+                obj["Genres"] = json!(r.genres);
+            }
             if let Some(ref pdate) = r.premiered_at {
                 if !pdate.is_empty() {
                     obj["PremiereDate"] = json!(pdate);
@@ -443,11 +640,92 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         })
         .collect();
 
-    Ok(json!({
-        "Items": items,
-        "StartIndex": offset,
-        "TotalRecordCount": total
-    }))
+    if requested_fields.contains("mediasources") {
+        let token = extract_emby_token(headers, q.api_key.as_deref()).unwrap_or_default();
+        let mut movie_work_ids = Vec::new();
+        for item in &items {
+            if item.get("Type").and_then(Value::as_str) == Some("Movie") {
+                let work_id = item
+                    .get("Id")
+                    .and_then(Value::as_str)
+                    .and_then(parse_work_id)
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "invalid generated item id".into(),
+                        )
+                    })?;
+                movie_work_ids.push(work_id);
+            }
+        }
+        let mut sources_by_work =
+            build_media_sources_for_movies(state, &token, "", &movie_work_ids).await?;
+        for item in &mut items {
+            let media_sources = if item.get("Type").and_then(Value::as_str) == Some("Movie") {
+                let work_id = item
+                    .get("Id")
+                    .and_then(Value::as_str)
+                    .and_then(parse_work_id)
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "invalid generated item id".into(),
+                        )
+                    })?;
+                sources_by_work.remove(&work_id).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            item["MediaSources"] = json!(media_sources);
+        }
+    }
+
+    // 混合查询先保持媒体的既有筛选/排序，再分页接续按名称排序的列表。
+    crate::web::emby_api::playlists::merge_discovery_page(
+        state,
+        user_id,
+        json!({
+            "Items": items,
+            "StartIndex": offset,
+            "TotalRecordCount": total
+        }),
+        type_set.contains("Playlist") && merge_discovery,
+        type_set.contains("BoxSet") && merge_discovery,
+        q,
+    )
+    .await
+}
+
+fn discovery_merge_allowed(q: &ItemsQuery) -> bool {
+    let root_parent = q.parent_id.as_deref().is_none_or(|p| p == "root");
+    let has_values = [
+        &q.genres,
+        &q.genre_ids,
+        &q.studios,
+        &q.studio_ids,
+        &q.tags,
+        &q.years,
+        &q.official_ratings,
+        &q.person_ids,
+        &q.persons,
+        &q.artist_ids,
+        &q.artists,
+    ]
+    .iter()
+    .any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()));
+    let filters: HashSet<_> = q
+        .filters
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    root_parent
+        && !has_values
+        && q.ids.as_deref().is_none_or(|s| s.trim().is_empty())
+        && !["IsFavorite", "IsPlayed", "IsUnplayed"]
+            .iter()
+            .any(|f| filters.contains(f))
 }
 
 /// 收藏过滤仅在客户端明确指定了不支持的非空类型集合时返回空列表。
@@ -489,6 +767,8 @@ struct PageHistoryRow {
     episode_number: i32,
     position_ticks: i64,
     is_played: bool,
+    play_count: i32,
+    last_played_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// 解析 Emby 客户端逗号分隔的 `SortBy` 与 `SortOrder` 参数，生成稳定的 PostgreSQL ORDER BY 子句。
@@ -541,7 +821,9 @@ fn build_emby_order_clause(
             "ProductionYear" => format!("year {} NULLS LAST", dir),
             "Popularity" => format!("popularity {} NULLS LAST", dir),
             "CommunityRating" | "CriticRating" => format!("rating {}", dir),
-            "SortName" | "Name" | "OriginalTitle" => format!("title {}", dir),
+            "SortName" => format!("COALESCE(NULLIF(m.sort_title, ''), m.title) {}", dir),
+            "Name" => format!("m.title {}", dir),
+            "OriginalTitle" => format!("m.original_title {} NULLS LAST", dir),
             "DatePlayed" => {
                 user_uses += 1;
                 format!(
@@ -552,7 +834,7 @@ fn build_emby_order_clause(
             "PlayCount" => {
                 user_uses += 1;
                 format!(
-                    "(SELECT COUNT(*) FROM play_histories ph WHERE ph.user_id = {uid} AND ph.is_played = TRUE AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)) {}",
+                    "(SELECT COALESCE(MAX(ph.play_count), 0) FROM play_histories ph WHERE ph.user_id = {uid} AND ((ph.tmdb_id IS NOT NULL AND ph.tmdb_id = m.tmdb_id AND ph.media_type = m.media_type) OR ph.work_id = m.id)) {}",
                     dir
                 )
             }
@@ -607,11 +889,14 @@ mod tests {
         let source = include_str!("list.rs");
         let select = source.find("SELECT m.id, m.media_type").unwrap();
         let from = source[select..].find("FROM media_works m").unwrap() + select;
-        let limit = source[from..].find("sql.push(\" LIMIT \")").unwrap() + from;
+        let limit = source[from..]
+            .find("sql.push_pagination(limit, offset)")
+            .unwrap()
+            + from;
         let query_shape = &source[select..limit];
         assert!(!query_shape.contains("FROM ("));
         assert!(query_shape.contains("ORDER BY"));
-        assert!(source[limit..].contains("sql.push(\" OFFSET \")"));
+        assert!(source[limit..].contains("sql.push_pagination(limit, offset)"));
     }
 
     #[test]
@@ -620,13 +905,16 @@ mod tests {
             build_emby_order_clause("PremiereDate,SortName", Some("Descending"), Some("$9"));
         assert_eq!(
             clause,
-            "COALESCE(NULLIF(premiered_at, ''), CASE WHEN year IS NOT NULL THEN year::text || '-01-01' ELSE NULL END) DESC NULLS LAST, title DESC, id DESC"
+            "COALESCE(NULLIF(premiered_at, ''), CASE WHEN year IS NOT NULL THEN year::text || '-01-01' ELSE NULL END) DESC NULLS LAST, COALESCE(NULLIF(m.sort_title, ''), m.title) DESC, id DESC"
         );
         assert_eq!(uses, 0);
 
         let (clause, uses) =
             build_emby_order_clause("Popularity,SortName", Some("Descending"), None);
-        assert_eq!(clause, "popularity DESC NULLS LAST, title DESC, id DESC");
+        assert_eq!(
+            clause,
+            "popularity DESC NULLS LAST, COALESCE(NULLIF(m.sort_title, ''), m.title) DESC, id DESC"
+        );
         assert_eq!(uses, 0);
 
         let (clause, _) = build_emby_order_clause(
@@ -637,7 +925,10 @@ mod tests {
         assert_eq!(clause, "rating DESC, created_at ASC, id DESC");
 
         let (clause, _) = build_emby_order_clause("IsFolder,SortName", None, None);
-        assert_eq!(clause, "title ASC, id ASC");
+        assert_eq!(
+            clause,
+            "COALESCE(NULLIF(m.sort_title, ''), m.title) ASC, id ASC"
+        );
 
         let (clause, _) = build_emby_order_clause("DateLastContentAdded", Some("Descending"), None);
         assert_eq!(clause, "updated_at DESC, id DESC");

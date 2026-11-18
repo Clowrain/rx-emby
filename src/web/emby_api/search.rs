@@ -7,12 +7,12 @@ use super::items::DynSql;
 use super::views::user_access_scope;
 use crate::state::AppState;
 use axum::{
-    Json,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
+    Json,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 #[derive(Deserialize, Default)]
@@ -23,7 +23,12 @@ pub(super) struct SearchHintsQuery {
     limit: Option<i64>,
     #[serde(rename = "UserId", alias = "userId")]
     user_id: Option<String>,
-    #[serde(rename = "api_key", alias = "ApiKey", alias = "X-Emby-Token")]
+    #[serde(
+        rename = "api_key",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token"
+    )]
     api_key: Option<String>,
     #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes")]
     include_item_types: Option<String>,
@@ -221,7 +226,7 @@ fn main_item_search_predicate(pattern_param: &str, tmdb_param: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::views::{AccessibleVirtualLibrary, UserAccessScope};
-    use super::{DynSql, main_item_search_predicate, parse_type_filter};
+    use super::{main_item_search_predicate, parse_type_filter, DynSql};
 
     #[test]
     fn search_type_filters_normalize_supported_media_types() {

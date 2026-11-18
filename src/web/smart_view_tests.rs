@@ -6,6 +6,38 @@ use axum::{
 };
 use tower::ServiceExt;
 
+struct SchemaDropGuard {
+    url: String,
+    schema: String,
+    armed: bool,
+}
+
+impl Drop for SchemaDropGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let url = self.url.clone();
+        let schema = self.schema.clone();
+        let _ = std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(async {
+                    if let Ok(pool) = sqlx::PgPool::connect(&url).await {
+                        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                            .execute(&pool)
+                            .await;
+                        pool.close().await;
+                    }
+                });
+            }
+        })
+        .join();
+    }
+}
+
 fn viewer_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -48,13 +80,43 @@ async fn request(
 #[tokio::test]
 #[ignore = "需要隔离 PostgreSQL：设置 TEST_DATABASE_URL 后运行 --ignored"]
 async fn smart_view_end_to_end() {
-    let url = std::env::var("TEST_DATABASE_URL").expect("使用隔离测试库");
-    let db = sqlx::PgPool::connect(&url).await.unwrap();
-    sqlx::migrate!("./migrations").run(&db).await.unwrap();
-    sqlx::raw_sql("TRUNCATE users, media_works, sync_folders, virtual_libraries CASCADE")
-        .execute(&db)
+    let url = std::env::var("TEST_DATABASE_URL").expect("设置 PostgreSQL 测试库");
+    let bootstrap = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("smart_view_test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&bootstrap)
         .await
         .unwrap();
+    let mut schema_guard = SchemaDropGuard {
+        url: url.clone(),
+        schema: schema.clone(),
+        armed: true,
+    };
+    let search_path = format!("SET search_path TO {schema}, public");
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .after_connect(move |conn, _| {
+            let sql = search_path.clone();
+            Box::pin(async move {
+                sqlx::query(&sql).execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .unwrap();
+    run_smart_view_end_to_end(db.clone()).await;
+    db.close().await;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&bootstrap)
+        .await
+        .unwrap();
+    schema_guard.armed = false;
+    bootstrap.close().await;
+}
+
+async fn run_smart_view_end_to_end(db: sqlx::PgPool) {
+    sqlx::migrate!("./migrations").run(&db).await.unwrap();
     sqlx::raw_sql(r#"
         INSERT INTO users(id,username,password_hash,is_admin,allowed_categories) VALUES
         ('admin','smart-admin','',TRUE,ARRAY['*']),('viewer','smart-viewer','',FALSE,ARRAY['vlib_*']),
@@ -65,9 +127,9 @@ async fn smart_view_end_to_end() {
         ('smart-test-denied-token','denied','test','test','test');
         INSERT INTO media_works(id,media_type,tmdb_id,title,rating,year,poster_path,category,countries,networks,genres,metadata_version,tmdb_metadata,premiered_at)
         VALUES
-        (10,'tv',100,'低分剧',5,2020,'/low.jpg','电视剧',ARRAY['中国大陆'],ARRAY['Apple TV'],ARRAY['悬疑'],1,'{"original_language":"zh","vote_count":20,"status":"Returning Series","number_of_episodes":30,"episode_run_time":[45]}','2020-01-01'),
-        (20,'tv',200,'高分剧',9,2026,'/high.jpg','电视剧',ARRAY['CN'],ARRAY['Apple TV'],ARRAY['悬疑','犯罪'],1,'{"original_language":"zh","vote_count":1500,"status":"Ended","number_of_episodes":8,"number_of_seasons":1,"episode_run_time":[40],"networks":[{"id":2552,"name":"Apple TV"}]}','2026-01-01'),
-        (30,'movie',300,'动画电影',8.5,2025,'/movie.jpg','动漫',ARRAY['JP'],ARRAY[]::text[],ARRAY['动画'],1,'{"original_language":"ja","vote_count":2000,"runtime":88,"popularity":100,"collection":{"id":99,"name":"系列"},"production_companies":[{"id":42,"name":"制作公司"}],"genre_ids":[16]}','2025-01-01');
+        (10,'tv',100,'低分剧',5,2020,'/low.jpg','电视剧',ARRAY['中国大陆'],ARRAY['Apple TV'],ARRAY['悬疑'],2,'{"original_language":"zh","vote_count":20,"status":"Returning Series","number_of_episodes":30,"episode_run_time":[45]}','2020-01-01'),
+        (20,'tv',200,'高分剧',9,2026,'/high.jpg','电视剧',ARRAY['CN'],ARRAY['Apple TV'],ARRAY['悬疑','犯罪'],2,'{"original_language":"zh","vote_count":1500,"status":"Ended","number_of_episodes":8,"number_of_seasons":1,"episode_run_time":[40],"networks":[{"id":2552,"name":"Apple TV"}]}','2026-01-01'),
+        (30,'movie',300,'动画电影',8.5,2025,'/movie.jpg','动漫',ARRAY['JP'],ARRAY[]::text[],ARRAY['动画'],2,'{"original_language":"ja","vote_count":2000,"runtime":88,"popularity":100,"collection":{"id":99,"name":"系列"},"production_companies":[{"id":42,"name":"制作公司"}],"genre_ids":[16]}','2025-01-01');
         INSERT INTO sync_folders(id,root_dir,raw_folder_name,clean_title,inferred_media_type,category,scrape_state,work_id)
         VALUES
         (10,'/low','low','低分剧','tv','电视剧','verified',10),
@@ -208,7 +270,7 @@ async fn smart_view_end_to_end() {
         (json!({"keyword":"%"}), 0),
         (json!({"premiered_after":"2026-01-01"}), 1),
         (json!({"min_popularity":50}), 1),
-        (json!({"added_within_days":1}), 4),
+        (json!({"added_within_days":1}), 3),
     ];
     for (rule, expected) in cases {
         let (status, result) = request(
@@ -341,7 +403,21 @@ async fn verify_metadata_refresh(db: &sqlx::PgPool) {
       ]}))}));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                axum::serve(listener, mock)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .unwrap()
+            })
+    });
     let mut cfg = crate::config::BootstrapFileConfig::default().into_dynamic();
     cfg.tmdb_api_base = format!("http://{}", addr);
     cfg.tmdb_api_key = "fixture".into();
@@ -388,10 +464,11 @@ async fn verify_metadata_refresh(db: &sqlx::PgPool) {
     assert!(crate::scraper::scrape_single_folder(&state, 700)
         .await
         .is_err());
-    let retry_cnt: i32 = sqlx::query_scalar("SELECT retry_count FROM sync_folders WHERE id=700")
+    let retry_cnt: i16 = sqlx::query_scalar("SELECT retry_count FROM sync_folders WHERE id=700")
         .fetch_one(db)
         .await
         .unwrap();
     assert_eq!(retry_cnt, 1);
-    server.abort();
+    let _ = shutdown_tx.send(());
+    server.join().unwrap();
 }

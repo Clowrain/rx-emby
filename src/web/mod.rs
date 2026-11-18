@@ -1,5 +1,6 @@
 pub mod admin_api;
 pub mod emby_api;
+mod password;
 
 use crate::state::AppState;
 use axum::{
@@ -11,7 +12,6 @@ use axum::{
 };
 use rust_embed::Embed;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Embed)]
 #[folder = "web_ui/"]
@@ -22,11 +22,6 @@ pub(crate) fn get_embedded_asset(path: &str) -> Option<rust_embed::EmbeddedFile>
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     Router::new()
         .route("/", get(serve_index))
         .route("/favicon.ico", get(serve_favicon))
@@ -36,7 +31,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(emby_api::router())
         .merge(admin_api::router(state.clone()))
         .fallback(log_unmatched_404)
-        .layer(cors)
         .with_state(state)
 }
 
@@ -46,7 +40,12 @@ async fn log_unmatched_404(req: Request) -> StatusCode {
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
-    tracing::warn!("⚠️ [HTTP 404] {} {} | UA={:?}", req.method(), req.uri(), ua);
+    tracing::warn!(
+        "⚠️ [HTTP 404] {} {} | UA={:?}",
+        req.method(),
+        emby_api::redacted_uri(req.uri()),
+        ua
+    );
     StatusCode::NOT_FOUND
 }
 
@@ -107,6 +106,6 @@ async fn serve_embedded_file(clean_path: &str) -> Response {
                     (StatusCode::INTERNAL_SERVER_ERROR, "静态资源响应构建失败").into_response()
                 })
         }
-        None => serve_index().await.into_response(),
+        None => (StatusCode::NOT_FOUND, "静态资源未找到").into_response(),
     }
 }

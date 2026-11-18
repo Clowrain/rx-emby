@@ -62,10 +62,15 @@ async fn main() -> Result<()> {
     }
 
     // 6. 拉起后台异步工作协程
-    sync::spawn_sync_worker(app_state.clone());
-    scraper::spawn_scrape_worker(app_state.clone(), priority_rx);
-    image_cache::spawn_image_lru_worker(app_state.clone());
-    monitor::spawn_resource_monitor(app_state.clone());
+    let session_cleanup = tokio::spawn(
+        app_state
+            .clone()
+            .run_session_cleanup(std::time::Duration::from_secs(30)),
+    );
+    let sync_worker = sync::spawn_sync_worker(app_state.clone());
+    let scraper_worker = scraper::spawn_scrape_worker(app_state.clone(), priority_rx);
+    let image_cache_worker = image_cache::spawn_image_lru_worker(app_state.clone());
+    let resource_monitor = monitor::spawn_resource_monitor(app_state.clone());
 
     // 7. 启动 Axum Web & Emby 协议服务
     let app = web::build_router(app_state.clone());
@@ -75,13 +80,51 @@ async fn main() -> Result<()> {
 
     info!("🚀 RX-Emby 服务已全面启动，监听地址: http://{}", bind_addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("收到退出信号，正在优雅停止后台任务...");
-            app_state.shutdown_token.cancel();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        #[cfg(unix)]
+        {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("注册 SIGTERM 处理器失败");
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    if let Err(error) = result {
+                        warn!("监听 Ctrl-C 失败: {}", error);
+                    }
+                }
+                _ = terminate.recv() => info!("收到 SIGTERM 信号"),
+            }
+        }
+        #[cfg(not(unix))]
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!("监听 Ctrl-C 失败: {}", error);
+        }
+        info!("收到退出信号，正在优雅停止后台任务...");
+        app_state.shutdown_token.cancel();
+    })
+    .await?;
 
+    let workers = async {
+        let (session, sync, scraper, image_cache, monitor) = tokio::join!(
+            session_cleanup,
+            sync_worker,
+            scraper_worker,
+            image_cache_worker,
+            resource_monitor,
+        );
+        session.context("等待会话清理任务退出失败")?;
+        sync.context("等待同步调度器退出失败")?;
+        scraper.context("等待刮削调度器退出失败")?;
+        image_cache.context("等待图片缓存任务退出失败")?;
+        monitor.context("等待资源监控任务退出失败")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), workers)
+        .await
+        .context("后台任务在 10 秒内未能退出")??;
     Ok(())
 }

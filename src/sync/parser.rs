@@ -27,6 +27,7 @@ static VIDEO_EXTS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedStrmRecord {
+    pub subtitles: Vec<String>,
     /// 影视根目录唯一键（用于聚合同一部电影或电视剧）
     pub root_dir: String,
     /// 原始文件夹名称
@@ -169,6 +170,7 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
     let path_hash = xxh3_64(alist_path.as_bytes()) as i64;
 
     Some(ParsedStrmRecord {
+        subtitles: Vec::new(),
         root_dir,
         raw_folder_name,
         clean_title,
@@ -189,7 +191,7 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
 }
 
 /// 剥离域名与 ?sign= 参数，返回归一化且容错解码后的 AList 逻辑路径
-fn extract_clean_alist_path(raw_url: &str) -> Option<String> {
+pub(super) fn extract_clean_alist_path(raw_url: &str) -> Option<String> {
     let without_query = raw_url.split('?').next().unwrap_or(raw_url).trim();
     // 直接剥离 scheme://host，避免 Url::parse 把文件名里的 `#` 当作 URL fragment 截断
     let raw_path = if let Some((_, after_scheme)) = without_query.split_once("://") {

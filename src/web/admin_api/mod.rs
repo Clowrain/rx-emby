@@ -1,10 +1,12 @@
 use crate::state::AppState;
 use axum::{
+    http::{header, Method},
     middleware,
     routing::{delete, get, post},
     Router,
 };
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 
 mod auth;
 mod media;
@@ -128,5 +130,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             auth::require_admin_auth,
         ));
 
-    Router::new().merge(public_auth).merge(protected)
+    // 管理后台与嵌入式前端及 Vite 开发代理同源部署，此处刻意保持严格同源策略（不开放跨站 origin / credentials）。
+    Router::new().merge(public_auth).merge(protected).layer(
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+    )
 }

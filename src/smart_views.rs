@@ -141,7 +141,9 @@ impl VirtualLibraryRule {
             add(format!("m.genres {genre_op} smart_texts({r}->'genres')"));
         }
         if !self.genre_ids.is_empty() {
-            add(format!("smart_texts(m.tmdb_metadata->'genre_ids') {genre_op} smart_texts({r}->'genre_ids')"));
+            add(format!(
+                "smart_texts(m.tmdb_metadata->'genre_ids') {genre_op} smart_texts({r}->'genre_ids')"
+            ));
         }
         for (field, enabled, column, op, cast) in [
             ("year_min", self.year_min.is_some(), "m.year", ">=", "int"),
@@ -227,11 +229,18 @@ impl VirtualLibraryRule {
             .is_some_and(|s| !s.trim().is_empty())
         {
             let overview = if self.search_overview {
-                format!(" OR m.overview ILIKE '%' || trim({r}->>'keyword') || '%'")
+                format!(
+                    " OR m.overview ILIKE '%' || replace(replace(replace(trim({r}->>'keyword'), chr(92), chr(92)||chr(92)), '%', chr(92)||'%'), '_', chr(92)||'_') || '%' ESCAPE E'\\\\'"
+                )
             } else {
                 String::new()
             };
-            add(format!("(m.title ILIKE '%' || trim({r}->>'keyword') || '%' OR m.original_title ILIKE '%' || trim({r}->>'keyword') || '%'{overview} OR EXISTS (SELECT 1 FROM sync_folders sf_kw WHERE sf_kw.work_id=m.id AND sf_kw.is_ignored=FALSE AND (sf_kw.clean_title ILIKE '%' || trim({r}->>'keyword') || '%' OR sf_kw.raw_folder_name ILIKE '%' || trim({r}->>'keyword') || '%')))"));
+            let pattern = format!(
+                "'%' || replace(replace(replace(trim({r}->>'keyword'), chr(92), chr(92)||chr(92)), '%', chr(92)||'%'), '_', chr(92)||'_') || '%'"
+            );
+            add(format!(
+                "(m.title ILIKE {pattern} ESCAPE E'\\\\' OR m.original_title ILIKE {pattern} ESCAPE E'\\\\'{overview} OR EXISTS (SELECT 1 FROM sync_folders sf_kw WHERE sf_kw.work_id=m.id AND sf_kw.is_ignored=FALSE AND (sf_kw.clean_title ILIKE {pattern} ESCAPE E'\\\\' OR sf_kw.raw_folder_name ILIKE {pattern} ESCAPE E'\\\\')))"
+            ));
         }
         for (field, enabled, column) in [
             ("network_ids", !self.network_ids.is_empty(), "networks"),
@@ -242,7 +251,9 @@ impl VirtualLibraryRule {
             ),
         ] {
             if enabled {
-                add(format!("EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'{column}','[]')) v WHERE v->>'id'=ANY(smart_texts({r}->'{field}')))"));
+                add(format!(
+                    "EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'{column}','[]')) v WHERE v->>'id'=ANY(smart_texts({r}->'{field}')))"
+                ));
             }
         }
         if !self.collection_ids.is_empty() {
@@ -251,7 +262,9 @@ impl VirtualLibraryRule {
             ));
         }
         if self.has_collection.is_some() {
-            add(format!("m.media_type='movie' AND m.metadata_version>=1 AND ((m.tmdb_metadata->'collection'->>'id' IS NOT NULL)=({r}->>'has_collection')::boolean)"));
+            add(format!(
+                "m.media_type='movie' AND m.metadata_version>=1 AND ((m.tmdb_metadata->'collection'->>'id' IS NOT NULL)=({r}->>'has_collection')::boolean)"
+            ));
         }
         if self.runtime_min.is_some() || self.runtime_max.is_some() {
             let mut ranges = vec!["t::int > 0".to_string()];
@@ -261,31 +274,46 @@ impl VirtualLibraryRule {
             if self.runtime_max.is_some() {
                 ranges.push(format!("t::int<=({r}->>'runtime_max')::int"));
             }
-            add(format!("EXISTS(SELECT 1 FROM unnest(CASE WHEN m.media_type='movie' THEN ARRAY[m.tmdb_metadata->>'runtime'] ELSE smart_texts(m.tmdb_metadata->'episode_run_time') END) t WHERE {})",ranges.join(" AND ")));
+            add(format!(
+                "EXISTS(SELECT 1 FROM unnest(CASE WHEN m.media_type='movie' THEN ARRAY[m.tmdb_metadata->>'runtime'] ELSE smart_texts(m.tmdb_metadata->'episode_run_time') END) t WHERE {})",
+                ranges.join(" AND ")
+            ));
         }
         let today = "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date";
         if self.premiered_within_days.is_some() {
-            add(format!("NULLIF(m.premiered_at,'') BETWEEN ({today}-(({r}->>'premiered_within_days')::int-1))::text AND {today}::text"));
+            add(format!(
+                "NULLIF(m.premiered_at,'') BETWEEN ({today}-(({r}->>'premiered_within_days')::int-1))::text AND {today}::text"
+            ));
         }
         if self.added_within_days.is_some() {
-            add(format!("(m.created_at AT TIME ZONE 'Asia/Shanghai')::date BETWEEN {today}-(({r}->>'added_within_days')::int-1) AND {today}"));
+            add(format!(
+                "(m.created_at AT TIME ZONE 'Asia/Shanghai')::date BETWEEN {today}-(({r}->>'added_within_days')::int-1) AND {today}"
+            ));
         }
         if !self.version_tags.is_empty() {
-            add(format!("EXISTS(SELECT 1 FROM sync_files sf JOIN sync_folders f ON f.id=sf.folder_id WHERE f.work_id=m.id AND f.is_ignored=FALSE AND regexp_split_to_array(sf.version_tag, '\\s*·\\s*') @> smart_texts({r}->'version_tags'))"));
+            add(format!(
+                "EXISTS(SELECT 1 FROM sync_files sf JOIN sync_folders f ON f.id=sf.folder_id WHERE f.work_id=m.id AND f.is_ignored=FALSE AND regexp_split_to_array(sf.version_tag, '\\s*·\\s*') @> smart_texts({r}->'version_tags'))"
+            ));
         }
         if !self.spoken_languages.is_empty() {
-            add(format!("smart_texts(m.tmdb_metadata->'spoken_language_codes') && smart_texts({r}->'spoken_languages')"));
+            add(format!(
+                "smart_texts(m.tmdb_metadata->'spoken_language_codes') && smart_texts({r}->'spoken_languages')"
+            ));
         }
         for (field, column, enabled) in [
             ("keyword_ids", "keyword_items", !self.keyword_ids.is_empty()),
             ("director_ids", "directors", !self.director_ids.is_empty()),
         ] {
             if enabled {
-                add(format!("EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'{column}','[]')) v WHERE v->>'id'=ANY(smart_texts({r}->'{field}')))"));
+                add(format!(
+                    "EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'{column}','[]')) v WHERE v->>'id'=ANY(smart_texts({r}->'{field}')))"
+                ));
             }
         }
         if !self.person_ids.is_empty() {
-            add(format!("EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'directors','[]') || COALESCE(m.tmdb_metadata->'cast','[]')) v WHERE v->>'id'=ANY(smart_texts({r}->'person_ids')))"));
+            add(format!(
+                "EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'directors','[]') || COALESCE(m.tmdb_metadata->'cast','[]')) v WHERE v->>'id'=ANY(smart_texts({r}->'person_ids')))"
+            ));
         }
         if !self.watch_provider_ids.is_empty() {
             let mut conds = vec![format!(
@@ -301,7 +329,10 @@ impl VirtualLibraryRule {
             if !self.watch_types.is_empty() {
                 conds.push(format!("p->>'type'=ANY(smart_texts({r}->'watch_types'))"));
             }
-            add(format!("EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'watch_providers','[]')) p WHERE {})", conds.join(" AND ")));
+            add(format!(
+                "EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'watch_providers','[]')) p WHERE {})",
+                conds.join(" AND ")
+            ));
         }
         if !self.certifications.is_empty() {
             let mut conds = vec![format!(
@@ -314,7 +345,10 @@ impl VirtualLibraryRule {
             {
                 conds.push(format!("c->>'region'=upper(trim({r}->>'cert_region'))"));
             }
-            add(format!("EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'certifications','[]')) c WHERE {})", conds.join(" AND ")));
+            add(format!(
+                "EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'certifications','[]')) c WHERE {})",
+                conds.join(" AND ")
+            ));
         }
         if self.digital_within_days.is_some() {
             let region_cond = if self
@@ -326,18 +360,26 @@ impl VirtualLibraryRule {
             } else {
                 String::new()
             };
-            add(format!("m.media_type='movie' AND EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'release_stages','[]')) s WHERE (s->>'type')::int=4{region_cond} AND NULLIF(s->>'date','') BETWEEN ({today}-(({r}->>'digital_within_days')::int-1))::text AND {today}::text)"));
+            add(format!(
+                "m.media_type='movie' AND EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(m.tmdb_metadata->'release_stages','[]')) s WHERE (s->>'type')::int=4{region_cond} AND NULLIF(s->>'date','') BETWEEN ({today}-(({r}->>'digital_within_days')::int-1))::text AND {today}::text)"
+            ));
         }
         if self.airing_within_days.is_some() {
-            add(format!("m.media_type='tv' AND NULLIF(m.tmdb_metadata->'next_episode_to_air'->>'air_date','') BETWEEN {today}::text AND ({today}+(({r}->>'airing_within_days')::int))::text"));
+            add(format!(
+                "m.media_type='tv' AND NULLIF(m.tmdb_metadata->'next_episode_to_air'->>'air_date','') BETWEEN {today}::text AND ({today}+(({r}->>'airing_within_days')::int))::text"
+            ));
         }
         if self.aired_within_days.is_some() {
-            add(format!("m.media_type='tv' AND NULLIF(m.tmdb_metadata->>'last_air_date','') BETWEEN ({today}-(({r}->>'aired_within_days')::int-1))::text AND {today}::text"));
+            add(format!(
+                "m.media_type='tv' AND NULLIF(m.tmdb_metadata->>'last_air_date','') BETWEEN ({today}-(({r}->>'aired_within_days')::int-1))::text AND {today}::text"
+            ));
         }
         if let Some(lc) = self.local_complete.as_deref().filter(|s| !s.is_empty()) {
             let local_ep_count = "(SELECT COUNT(DISTINCT (sf.season_number, sf.episode_number)) FROM sync_files sf JOIN sync_folders f ON f.id=sf.folder_id WHERE f.work_id=m.id AND f.is_ignored=FALSE AND sf.season_number>0)";
             if lc == "all" {
-                add(format!("m.media_type='tv' AND m.tmdb_metadata->>'status'='Ended' AND COALESCE((m.tmdb_metadata->>'number_of_episodes')::int,0)>0 AND {local_ep_count}>=(m.tmdb_metadata->>'number_of_episodes')::int"));
+                add(format!(
+                    "m.media_type='tv' AND m.tmdb_metadata->>'status'='Ended' AND COALESCE((m.tmdb_metadata->>'number_of_episodes')::int,0)>0 AND {local_ep_count}>=(m.tmdb_metadata->>'number_of_episodes')::int"
+                ));
             } else if lc == "aired" {
                 let aired_sum = "(SELECT COALESCE(SUM(s.episode_count),0) FROM work_seasons s WHERE s.work_id=m.id AND s.season_number>0 AND s.episode_count>0)";
                 add(format!(

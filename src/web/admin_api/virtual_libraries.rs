@@ -1,22 +1,62 @@
 use crate::{
     state::AppState,
     web::emby_api::{
-        VirtualLibraryRule, count_virtual_library_matches, resolve_virtual_library_cover_key,
+        count_virtual_library_matches, resolve_virtual_library_cover_key, VirtualLibraryRule,
     },
 };
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
+    Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 type EnabledVlibsCache = moka::future::Cache<String, Vec<(i32, String, Value)>>;
 
+async fn load_smart_view_facet(db: &sqlx::PgPool, expression: &str) -> Result<Value, String> {
+    let sql = format!(
+        "SELECT DISTINCT (v->>'id')::int AS id, v->>'name' AS name FROM media_works m CROSS JOIN LATERAL jsonb_array_elements(COALESCE({},'[]')) v WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE) AND m.metadata_version >= 2 AND v->>'id' IS NOT NULL ORDER BY name,id LIMIT 500",
+        expression
+    );
+    let rows: Vec<(i32, String)> = sqlx::query_as(&sql)
+        .fetch_all(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!(rows
+        .into_iter()
+        .map(|(id, name)| json!({"id": id, "name": name}))
+        .collect::<Vec<_>>()))
+}
+
+async fn load_smart_view_metadata_stats(db: &sqlx::PgPool) -> Result<Value, String> {
+    let stats: (i64, i64, i64, i64) = sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER(WHERE m.metadata_version>=2), COUNT(*) FILTER(WHERE m.metadata_refresh_requested), COUNT(*) FILTER(WHERE m.metadata_refresh_requested AND m.metadata_retry_count>=3) FROM media_works m WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)")
+        .fetch_one(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(json!({"total": stats.0, "enriched": stats.1, "queued": stats.2, "failed": stats.3}))
+}
+
 fn invalidate_enabled_vlibs_cache(cache: &EnabledVlibsCache) {
     cache.invalidate_all();
+}
+
+async fn invalidate_vlib_image_meta(state: &AppState, id: i32) {
+    for key in [
+        format!("lib_vlib_{id}:Primary"),
+        format!("lib_vlib_{id}:Backdrop"),
+    ] {
+        state.caches.image_meta_cache.invalidate(&key).await;
+    }
+    state.caches.collage_cache.invalidate_all();
+}
+
+async fn invalidate_base_library_image_meta(state: &AppState, id: &str) {
+    for key in [format!("{id}:Primary"), format!("{id}:Backdrop")] {
+        state.caches.image_meta_cache.invalidate(&key).await;
+    }
+    state.caches.collage_cache.invalidate_all();
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -40,34 +80,41 @@ pub(super) async fn list_virtual_libraries(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut libraries = Vec::with_capacity(rows.len());
-    for r in rows {
-        let rule: VirtualLibraryRule =
-            serde_json::from_value(r.filter_rules.clone()).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("视图 {} 规则损坏：{}", r.id, e),
-                )
-            })?;
-        let matched_count = count_virtual_library_matches(&state, &rule)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let resolved_cover =
-            resolve_virtual_library_cover_key(r.cover_image.as_deref(), &r.name, &r.icon_type);
-        libraries.push(json!({
-            "id": r.id,
-            "view_id": format!("lib_vlib_{}", r.id),
-            "name": r.name,
-            "icon_type": r.icon_type,
-            "sort_order": r.sort_order,
-            "filter_rules": rule,
-            "is_enabled": r.is_enabled,
-            "cover_image": r.cover_image,
-            "resolved_cover": resolved_cover,
-            "matched_count": matched_count
-        }));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, r) in rows.into_iter().enumerate() {
+        let state = state.clone();
+        tasks.spawn(async move {
+            let rule: VirtualLibraryRule =
+                serde_json::from_value(r.filter_rules.clone()).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("视图 {} 规则损坏：{}", r.id, e),
+                    )
+                })?;
+            let matched_count = count_virtual_library_matches(&state, &rule)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let resolved_cover =
+                resolve_virtual_library_cover_key(r.cover_image.as_deref(), &r.name, &r.icon_type);
+            Ok::<(usize, Value), (StatusCode, String)>((
+                index,
+                json!({
+                    "id": r.id, "view_id": format!("lib_vlib_{}", r.id), "name": r.name,
+                    "icon_type": r.icon_type, "sort_order": r.sort_order, "filter_rules": rule,
+                    "is_enabled": r.is_enabled, "cover_image": r.cover_image,
+                    "resolved_cover": resolved_cover, "matched_count": matched_count
+                }),
+            ))
+        });
     }
-
+    let mut ordered = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        let (index, library) =
+            result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+        ordered.push((index, library));
+    }
+    ordered.sort_by_key(|(index, _)| *index);
+    let libraries: Vec<Value> = ordered.into_iter().map(|(_, library)| library).collect();
     Ok(Json(json!({ "libraries": libraries })))
 }
 
@@ -116,7 +163,7 @@ pub(super) async fn save_virtual_library(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    if let Some(vid) = payload.id {
+    let vlib_id = if let Some(vid) = payload.id {
         let result = sqlx::query(
             r#"
             UPDATE virtual_libraries
@@ -137,11 +184,13 @@ pub(super) async fn save_virtual_library(
         if result.rows_affected() == 0 {
             return Err((StatusCode::NOT_FOUND, "智能视图已被删除，请刷新列表".into()));
         }
+        vid
     } else {
-        sqlx::query(
+        sqlx::query_scalar(
             r#"
             INSERT INTO virtual_libraries (name, icon_type, sort_order, filter_rules, is_enabled, cover_image)
             VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
             "#,
         )
         .bind(name)
@@ -150,14 +199,14 @@ pub(super) async fn save_virtual_library(
         .bind(&rules_json)
         .bind(payload.is_enabled)
         .bind(&cover_image)
-        .execute(&state.db)
+        .fetch_one(&state.db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
 
     invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
     state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_vlib_image_meta(&state, vlib_id).await;
 
     Ok(Json(
         json!({ "status": "ok", "message": "智能视图已保存并立即生效" }),
@@ -309,7 +358,19 @@ pub(super) async fn seed_preset_virtual_libraries(
     if inserted > 0 {
         invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
         state.caches.admin_stats_cache.invalidate_all();
-        state.caches.image_meta_cache.invalidate_all();
+        let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM virtual_libraries")
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for id in ids {
+            for key in [
+                format!("lib_vlib_{id}:Primary"),
+                format!("lib_vlib_{id}:Backdrop"),
+            ] {
+                state.caches.image_meta_cache.invalidate(&key).await;
+            }
+        }
+        state.caches.collage_cache.invalidate_all();
     }
 
     Ok(Json(json!({
@@ -365,7 +426,7 @@ pub(super) async fn delete_virtual_library(
 
     invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
     state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_vlib_image_meta(&state, id).await;
 
     Ok(Json(json!({ "status": "ok", "message": "智能视图已删除" })))
 }
@@ -458,6 +519,7 @@ pub(super) async fn save_base_library_cover(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
+    invalidate_base_library_image_meta(&state, &payload.id).await;
 
     Ok(Json(
         json!({ "status": "ok", "message": "基础媒体库封面已更新" }),
@@ -478,50 +540,35 @@ pub(super) async fn preview_smart_view(
 pub(super) async fn smart_view_options(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    if let Some(cached) = state
+    let db = state.db.clone();
+    let result = state
         .caches
         .admin_stats_cache
-        .get("smart_view_options")
+        .try_get_with("smart_view_options".to_string(), async move {
+            let (networks, companies, collections, keywords, directors, cast, watch_providers, metadata) =
+                tokio::try_join!(
+                    load_smart_view_facet(&db, "m.tmdb_metadata->'networks'"),
+                    load_smart_view_facet(&db, "m.tmdb_metadata->'production_companies'"),
+                    load_smart_view_facet(&db, "CASE WHEN m.tmdb_metadata->'collection'->>'id' IS NOT NULL THEN jsonb_build_array(m.tmdb_metadata->'collection') ELSE '[]'::jsonb END"),
+                    load_smart_view_facet(&db, "m.tmdb_metadata->'keyword_items'"),
+                    load_smart_view_facet(&db, "m.tmdb_metadata->'directors'"),
+                    load_smart_view_facet(&db, "m.tmdb_metadata->'cast'"),
+                    load_smart_view_facet(&db, "m.tmdb_metadata->'watch_providers'"),
+                    load_smart_view_metadata_stats(&db),
+                )?;
+            Ok::<_, String>(json!({
+                "networks": networks,
+                "companies": companies,
+                "collections": collections,
+                "keywords": keywords,
+                "directors": directors,
+                "cast": cast,
+                "watch_providers": watch_providers,
+                "metadata": metadata
+            }))
+        })
         .await
-    {
-        return Ok(Json(cached));
-    }
-    let mut result = json!({});
-    for (key, expr) in [
-        ("networks", "m.tmdb_metadata->'networks'"),
-        ("companies", "m.tmdb_metadata->'production_companies'"),
-        (
-            "collections",
-            "CASE WHEN m.tmdb_metadata->'collection'->>'id' IS NOT NULL THEN jsonb_build_array(m.tmdb_metadata->'collection') ELSE '[]'::jsonb END",
-        ),
-        ("keywords", "m.tmdb_metadata->'keyword_items'"),
-        ("directors", "m.tmdb_metadata->'directors'"),
-        ("cast", "m.tmdb_metadata->'cast'"),
-        ("watch_providers", "m.tmdb_metadata->'watch_providers'"),
-    ] {
-        let sql = format!(
-            "SELECT DISTINCT (v->>'id')::int AS id, v->>'name' AS name FROM media_works m CROSS JOIN LATERAL jsonb_array_elements(COALESCE({},'[]')) v WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE) AND m.metadata_version >= 2 AND v->>'id' IS NOT NULL ORDER BY name,id LIMIT 500",
-            expr
-        );
-        let rows: Vec<(i32, String)> = sqlx::query_as(&sql)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        result[key] = json!(
-            rows.into_iter()
-                .map(|(id, name)| json!({"id":id,"name":name}))
-                .collect::<Vec<_>>()
-        );
-    }
-    let stats: (i64,i64,i64,i64) = sqlx::query_as("SELECT COUNT(*), COUNT(*) FILTER(WHERE m.metadata_version>=2), COUNT(*) FILTER(WHERE m.metadata_refresh_requested), COUNT(*) FILTER(WHERE m.metadata_refresh_requested AND m.metadata_retry_count>=3) FROM media_works m WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)")
-        .fetch_one(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
-    result["metadata"] =
-        json!({"total":stats.0,"enriched":stats.1,"queued":stats.2,"failed":stats.3});
-    state
-        .caches
-        .admin_stats_cache
-        .insert("smart_view_options".to_string(), result.clone())
-        .await;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(result))
 }
 
@@ -539,7 +586,7 @@ pub(super) async fn queue_metadata_backfill(
         .execute(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
     invalidate_enabled_vlibs_cache(&state.caches.enabled_vlibs_cache);
     state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    state.caches.collage_cache.invalidate_all();
     Ok(Json(
         json!({"queued":result.rows_affected(),"message":format!("已将 {} 部作品加入深度元数据补齐队列",result.rows_affected())}),
     ))

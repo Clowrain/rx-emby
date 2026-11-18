@@ -1,5 +1,10 @@
 pub mod collage;
 
+const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+const TMDB_IMAGE_SIZES: &[&str] = &[
+    "w45", "w92", "w154", "w185", "w300", "w342", "w500", "w780", "w1280", "h632", "original",
+];
+
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -43,7 +48,12 @@ impl AppState {
     /// 2. 真正的 singleflight：同一 `cache_key` 的并发请求只会执行一次回源，其余等待共享结果。
     pub async fn get_or_fetch_tmdb_image(&self, size: &str, file_name: &str) -> Result<Bytes> {
         // 路径安全过滤，防止目录穿越攻击
-        if size.contains("..") || file_name.contains("..") || file_name.contains('/') {
+        if !TMDB_IMAGE_SIZES.contains(&size)
+            || file_name.contains("..")
+            || file_name.contains('/')
+            || file_name.contains('\\')
+            || file_name.contains('\0')
+        {
             return Err(anyhow!("非法的图片路径参数"));
         }
 
@@ -103,7 +113,15 @@ impl AppState {
             .with_context(|| format!("回源拉取 TMDB 图片失败: {}", remote_url))?
             .error_for_status()?;
 
-        let bytes = resp.bytes().await?;
+        let mut resp = resp;
+        let mut data = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            if data.len().saturating_add(chunk.len()) > MAX_IMAGE_BYTES {
+                return Err(anyhow!("TMDB 图片超过 {} 字节上限", MAX_IMAGE_BYTES));
+            }
+            data.extend_from_slice(&chunk);
+        }
+        let bytes = Bytes::from(data);
 
         // 4. 原子写入本地分片磁盘并更新 LRU 索引：先写同目录唯一临时文件再 rename 到位，
         //    并发读端永远不会看到半截图片文件
@@ -124,7 +142,7 @@ impl AppState {
             )
             .bind(cache_key)
             .bind(&rel_path)
-            .bind(bytes.len() as i64)
+            .bind(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
             .execute(&self.db)
             .await
             {
@@ -176,7 +194,7 @@ impl AppState {
 }
 
 /// 启动后台图片缓存 LRU 水位线巡检清理任务
-pub fn spawn_image_lru_worker(state: Arc<AppState>) {
+pub fn spawn_image_lru_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("图片磁盘缓存 LRU 水位线监控协程已启动");
         loop {
@@ -192,7 +210,7 @@ pub fn spawn_image_lru_worker(state: Arc<AppState>) {
                 }
             }
         }
-    });
+    })
 }
 
 pub async fn enforce_image_cache_quota(state: &AppState) -> Result<u64> {

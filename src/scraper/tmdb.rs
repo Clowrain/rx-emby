@@ -3,6 +3,33 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+const MAX_API_JSON_BYTES: usize = 16 * 1024 * 1024;
+
+async fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+) -> Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_API_JSON_BYTES as u64)
+    {
+        return Err(anyhow!(
+            "TMDB JSON 响应超过 {} 字节上限",
+            MAX_API_JSON_BYTES
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_API_JSON_BYTES {
+            return Err(anyhow!(
+                "TMDB JSON 响应超过 {} 字节上限",
+                MAX_API_JSON_BYTES
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 #[derive(Debug, Clone)]
 pub struct ScrapedMetadata {
     pub media_type: String, // "movie" | "tv"
@@ -348,7 +375,9 @@ impl AppState {
         }
 
         if media_type == "movie" {
-            let mut m: MovieDetailResp = resp.json().await.context("解析 TMDB Movie JSON 失败")?;
+            let mut m: MovieDetailResp = read_json_bounded(resp)
+                .await
+                .context("解析 TMDB Movie JSON 失败")?;
             let year = parse_year_from_date(m.release_date.as_deref());
             let genre_ids: Vec<i32> = m.genres.iter().map(|g| g.id).collect();
             let genres: Vec<String> = m.genres.into_iter().map(|g| g.name).collect();
@@ -394,7 +423,9 @@ impl AppState {
                 category,
             })
         } else {
-            let mut t: TvDetailResp = resp.json().await.context("解析 TMDB TV JSON 失败")?;
+            let mut t: TvDetailResp = read_json_bounded(resp)
+                .await
+                .context("解析 TMDB TV JSON 失败")?;
             let year = parse_year_from_date(t.first_air_date.as_deref());
             let genre_ids: Vec<i32> = t.genres.iter().map(|g| g.id).collect();
             let genres: Vec<String> = t.genres.into_iter().map(|g| g.name).collect();
@@ -463,14 +494,13 @@ impl AppState {
             percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC)
         );
 
-        let resp: MultiSearchResp = client
+        let response = client
             .get(&url)
             .send()
             .await
             .context("请求 TMDB /search/multi 失败")?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let resp: MultiSearchResp = read_json_bounded(response).await?;
 
         // 筛选 movie 或 tv 结果并按年份接近度 + 类型匹配度 + 热度打分
         let best = resp
@@ -540,12 +570,13 @@ impl AppState {
             ));
         }
 
-        let mut season_data: TmdbSeasonDetailResp = resp.json().await.with_context(|| {
-            format!(
-                "解析 TMDB Season JSON 失败: tv={} S{:02}",
-                tmdb_id, season_number
-            )
-        })?;
+        let mut season_data: TmdbSeasonDetailResp =
+            read_json_bounded(resp).await.with_context(|| {
+                format!(
+                    "解析 TMDB Season JSON 失败: tv={} S{:02}",
+                    tmdb_id, season_number
+                )
+            })?;
 
         // 清洗空字符串字段为 None
         season_data.name = season_data

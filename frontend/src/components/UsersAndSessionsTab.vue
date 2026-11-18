@@ -184,14 +184,14 @@
                 暂无已登录的客户端设备
               </td>
             </tr>
-            <tr v-for="t in tokens" :key="t.token" class="hover:bg-slate-900/40 transition-colors tabular-nums">
+            <tr v-for="t in tokens" :key="t.token_id" class="hover:bg-slate-900/40 transition-colors tabular-nums">
               <th scope="row" class="px-6 py-3 font-medium text-white whitespace-nowrap">{{ t.username }}</th>
               <td class="px-4 py-3 text-xs text-slate-300 font-mono whitespace-nowrap">{{ t.client_name }}</td>
               <td class="px-4 py-3 text-xs text-slate-400 whitespace-nowrap font-mono">
                 {{ new Date(t.last_used_at).toLocaleString() }}
               </td>
               <td class="px-4 py-3 font-mono text-xs text-slate-500 whitespace-nowrap">
-                {{ t.token.slice(0, 12) }}…
+                {{ t.token_preview }}
               </td>
               <td class="px-6 py-3 text-right whitespace-nowrap">
                 <button
@@ -445,7 +445,7 @@ async function handleRevokeToken(t) {
   })
   if (!ok) return
   try {
-    const res = await adminApi.revokeToken(t.token)
+    const res = await adminApi.revokeToken(t.token_id)
     toast.info(res.message)
     await loadAll()
   } catch (err) {

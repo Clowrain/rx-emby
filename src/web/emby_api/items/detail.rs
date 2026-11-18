@@ -1,4 +1,4 @@
-use super::episode_json::{EpisodeJsonInput, build_episode_item_json};
+use super::episode_json::{build_episode_item_json, EpisodeJsonInput};
 use super::sql::*;
 use serde_json::json;
 pub async fn get_item_detail(
@@ -55,12 +55,41 @@ async fn get_item_detail_inner(
     q: &PlaybackQuery,
     item_id: &str,
 ) -> Result<Value, (StatusCode, String)> {
+    if item_id.starts_with("pl_") || item_id.starts_with("col_") {
+        return crate::web::emby_api::playlists::list_detail(
+            state,
+            user_id,
+            item_id,
+            item_id.starts_with("col_"),
+        )
+        .await;
+    }
+    if let Some(source_id) = item_id
+        .strip_prefix("src_")
+        .and_then(|id| id.parse::<i64>().ok())
+    {
+        let source: Option<(i64, i32, i32, String)> = sqlx::query_as("SELECT f.work_id, sf.season_number, sf.episode_number, w.media_type FROM sync_files sf JOIN sync_folders f ON f.id=sf.folder_id JOIN media_works w ON w.id=f.work_id WHERE sf.id=$1 AND f.work_id IS NOT NULL AND f.is_ignored=FALSE")
+            .bind(source_id).fetch_optional(&state.db).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let Some((wid, season, episode, media_type)) = source else {
+            return Err((StatusCode::NOT_FOUND, "媒体源不存在或已被屏蔽".into()));
+        };
+        ensure_media_accessible(state, user_id, wid).await?;
+        let canonical_id = if media_type == "tv" {
+            format!("ep_{wid}_{season}_{episode}")
+        } else {
+            format!("work_{wid}")
+        };
+        return Box::pin(get_item_detail_inner(
+            state,
+            user_id,
+            headers,
+            q,
+            &canonical_id,
+        ))
+        .await;
+    }
     let cfg = state.config.load();
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1:8096")
-        .to_string();
     let token = extract_emby_token(headers, q.api_key.as_deref())
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let session_id = Uuid::new_v4().simple().to_string();
@@ -84,7 +113,7 @@ async fn get_item_detail_inner(
             r#"
             SELECT media_type, tmdb_id, title, year, overview, rating, poster_path, backdrop_path,
                    (tmdb_metadata->>'number_of_seasons')::int, (tmdb_metadata->>'number_of_episodes')::int,
-                   original_title
+                   original_title, sort_title
             FROM media_works WHERE id = $1
             "#,
         )
@@ -98,24 +127,74 @@ async fn get_item_detail_inner(
         };
 
         if work.media_type == "tv" {
-            let _ = state
+            if let Err(error) = state
                 .scraper
                 .priority_tx
-                .try_send(ScrapeTask::WorkSeasons(wid));
+                .try_send(ScrapeTask::WorkSeasons(wid))
+            {
+                tracing::debug!(work_id = wid, %error, "failed to enqueue season metadata prewarm");
+            }
         }
 
-        let fav_set = load_user_favorite_keys(state, user_id).await?;
-        let is_fav = is_media_favorited(&fav_set, wid, work.tmdb_id, &work.media_type);
-        let history_map =
-            load_media_episode_histories(state, user_id, wid, work.tmdb_id, &work.media_type)
-                .await?;
-        let (pos_ticks, dur_ticks, is_played) =
-            history_map.get(&(0, 1)).copied().unwrap_or((0, 0, false));
+        let is_fav: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_favorites WHERE user_id=$1 AND ((work_id=$2) OR (tmdb_id IS NOT NULL AND tmdb_id=$3 AND media_type=$4)))",
+        )
+        .bind(user_id)
+        .bind(wid)
+        .bind(work.tmdb_id)
+        .bind(&work.media_type)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let history_map = crate::web::emby_api::sessions::load_media_episode_user_data(
+            state,
+            user_id,
+            wid,
+            work.tmdb_id,
+            &work.media_type,
+        )
+        .await?;
+        let user_data = history_map.get(&(0, 1)).cloned().unwrap_or_default();
+        let (pos_ticks, dur_ticks, is_played, play_count, last_played_date, unplayed_count) =
+            if work.media_type == "tv" {
+                let present: Vec<(i32, i32)> = sqlx::query_as(
+                    "SELECT DISTINCT sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id=sf.folder_id WHERE f.work_id=$1 AND f.is_ignored=FALSE",
+                ).bind(wid).fetch_all(&state.db).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
+                let unplayed = present
+                    .iter()
+                    .filter(|key| !history_map.get(key).is_some_and(|h| h.is_played))
+                    .count();
+                let count = present
+                    .iter()
+                    .filter_map(|key| history_map.get(key).map(|h| h.play_count))
+                    .max()
+                    .unwrap_or(0);
+                let last = present
+                    .iter()
+                    .filter_map(|key| history_map.get(key).and_then(|h| h.last_played_date))
+                    .max();
+                (
+                    0,
+                    0,
+                    !present.is_empty() && unplayed == 0,
+                    count,
+                    last,
+                    unplayed,
+                )
+            } else {
+                (
+                    user_data.position_ticks,
+                    user_data.duration_ticks,
+                    user_data.is_played,
+                    user_data.play_count,
+                    user_data.last_played_date,
+                    0,
+                )
+            };
 
         let mut media_sources = vec![];
         if work.media_type == "movie" {
-            media_sources =
-                build_media_sources_for_movie(state, &host, &token, &session_id, wid).await?;
+            media_sources = build_media_sources_for_movie(state, &token, &session_id, wid).await?;
         }
 
         let mut image_tags = json!({});
@@ -129,7 +208,7 @@ async fn get_item_detail_inner(
             "Id": format!("work_{}", wid),
             "Name": work.title,
             "OriginalTitle": work.original_title,
-            "SortName": work.title,
+            "SortName": work.sort_title.as_deref().filter(|name| !name.is_empty()).unwrap_or(&work.title),
             "ServerId": cfg.server_id,
             "Type": if work.media_type == "movie" { "Movie" } else { "Series" },
             "ProductionYear": work.year,
@@ -139,7 +218,9 @@ async fn get_item_detail_inner(
             "MediaSources": media_sources,
             "UserData": {
                 "PlaybackPositionTicks": pos_ticks,
-                "PlayCount": if is_played { 1 } else { 0 },
+                "PlayCount": play_count,
+                "LastPlayedDate": last_played_date,
+                "UnplayedItemCount": unplayed_count,
                 "IsFavorite": is_fav,
                 "Played": is_played
             }
@@ -214,15 +295,28 @@ async fn get_item_detail_inner(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let (tmdb_id, mtype, series_title) =
             media_meta.unwrap_or((None, "tv".to_string(), String::new()));
-        let history_map =
-            load_media_episode_histories(state, user_id, wid, tmdb_id, &mtype).await?;
-        let (pos_ticks, dur_ticks, is_played) = history_map
-            .get(&(snum, epnum))
-            .copied()
-            .unwrap_or((0, 0, false));
+        let history_map = crate::web::emby_api::sessions::load_media_episode_user_data(
+            state, user_id, wid, tmdb_id, &mtype,
+        )
+        .await?;
+        let user_data = history_map.get(&(snum, epnum)).cloned().unwrap_or_default();
+        let (pos_ticks, dur_ticks, is_played) = (
+            user_data.position_ticks,
+            user_data.duration_ticks,
+            user_data.is_played,
+        );
+        let is_favorite: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM user_favorites WHERE user_id=$1 AND (work_id=$2 OR (tmdb_id IS NOT NULL AND tmdb_id=$3 AND media_type=$4)))",
+        )
+        .bind(user_id)
+        .bind(wid)
+        .bind(tmdb_id)
+        .bind(&mtype)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let sources =
-            build_media_sources_for_episode(state, &host, &token, &session_id, wid, snum, epnum)
-                .await?;
+            build_media_sources_for_episode(state, &token, &session_id, wid, snum, epnum).await?;
         return Ok(build_episode_item_json(EpisodeJsonInput {
             server_id: cfg.server_id.clone(),
             work_id: wid,
@@ -238,6 +332,9 @@ async fn get_item_detail_inner(
             duration_ticks: dur_ticks,
             runtime_seconds: runtime,
             is_played,
+            is_favorite,
+            play_count: user_data.play_count,
+            last_played_date: user_data.last_played_date,
             media_sources: Some(json!(sources)),
             series_primary_image_tag: false,
         }));
@@ -261,7 +358,39 @@ async fn get_season_detail(
     snum: i32,
 ) -> Result<Value, (StatusCode, String)> {
     let cfg = state.config.load();
-    ensure_media_accessible(state, user_id, wid).await?;
+    let (media_type, tmdb_id, _) = ensure_media_accessible(state, user_id, wid).await?;
+    let histories = crate::web::emby_api::sessions::load_media_episode_user_data(
+        state,
+        user_id,
+        wid,
+        tmdb_id,
+        &media_type,
+    )
+    .await?;
+    let season_histories: Vec<_> = histories
+        .iter()
+        .filter(|((season, _), _)| *season == snum)
+        .map(|(_, value)| value)
+        .collect();
+    let present: Vec<i32> = sqlx::query_scalar("SELECT DISTINCT sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id=sf.folder_id WHERE f.work_id=$1 AND f.is_ignored=FALSE AND sf.season_number=$2")
+        .bind(wid).bind(snum).fetch_all(&state.db).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let is_fav: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_favorites WHERE user_id=$1 AND (work_id=$2 OR (tmdb_id IS NOT NULL AND tmdb_id=$3 AND media_type=$4)))")
+        .bind(user_id).bind(wid).bind(tmdb_id).bind(&media_type).fetch_one(&state.db).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let played = !present.is_empty()
+        && present.iter().all(|episode| {
+            histories
+                .get(&(snum, *episode))
+                .is_some_and(|history| history.is_played)
+        });
+    let user_data = json!({
+        "PlaybackPositionTicks": season_histories.iter().map(|h| h.position_ticks).max().unwrap_or(0),
+        "PlayCount": season_histories.iter().map(|h| h.play_count).max().unwrap_or(0),
+        "Played": played,
+        "IsFavorite": is_fav,
+        "LastPlayedDate": season_histories.iter().filter_map(|h| h.last_played_date).max()
+    });
     state.spawn_prewarm_media_dirs(wid, None);
 
     let row: Option<SeasonMetadata> = sqlx::query_as(
@@ -317,6 +446,7 @@ async fn get_season_detail(
         "Overview": overview,
         "PremiereDate": air_date,
         "ChildCount": child_count,
+        "UserData": user_data,
         "ImageTags": if poster.is_some() { json!({"Primary": crate::web::emby_api::images::image_path_tag(poster.as_deref())}) } else { json!({}) }
     });
     Ok(obj)
@@ -361,7 +491,8 @@ async fn get_view_detail(
     }
 
     let vid = item_id
-        .trim_start_matches("lib_vlib_")
+        .strip_prefix("lib_vlib_")
+        .unwrap_or(item_id)
         .parse::<i32>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "无效的智能视图 ID".to_string()))?;
     let row: Option<(String, String, Value)> =
@@ -405,7 +536,7 @@ async fn get_view_detail(
 
 #[cfg(test)]
 mod access_tests {
-    use super::{StatusCode, ensure_base_library_access};
+    use super::{ensure_base_library_access, StatusCode};
 
     #[test]
     fn forbidden_for_base_library_outside_allowed_categories() {
@@ -428,10 +559,12 @@ struct WorkDetailRow {
     num_seasons: Option<i32>,
     num_episodes: Option<i32>,
     original_title: Option<String>,
+    sort_title: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
 pub(in crate::web::emby_api) struct SeasonListRow {
+    pub(super) total_count: i64,
     pub(super) season_number: i32,
     pub(super) name: Option<String>,
     pub(super) overview: Option<String>,

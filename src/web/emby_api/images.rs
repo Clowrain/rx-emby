@@ -1,20 +1,75 @@
-use super::ids::{parse_episode_id, parse_season_id};
 use super::views::base_library_category;
+use super::{
+    auth::{extract_emby_token, resolve_auth_context},
+    ids::{parse_episode_id, parse_season_id},
+};
 use crate::smart_views::VirtualLibraryRule;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, Method, StatusCode},
     response::Response,
 };
 use bytes::Bytes;
+use serde::Deserialize;
 use std::sync::Arc;
+
+#[derive(Deserialize, Default)]
+pub(super) struct ImageAuthQuery {
+    #[serde(
+        rename = "api_key",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token"
+    )]
+    api_key: Option<String>,
+}
+
+fn image_child_work_id(item_id: &str) -> Option<i64> {
+    parse_episode_id(item_id)
+        .map(|(id, _, _)| id)
+        .or_else(|| parse_season_id(item_id).map(|(id, _)| id))
+        .or_else(|| super::ids::parse_work_id(item_id))
+}
+
+fn is_supported_image_type(image_type: &str) -> bool {
+    image_type.eq_ignore_ascii_case("Primary") || image_type.eq_ignore_ascii_case("Backdrop")
+}
+
+fn playlist_collection_cover_permitted(
+    collection: bool,
+    owner: Option<&str>,
+    auth_user: Option<(&str, bool)>,
+) -> bool {
+    match (collection, owner, auth_user) {
+        (true, None, _) => true,
+        (_, Some(owner), Some((user, is_admin))) => is_admin || owner == user,
+        _ => false,
+    }
+}
 
 pub(super) fn image_path_tag(path: Option<&str>) -> String {
     let Some(path) = path else {
         return String::new();
     };
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(path.as_bytes()))
+}
+
+fn head_image_response(
+    headers: &HeaderMap,
+    etag: &str,
+    content_type: &str,
+) -> Result<Response, (StatusCode, String)> {
+    if let Some(response) = not_modified_response(headers, etag)? {
+        return Ok(response);
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "public, max-age=604800")
+        .body(axum::body::Body::empty())
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 fn not_modified_response(
@@ -46,25 +101,84 @@ pub(super) async fn get_item_image_indexed(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
     Path((item_id, image_type, _image_index)): Path<(String, String, String)>,
+    Query(q): Query<ImageAuthQuery>,
+    method: Method,
 ) -> Result<Response, (StatusCode, String)> {
-    get_item_image_inner(state, headers, Path((item_id, image_type))).await
+    get_item_image_inner(
+        state,
+        headers,
+        Path((item_id, image_type)),
+        q.api_key.as_deref(),
+        method,
+    )
+    .await
 }
 
 pub(super) async fn get_item_image(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((item_id, image_type)): Path<(String, String)>,
+    Query(q): Query<ImageAuthQuery>,
+    method: Method,
 ) -> Result<Response, (StatusCode, String)> {
-    get_item_image_inner(State(state), headers, Path((item_id, image_type))).await
+    get_item_image_inner(
+        State(state),
+        headers,
+        Path((item_id, image_type)),
+        q.api_key.as_deref(),
+        method,
+    )
+    .await
+}
+
+pub(super) async fn get_user_image_indexed(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((user_id, image_type, _image_index)): Path<(String, String, String)>,
+    method: Method,
+) -> Result<Response, (StatusCode, String)> {
+    get_user_image(state, headers, Path((user_id, image_type)), method).await
+}
+
+pub(super) async fn get_user_image(
+    State(_state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((_user_id, _image_type)): Path<(String, String)>,
+    method: Method,
+) -> Result<Response, (StatusCode, String)> {
+    // 所有用户当前共用默认头像；匿名登录页返回一致结果，避免暴露用户是否存在。
+    let etag = r#""default-user-avatar-v1""#;
+    if method == Method::HEAD {
+        return head_image_response(&headers, etag, "image/jpeg");
+    }
+    if let Some(response) = not_modified_response(&headers, etag)? {
+        return Ok(response);
+    }
+    let mut response = serve_embedded_cover("vlib_default_tv")?;
+    response
+        .headers_mut()
+        .insert(header::ETAG, axum::http::HeaderValue::from_static(etag));
+    Ok(response)
 }
 
 async fn get_item_image_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((item_id, image_type)): Path<(String, String)>,
+    api_key: Option<&str>,
+    method: Method,
 ) -> Result<Response, (StatusCode, String)> {
+    if !is_supported_image_type(&image_type) {
+        return Err((StatusCode::NOT_FOUND, "暂无图片".to_string()));
+    }
+
     // 基础分类封面（内嵌资源 / 自定义配置 / 动态自动封面 / 拼接封面）
     if let Some(base_cat) = base_library_category(&item_id) {
+        let auth = resolve_auth_context(&state, &headers, api_key).await?;
+        let allowed = super::views::get_user_allowed_categories(&state, &auth.user_id).await?;
+        if !crate::smart_views::can_access_view(allowed.as_deref(), &item_id, base_cat) {
+            return Err((StatusCode::FORBIDDEN, "无权访问该媒体库".into()));
+        }
         let custom_cover: Option<String> =
             sqlx::query_scalar("SELECT config_value FROM system_configs WHERE config_key = $1")
                 .bind(format!("base_lib_cover:{}", item_id))
@@ -84,14 +198,19 @@ async fn get_item_image_inner(
             categories: vec![base_cat.to_string()],
             ..Default::default()
         };
-        if let Some(resp) = try_serve_dynamic_cover(&state, &item_id, clean_custom, &rule).await {
-            return Ok(resp);
-        }
-
         let cover_key = clean_custom
             .filter(|k| is_builtin_cover_key(k))
             .unwrap_or(&item_id);
-        return serve_embedded_cover(cover_key);
+        return serve_library_cover(
+            &state,
+            &headers,
+            method,
+            &item_id,
+            clean_custom,
+            &rule,
+            cover_key,
+        )
+        .await;
     }
 
     // 智能视图封面
@@ -100,8 +219,10 @@ async fn get_item_image_inner(
             .parse::<i32>()
             .map_err(|_| (StatusCode::BAD_REQUEST, "无效的智能视图 ID".to_string()))?;
 
+        let auth = resolve_auth_context(&state, &headers, api_key).await?;
+
         let row: Option<(String, String, Option<String>, serde_json::Value)> = sqlx::query_as(
-            "SELECT name, icon_type, cover_image, filter_rules FROM virtual_libraries WHERE id = $1",
+            "SELECT name, icon_type, cover_image, filter_rules FROM virtual_libraries WHERE id = $1 AND is_enabled = TRUE",
         )
         .bind(vid)
         .fetch_optional(&state.db)
@@ -111,6 +232,16 @@ async fn get_item_image_inner(
         let Some((vname, icon_type, cover_image, rules_val)) = row else {
             return Err((StatusCode::NOT_FOUND, "智能视图不存在".to_string()));
         };
+
+        if !crate::smart_views::can_access_view(
+            super::views::get_user_allowed_categories(&state, &auth.user_id)
+                .await?
+                .as_deref(),
+            &item_id,
+            &vname,
+        ) {
+            return Err((StatusCode::FORBIDDEN, "无权访问该智能视图".into()));
+        }
 
         let custom_cover = cover_image
             .as_deref()
@@ -123,34 +254,107 @@ async fn get_item_image_inner(
                 format!("智能视图规则损坏：{}", e),
             )
         })?;
-        if let Some(resp) = try_serve_dynamic_cover(&state, &item_id, custom_cover, &rule).await {
-            return Ok(resp);
-        }
-
         let cover_key = resolve_virtual_library_cover_key(custom_cover, &vname, &icon_type);
-        return serve_embedded_cover(cover_key);
+        return serve_library_cover(
+            &state,
+            &headers,
+            method,
+            &item_id,
+            custom_cover,
+            &rule,
+            cover_key,
+        )
+        .await;
+    }
+
+    // Playlist/collection art inherits its parent's ACL; anonymous callers may
+    // only access legacy public collections, never private playlists.
+    if item_id.starts_with("pl_") || item_id.starts_with("col_") {
+        let collection = item_id.starts_with("col_");
+        let prefix = if collection { "col_" } else { "pl_" };
+        let id = item_id
+            .strip_prefix(prefix)
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|id| *id > 0)
+            .ok_or((StatusCode::BAD_REQUEST, "无效的资源 ID".to_string()))?;
+        let token = extract_emby_token(&headers, api_key);
+        let auth = if token.is_some() {
+            Some(resolve_auth_context(&state, &headers, api_key).await?)
+        } else {
+            None
+        };
+        let table = if collection {
+            "collections"
+        } else {
+            "playlists"
+        };
+        let owner: Option<Option<String>> =
+            sqlx::query_scalar(&format!("SELECT user_id FROM {table} WHERE id=$1"))
+                .bind(id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let Some(owner) = owner else {
+            return Err((StatusCode::NOT_FOUND, "列表不存在".into()));
+        };
+        let auth_user = auth
+            .as_ref()
+            .map(|context| (context.user_id.as_str(), context.is_admin));
+        let permitted =
+            playlist_collection_cover_permitted(collection, owner.as_deref(), auth_user);
+        if !permitted {
+            return Err((StatusCode::NOT_FOUND, "暂无图片".into()));
+        }
+    }
+
+    // Media artwork is protected by the same ignored-folder and category ACL as details/playback.
+    let auth = resolve_auth_context(&state, &headers, api_key).await?;
+    let work_id = parse_episode_id(&item_id)
+        .map(|(id, _, _)| id)
+        .or_else(|| parse_season_id(&item_id).map(|(id, _)| id))
+        .or_else(|| super::ids::parse_work_id(&item_id));
+    if let Some(work_id) = work_id {
+        super::items::ensure_media_accessible(&state, &auth.user_id, work_id).await?;
     }
 
     // 短 TTL 元数据缓存：热门海报/背景图的 DB 定位查询不再逐请求打库
     let meta_cache_key = format!("{}:{}", item_id, image_type);
-    let (size, clean_name) =
-        if let Some(cached) = state.caches.image_meta_cache.get(&meta_cache_key).await {
-            match cached {
-                Some(pair) => pair,
-                None => return Err((StatusCode::NOT_FOUND, "暂无图片".to_string())),
-            }
+    let resolved = state
+        .caches
+        .image_meta_cache
+        .try_get_with(meta_cache_key, async {
+            resolve_item_image_meta(&state, &item_id, &image_type, &auth.user_id)
+                .await
+                .map_err(|(status, message)| format!("{}|{}", status.as_u16(), message))
+        })
+        .await
+        .map_err(|error| {
+            let (status, message) = error
+                .split_once('|')
+                .unwrap_or(("500", "图片元数据查询失败"));
+            (
+                status
+                    .parse::<u16>()
+                    .ok()
+                    .and_then(|code| StatusCode::from_u16(code).ok())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                message.to_string(),
+            )
+        })?;
+    let (size, clean_name) = resolved.ok_or((StatusCode::NOT_FOUND, "暂无图片".to_string()))?;
+    if method == Method::HEAD {
+        let etag_key = format!("{item_id}:{image_type}:{size}:{clean_name}");
+        let etag = format!(
+            "\"img-{:016x}\"",
+            xxhash_rust::xxh3::xxh3_64(etag_key.as_bytes())
+        );
+        let content_type = if clean_name.ends_with(".png") {
+            "image/png"
         } else {
-            let resolved = resolve_item_image_meta(&state, &item_id, &image_type).await?;
-            state
-                .caches
-                .image_meta_cache
-                .insert(meta_cache_key, resolved.clone())
-                .await;
-            match resolved {
-                Some(pair) => pair,
-                None => return Err((StatusCode::NOT_FOUND, "暂无图片".to_string())),
-            }
+            "image/jpeg"
         };
+        return head_image_response(&headers, &etag, content_type);
+    }
 
     let bytes = state
         .get_or_fetch_tmdb_image(&size, &clean_name)
@@ -184,12 +388,44 @@ async fn resolve_item_image_meta(
     state: &AppState,
     item_id: &str,
     image_type: &str,
+    user_id: &str,
 ) -> Result<Option<(String, String)>, (StatusCode, String)> {
     if base_library_category(item_id).is_some() || item_id.starts_with("lib_vlib_") {
         // 基础分类与智能视图封面由动态封面/内嵌资源分支处理，不走 TMDB 路径
         return Err((StatusCode::NOT_FOUND, "暂无图片".to_string()));
     }
 
+    if !is_supported_image_type(image_type) {
+        return Ok(None);
+    }
+    if item_id.starts_with("pl_") || item_id.starts_with("col_") {
+        let collection = item_id.starts_with("col_");
+        let raw = item_id
+            .strip_prefix(if collection { "col_" } else { "pl_" })
+            .unwrap_or(item_id);
+        let id = raw
+            .parse::<i64>()
+            .ok()
+            .filter(|v| *v > 0)
+            .ok_or((StatusCode::BAD_REQUEST, "无效的资源 ID".to_string()))?;
+        let sql = if collection {
+            "SELECT item_id FROM collection_items WHERE collection_id=$1 ORDER BY id LIMIT 1"
+        } else {
+            "SELECT item_id FROM playlist_items WHERE playlist_id=$1 ORDER BY sort_order,id LIMIT 1"
+        };
+        let child: Option<String> = sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Some(child) = child {
+            if let Some(work_id) = image_child_work_id(&child) {
+                super::items::ensure_media_accessible(state, user_id, work_id).await?;
+            }
+            return Box::pin(resolve_item_image_meta(state, &child, image_type, user_id)).await;
+        }
+        return Ok(None);
+    }
     if let Some((wid, s_num, ep_num)) = parse_episode_id(item_id) {
         let ep_paths: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             r#"
@@ -198,6 +434,7 @@ async fn resolve_item_image_meta(
             LEFT JOIN work_episodes e
               ON e.work_id = w.id AND e.season_number = $2 AND e.episode_number = $3
             WHERE w.id = $1
+              AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
             "#,
         )
         .bind(wid)
@@ -208,7 +445,7 @@ async fn resolve_item_image_meta(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let Some((still, backdrop, poster)) = ep_paths else {
-            return Err((StatusCode::NOT_FOUND, "单集不存在".to_string()));
+            return Err((StatusCode::NOT_FOUND, "暂无图片".to_string()));
         };
         return Ok(still
             .or(backdrop)
@@ -225,6 +462,7 @@ async fn resolve_item_image_meta(
             LEFT JOIN work_seasons ws
               ON ws.work_id = w.id AND ws.season_number = $2 AND ws.poster_path IS NOT NULL
             WHERE w.id = $1
+              AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
             "#,
         )
         .bind(wid)
@@ -244,14 +482,14 @@ async fn resolve_item_image_meta(
     };
 
     let paths: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT poster_path, backdrop_path FROM media_works WHERE id = $1")
+        sqlx::query_as("SELECT poster_path, backdrop_path FROM media_works w WHERE id = $1 AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)")
             .bind(wid)
             .fetch_optional(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let Some((poster, backdrop)) = paths else {
-        return Err((StatusCode::NOT_FOUND, "条目不存在".to_string()));
+        return Err((StatusCode::NOT_FOUND, "暂无图片".to_string()));
     };
 
     if image_type.eq_ignore_ascii_case("Backdrop") {
@@ -343,17 +581,53 @@ async fn try_serve_dynamic_cover(
     None
 }
 
+async fn serve_library_cover(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    method: Method,
+    item_id: &str,
+    custom_cover: Option<&str>,
+    rule: &VirtualLibraryRule,
+    fallback_cover_key: &str,
+) -> Result<Response, (StatusCode, String)> {
+    let key = custom_cover.unwrap_or(item_id);
+    let etag = format!(
+        "\"cover-{:016x}\"",
+        xxhash_rust::xxh3::xxh3_64(key.as_bytes())
+    );
+    if let Some(response) = not_modified_response(headers, &etag)? {
+        return Ok(response);
+    }
+    if method == Method::HEAD && custom_cover != Some("auto") {
+        return head_image_response(headers, &etag, "image/jpeg");
+    }
+    let mut response =
+        if let Some(resp) = try_serve_dynamic_cover(state, item_id, custom_cover, rule).await {
+            resp
+        } else {
+            serve_embedded_cover(fallback_cover_key)?
+        };
+    if let Ok(etag_val) = axum::http::HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, etag_val);
+    }
+    if method == Method::HEAD {
+        let (parts, _) = response.into_parts();
+        return Ok(Response::from_parts(parts, axum::body::Body::empty()));
+    }
+    Ok(response)
+}
+
 fn serve_embedded_cover(cover_key: &str) -> Result<Response, (StatusCode, String)> {
     let asset_path = format!("covers/{}.jpg", cover_key);
     let asset = crate::web::get_embedded_asset(&asset_path)
         .or_else(|| crate::web::get_embedded_asset("covers/vlib_default_tv.jpg"))
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "封面资源未找到".to_string()))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "暂无图片".to_string()))?;
 
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/jpeg")
         .header(header::CACHE_CONTROL, "public, max-age=3600")
-        .body(axum::body::Body::from(asset.data.into_owned()))
+        .body(axum::body::Body::from(asset.data))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
@@ -549,6 +823,19 @@ async fn fetch_or_build_virtual_library_collage(
                     if let Err(e) = tokio::fs::rename(&tmp_path, &cache_path2).await {
                         tracing::warn!("拼接封面原子落盘失败 ({}): {}", cache_path2.display(), e);
                         let _ = tokio::fs::remove_file(&tmp_path).await;
+                    } else {
+                        let rel_path = format!("covers/{}_{}_{:016x}.jpg", view_id, style.as_str(), hash);
+                        let cache_key = format!("collage:{}:{}:{:016x}", view_id, style.as_str(), hash);
+                        if let Err(error) = sqlx::query(
+                            "INSERT INTO image_cache_index (cache_key, local_rel_path, size_bytes, last_accessed_at) VALUES ($1, $2, $3, NOW()) ON CONFLICT (cache_key) DO UPDATE SET local_rel_path=EXCLUDED.local_rel_path, size_bytes=EXCLUDED.size_bytes, last_accessed_at=NOW()",
+                        )
+                        .bind(cache_key)
+                        .bind(rel_path)
+                        .bind(i64::try_from(rendered.len()).unwrap_or(i64::MAX))
+                        .execute(&state2.db)
+                        .await {
+                            tracing::warn!("拼接封面缓存索引更新失败: {}", error);
+                        }
                     }
                 }
             }
@@ -563,8 +850,115 @@ async fn fetch_or_build_virtual_library_collage(
 
 #[cfg(test)]
 mod tests {
-    use super::{image_path_tag, not_modified_response};
+    use super::{
+        head_image_response, image_path_tag, not_modified_response,
+        playlist_collection_cover_permitted,
+    };
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    #[tokio::test]
+    async fn recursive_playlist_and_collection_children_resolve_and_enforce_media_acl() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/test")
+            .unwrap();
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let state = crate::state::AppState::new(
+            crate::config::BootstrapFileConfig::default().into_dynamic(),
+            db,
+            tx,
+        )
+        .unwrap();
+        let restricted = super::super::views::UserAccessScope {
+            allowed_categories: Some(vec!["allowed".into()]),
+            virtual_libraries: vec![],
+        };
+        for child in ["work_17", "season_18_0", "ep_19_1_2"] {
+            let work_id = super::image_child_work_id(child).unwrap();
+            assert!(!super::super::items::work_access_allowed(
+                &state,
+                work_id,
+                "restricted",
+                &restricted,
+            )
+            .await
+            .unwrap());
+        }
+        assert_eq!(super::image_child_work_id("pl_20"), None);
+        assert_eq!(super::image_child_work_id("col_21"), None);
+    }
+
+    #[test]
+    fn playlist_and_collection_cover_acl_matches_visibility_contract() {
+        assert!(!playlist_collection_cover_permitted(
+            false,
+            Some("alice"),
+            None
+        ));
+        assert!(!playlist_collection_cover_permitted(
+            false,
+            Some("alice"),
+            Some(("bob", false))
+        ));
+        assert!(playlist_collection_cover_permitted(
+            false,
+            Some("alice"),
+            Some(("alice", false))
+        ));
+        assert!(playlist_collection_cover_permitted(
+            false,
+            Some("alice"),
+            Some(("admin", true))
+        ));
+
+        assert!(!playlist_collection_cover_permitted(
+            true,
+            Some("alice"),
+            None
+        ));
+        assert!(!playlist_collection_cover_permitted(
+            true,
+            Some("alice"),
+            Some(("bob", false))
+        ));
+        assert!(playlist_collection_cover_permitted(
+            true,
+            Some("alice"),
+            Some(("alice", false))
+        ));
+        assert!(playlist_collection_cover_permitted(
+            true,
+            Some("alice"),
+            Some(("admin", true))
+        ));
+
+        assert!(playlist_collection_cover_permitted(true, None, None));
+        assert!(playlist_collection_cover_permitted(
+            true,
+            None,
+            Some(("bob", false))
+        ));
+    }
+
+    #[test]
+    fn image_head_returns_deterministic_metadata_and_honors_etag() {
+        let headers = HeaderMap::new();
+        let response = head_image_response(&headers, "\"cover-1\"", "image/jpeg").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ETAG], "\"cover-1\"");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+
+        let mut conditional = HeaderMap::new();
+        conditional.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"cover-1\""),
+        );
+        assert_eq!(
+            head_image_response(&conditional, "\"cover-1\"", "image/jpeg")
+                .unwrap()
+                .status(),
+            StatusCode::NOT_MODIFIED
+        );
+    }
 
     #[test]
     fn matching_if_none_match_returns_304() {
@@ -577,6 +971,19 @@ mod tests {
             .unwrap()
             .expect("matching ETag should produce a 304 response");
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn image_type_is_restricted_to_primary_and_backdrop() {
+        assert!(["Primary", "Backdrop"]
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case("primary")));
+        assert!(!["Primary", "Backdrop"]
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case("Logo")));
+        assert!(!["Primary", "Backdrop"]
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case("Banner")));
     }
 
     #[test]

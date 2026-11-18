@@ -3,19 +3,19 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use governor::{
-    Quota, RateLimiter,
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
+    Quota, RateLimiter,
 };
 use moka::future::Cache;
 use reqwest::{Client, Proxy};
 use sqlx::PgPool;
 use std::{
     num::NonZeroU32,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, mpsc, watch};
+use tokio::sync::{mpsc, watch, Mutex, Notify, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -34,8 +34,135 @@ pub struct AppState {
     pub scraper: ScrapeScheduler,
     pub caches: CacheLayer,
     pub sessions: DashMap<String, PlaybackSession>,
+    pub session_hub: SessionHub,
+    pub client_capabilities: moka::sync::Cache<String, serde_json::Value>,
     pub monitor: crate::monitor::MonitorState,
     pub shutdown_token: CancellationToken,
+}
+
+/// 每个连接使用有界队列；慢客户端被断开，避免后台广播积累内存。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HubEventKind {
+    Sessions,
+    LibraryChanged,
+    UserDataChanged,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct HubEvent {
+    pub kind: HubEventKind,
+    pub message: String,
+}
+
+impl HubEventKind {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "Sessions" => Self::Sessions,
+            "LibraryChanged" => Self::LibraryChanged,
+            "UserDataChanged" => Self::UserDataChanged,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SessionHub {
+    connections: DashMap<String, HubConnection>,
+}
+
+struct HubConnection {
+    token: String,
+    user_id: String,
+    is_admin: bool,
+    tx: mpsc::Sender<HubEvent>,
+    cancelled: CancellationToken,
+}
+
+impl SessionHub {
+    #[cfg(test)]
+    pub fn register(
+        &self,
+        token: String,
+        user_id: String,
+    ) -> (String, mpsc::Receiver<HubEvent>, CancellationToken) {
+        self.register_with_role(token, user_id, false)
+    }
+
+    pub fn register_with_role(
+        &self,
+        token: String,
+        user_id: String,
+        is_admin: bool,
+    ) -> (String, mpsc::Receiver<HubEvent>, CancellationToken) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::channel(64);
+        let cancelled = CancellationToken::new();
+        self.connections.insert(
+            id.clone(),
+            HubConnection {
+                token,
+                user_id,
+                is_admin,
+                tx,
+                cancelled: cancelled.clone(),
+            },
+        );
+        (id, rx, cancelled)
+    }
+
+    pub fn unregister(&self, id: &str) {
+        if let Some((_, connection)) = self.connections.remove(id) {
+            connection.cancelled.cancel();
+        }
+    }
+
+    pub fn broadcast(&self, user_id: Option<&str>, message_type: &str, data: serde_json::Value) {
+        let message = HubEvent {
+            kind: HubEventKind::from_name(message_type),
+            message: serde_json::json!({"MessageType": message_type, "Data": data}).to_string(),
+        };
+        let mut evicted = Vec::new();
+        for entry in &self.connections {
+            if user_id.is_none_or(|id| id == entry.user_id)
+                && entry.tx.try_send(message.clone()).is_err()
+            {
+                entry.cancelled.cancel();
+                evicted.push(entry.key().clone());
+            }
+        }
+        for id in evicted {
+            self.unregister(&id);
+        }
+    }
+
+    pub fn broadcast_admins(&self, message_type: &str, data: serde_json::Value) {
+        let message = HubEvent {
+            kind: HubEventKind::from_name(message_type),
+            message: serde_json::json!({"MessageType": message_type, "Data": data}).to_string(),
+        };
+        let mut evicted = Vec::new();
+        for entry in &self.connections {
+            if entry.is_admin && entry.tx.try_send(message.clone()).is_err() {
+                entry.cancelled.cancel();
+                evicted.push(entry.key().clone());
+            }
+        }
+        for id in evicted {
+            self.unregister(&id);
+        }
+    }
+
+    pub fn disconnect_tokens(&self, tokens: &[String]) {
+        self.connections.retain(|_, connection| {
+            if tokens.contains(&connection.token) {
+                connection.cancelled.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
 }
 
 pub struct AlistAuthManager {
@@ -95,6 +222,7 @@ pub enum ScrapeTask {
 }
 
 pub struct ScrapeScheduler {
+    pub runtime: crate::scraper::ScrapeRuntime,
     pub priority_tx: mpsc::Sender<ScrapeTask>,
     pub limiter: ArcSwap<SharedRateLimiter>,
 }
@@ -117,6 +245,10 @@ pub struct CacheLayer {
     pub image_lru_touch_debounce: Cache<String, ()>,
     /// 访问令牌校验缓存：token -> (user_id, is_admin)，注销/吊销时需显式失效
     pub token_user_cache: Cache<String, Arc<(String, bool)>>,
+    /// 管理 API 的完整令牌身份缓存，避免用户名校验回退到每请求 PG。
+    pub admin_token_user_cache: Cache<String, Arc<(String, String, bool)>>,
+    /// 失败登录窗口计数；按用户名/IP隔离，60 秒自动过期。
+    pub failed_login_attempts: Cache<String, Arc<std::sync::atomic::AtomicU32>>,
     /// access_tokens.last_used_at 写库去抖：同一 token 在窗口内至多更新一次
     pub token_touch_debounce: Cache<String, ()>,
     /// 后台概览与统计短时缓存（避免频繁切换 Tab 反复触发全表聚合扫描）
@@ -125,6 +257,8 @@ pub struct CacheLayer {
     pub user_categories_cache: Cache<String, Option<Vec<String>>>,
     /// 启用的虚拟媒体库缓存（全局短 TTL）。
     pub enabled_vlibs_cache: Cache<String, Vec<(i32, String, serde_json::Value)>>,
+    /// 元数据标签反查映射缓存（prefix:col_expr -> (tag_id -> 原始名称)）。
+    pub metadata_tag_map_cache: Cache<String, Arc<std::collections::HashMap<String, String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,7 +271,19 @@ pub struct PlaybackSession {
     pub current_episode_id: Option<i64>,
     pub position_ticks: i64,
     pub next_ep_prewarmed: bool,
+    pub completed_in_session: bool,
     pub last_activity: Instant,
+}
+
+impl PlaybackSession {
+    pub fn is_active(&self) -> bool {
+        self.last_activity.elapsed()
+            <= if self.position_ticks <= 0 {
+                SESSION_ZERO_PROGRESS_TIMEOUT
+            } else {
+                SESSION_IDLE_TIMEOUT
+            }
+    }
 }
 
 /// 播放会话最大无心跳存活时间（Emby 客户端正常播放时每 10 秒上报一次 Progress）
@@ -175,7 +321,7 @@ impl AppState {
 
         let collage_cache = Cache::builder()
             .max_capacity(128)
-            .time_to_live(Duration::from_secs(3600))
+            .time_to_live(Duration::from_secs(300))
             .build();
 
         let image_meta_cache = Cache::builder()
@@ -193,9 +339,19 @@ impl AppState {
             .time_to_live(Duration::from_secs(60))
             .build();
 
+        let admin_token_user_cache = Cache::builder()
+            .max_capacity(2_000)
+            .time_to_live(Duration::from_secs(60))
+            .build();
+
         let token_touch_debounce = Cache::builder()
             .max_capacity(5_000)
             .time_to_live(Duration::from_secs(300))
+            .build();
+
+        let failed_login_attempts = Cache::builder()
+            .max_capacity(50_000)
+            .time_to_live(Duration::from_secs(60))
             .build();
 
         let admin_stats_cache = Cache::builder()
@@ -213,6 +369,11 @@ impl AppState {
             .time_to_live(Duration::from_secs(30))
             .build();
 
+        let metadata_tag_map_cache = Cache::builder()
+            .max_capacity(8)
+            .time_to_live(Duration::from_secs(60))
+            .build();
+
         let cfg_arc = Arc::new(initial_cfg);
         let (config_tx, _) = watch::channel(cfg_arc.clone());
 
@@ -225,6 +386,7 @@ impl AppState {
             alist_auth: AlistAuthManager::default(),
             sync_ctrl: SyncControl::default(),
             scraper: ScrapeScheduler {
+                runtime: Default::default(),
                 priority_tx,
                 limiter: ArcSwap::from_pointee(limiter),
             },
@@ -237,31 +399,88 @@ impl AppState {
                 image_meta_cache,
                 image_lru_touch_debounce: lru_touch_debounce,
                 token_user_cache,
+                admin_token_user_cache,
+                failed_login_attempts,
                 token_touch_debounce,
                 admin_stats_cache,
                 user_categories_cache,
                 enabled_vlibs_cache,
+                metadata_tag_map_cache,
             },
             sessions: DashMap::new(),
+            session_hub: SessionHub::default(),
+            client_capabilities: moka::sync::Cache::builder()
+                .max_capacity(5_000)
+                .time_to_idle(Duration::from_secs(7 * 24 * 3600))
+                .build(),
             monitor: crate::monitor::MonitorState::default(),
             shutdown_token: CancellationToken::new(),
         }))
     }
 
+    pub async fn login_rate_limited(&self, username: &str, ip: &str) -> bool {
+        let username_limited = self
+            .caches
+            .failed_login_attempts
+            .get(&format!("user:{}", username.to_lowercase()))
+            .await
+            .is_some_and(|counter| counter.load(std::sync::atomic::Ordering::Relaxed) >= 15);
+        let ip_limited = self
+            .caches
+            .failed_login_attempts
+            .get(&format!("ip:{ip}"))
+            .await
+            .is_some_and(|counter| counter.load(std::sync::atomic::Ordering::Relaxed) >= 30);
+        username_limited || ip_limited
+    }
+
+    pub async fn record_failed_login(&self, username: &str, ip: &str) {
+        for key in [
+            format!("user:{}", username.to_lowercase()),
+            format!("ip:{ip}"),
+        ] {
+            let counter = self
+                .caches
+                .failed_login_attempts
+                .get_with(key, async {
+                    Arc::new(std::sync::atomic::AtomicU32::new(0))
+                })
+                .await;
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// 清理已断开但未收到 Stopped 信号的过期僵尸会话
     pub fn prune_stale_sessions(&self) {
-        self.sessions.retain(|_, s| {
-            let idle = s.last_activity.elapsed();
-            if s.position_ticks <= 0 {
-                idle <= SESSION_ZERO_PROGRESS_TIMEOUT
-            } else {
-                idle <= SESSION_IDLE_TIMEOUT
+        self.sessions.retain(|_, s| s.is_active());
+    }
+
+    pub async fn run_session_cleanup(self: Arc<Self>, interval: Duration) {
+        let mut timer = tokio::time::interval(interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_token_prune = Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown_token.cancelled() => break,
+                _ = timer.tick() => {
+                    self.prune_stale_sessions();
+                    if last_token_prune.elapsed() >= Duration::from_secs(3600) {
+                        last_token_prune = Instant::now();
+                        let _ = sqlx::query(
+                            "DELETE FROM access_tokens WHERE last_used_at < NOW() - INTERVAL '90 days'",
+                        )
+                        .execute(&self.db)
+                        .await;
+                    }
+                }
             }
-        });
+        }
     }
 
     /// 运行时热更新配置（Web 后台保存设置后调用，无需重启服务）
     pub async fn reload_config(&self, new_cfg: DynamicConfig) -> Result<()> {
+        validate_runtime_config(&new_cfg)?;
         let old_cfg = self.config.load();
 
         // 1. 若代理配置变更，原子重建 TMDB HTTP Client
@@ -287,9 +506,12 @@ impl AppState {
             || old_cfg.alist_password != new_cfg.alist_password
             || old_cfg.alist_otp_secret != new_cfg.alist_otp_secret
             || old_cfg.alist_path_prefix != new_cfg.alist_path_prefix
+            || old_cfg.direct_url_ttl_sec != new_cfg.direct_url_ttl_sec
         {
+            let _refresh_guard = self.alist_auth.refresh_lock.lock().await;
             let mut token_guard = self.alist_auth.current_token.write().await;
             *token_guard = None;
+            *self.alist_auth.last_refresh_at.write().await = None;
             self.caches.alist_direct_urls.invalidate_all();
             self.caches.alist_dir_prewarmed.invalidate_all();
             info!("AList 配置已变更，旧 Token、直链及目录预热缓存已清空");
@@ -302,9 +524,58 @@ impl AppState {
     }
 }
 
+fn validate_runtime_config(cfg: &DynamicConfig) -> Result<()> {
+    fn validate_url(value: &str, allowed_schemes: &[&str], name: &str) -> Result<()> {
+        let url = reqwest::Url::parse(value).with_context(|| format!("invalid {name} URL"))?;
+        anyhow::ensure!(
+            allowed_schemes.contains(&url.scheme()) && url.host_str().is_some(),
+            "invalid {name} URL scheme or host"
+        );
+        Ok(())
+    }
+
+    validate_url(&cfg.tmdb_api_base, &["http", "https"], "TMDB API base")?;
+    validate_url(&cfg.tmdb_image_base, &["http", "https"], "TMDB image base")?;
+    if let Some(proxy) = cfg
+        .tmdb_proxy_url
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        validate_url(proxy, &["http", "https", "socks5", "socks5h"], "TMDB proxy")?;
+    }
+    if !cfg.alist_base_url.trim().is_empty() {
+        validate_url(&cfg.alist_base_url, &["http", "https"], "AList base")?;
+    }
+    let source = cfg.strm_txt_source.trim();
+    if source.starts_with("http://") || source.starts_with("https://") {
+        validate_url(source, &["http", "https"], "sync source")?;
+    } else {
+        anyhow::ensure!(!source.is_empty(), "sync source cannot be empty");
+        anyhow::ensure!(
+            !["/dev/", "/proc/", "/sys/"]
+                .iter()
+                .any(|p| source.starts_with(p)),
+            "sync source cannot be a system pseudo-file"
+        );
+        let metadata =
+            std::fs::metadata(source).with_context(|| "sync source must be a regular file")?;
+        anyhow::ensure!(metadata.is_file(), "sync source must be a regular file");
+    }
+    anyhow::ensure!(
+        !cfg.image_cache_dir.as_os_str().is_empty()
+            && !cfg
+                .image_cache_dir
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir)),
+        "image cache directory cannot be empty or contain parent traversal"
+    );
+    Ok(())
+}
+
 pub fn build_tmdb_client(proxy_url: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(16);
 
     if let Some(p_url) = proxy_url {
@@ -331,4 +602,144 @@ pub fn build_alist_client() -> Result<Client> {
 pub fn build_rate_limiter(per_sec: u32) -> SharedRateLimiter {
     let quota = Quota::per_second(NonZeroU32::new(per_sec.max(1)).unwrap_or(NonZeroU32::MAX));
     RateLimiter::direct(quota)
+}
+
+#[cfg(test)]
+mod session_hub_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_cleanup_removes_stale_sessions_and_stops_on_shutdown() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/test")
+            .unwrap();
+        let (tx, _) = mpsc::channel(1);
+        let state = AppState::new(
+            crate::config::BootstrapFileConfig::default().into_dynamic(),
+            db,
+            tx,
+        )
+        .unwrap();
+        let session = PlaybackSession {
+            session_id: "stale".into(),
+            user_id: "u".into(),
+            device_id: "d".into(),
+            device_name: "d".into(),
+            client_name: "test".into(),
+            current_episode_id: None,
+            position_ticks: 0,
+            next_ep_prewarmed: false,
+            completed_in_session: false,
+            last_activity: Instant::now() - Duration::from_secs(61),
+        };
+        state.sessions.insert("stale".into(), session.clone());
+        state.sessions.insert(
+            "active".into(),
+            PlaybackSession {
+                last_activity: Instant::now(),
+                ..session
+            },
+        );
+        let task = tokio::spawn(state.clone().run_session_cleanup(Duration::from_millis(1)));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.sessions.contains_key("stale") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.sessions.contains_key("active"));
+        state.shutdown_token.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_login_window_limits_after_fifteen_attempts_case_insensitively() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/test")
+            .unwrap();
+        let (tx, _) = mpsc::channel(1);
+        let state = AppState::new(
+            crate::config::BootstrapFileConfig::default().into_dynamic(),
+            db,
+            tx,
+        )
+        .unwrap();
+        for _ in 0..15 {
+            state.record_failed_login("Alice", "192.0.2.1").await;
+        }
+        assert!(state.login_rate_limited("alice", "192.0.2.1").await);
+        assert!(!state.login_rate_limited("bob", "192.0.2.2").await);
+        for _ in 0..15 {
+            state.record_failed_login("other", "192.0.2.3").await;
+        }
+        assert!(state.login_rate_limited("other", "192.0.2.3").await);
+        for index in 0..30 {
+            state
+                .record_failed_login(&format!("distinct-user-{index}"), "192.0.2.4")
+                .await;
+        }
+        assert!(
+            state
+                .login_rate_limited("different-user", "192.0.2.4")
+                .await
+        );
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_urls_and_cache_paths() {
+        let mut cfg = crate::config::BootstrapFileConfig::default().into_dynamic();
+        cfg.tmdb_api_base = "javascript:alert(1)".into();
+        assert!(validate_runtime_config(&cfg).is_err());
+        cfg.tmdb_api_base = "https://api.example.test".into();
+        cfg.image_cache_dir = "../outside".into();
+        assert!(validate_runtime_config(&cfg).is_err());
+    }
+
+    #[tokio::test]
+    async fn hub_broadcasts_global_session_events_only_to_admin_connections() {
+        let hub = SessionHub::default();
+        let (_, mut admin, _) = hub.register_with_role("admin-token".into(), "root".into(), true);
+        let (_, mut user, _) = hub.register("user-token".into(), "alice".into());
+        hub.broadcast_admins("Sessions", serde_json::json!([{"UserId":"alice"}]));
+        let message = admin.recv().await.unwrap();
+        assert!(message.message.contains("alice"));
+        assert!(user.try_recv().is_err());
+    }
+
+    #[test]
+    fn hub_evicts_slow_connections_when_queue_is_full() {
+        let hub = SessionHub::default();
+        let (_, _rx, cancelled) = hub.register("t".into(), "u".into());
+        for _ in 0..65 {
+            hub.broadcast(None, "Sessions", serde_json::json!([]));
+        }
+        assert!(cancelled.is_cancelled());
+        assert!(hub.connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hub_scopes_push_and_revokes_all_connections_for_token() {
+        let hub = SessionHub::default();
+        let (id, mut alice, cancelled) = hub.register("a".into(), "alice".into());
+        let (_, mut bob, bob_cancelled) = hub.register("b".into(), "bob".into());
+        let (_, _, second) = hub.register("a".into(), "alice".into());
+        hub.broadcast(
+            Some("alice"),
+            "UserDataChanged",
+            serde_json::json!({"Id":1}),
+        );
+        assert!(alice.recv().await.unwrap().kind == HubEventKind::UserDataChanged);
+        assert!(bob.try_recv().is_err());
+        hub.broadcast(None, "LibraryChanged", serde_json::json!({}));
+        assert!(bob.recv().await.unwrap().kind == HubEventKind::LibraryChanged);
+        hub.disconnect_tokens(&["a".into()]);
+        assert!(cancelled.is_cancelled());
+        assert!(second.is_cancelled());
+        assert!(!bob_cancelled.is_cancelled());
+        hub.unregister(&id);
+    }
 }

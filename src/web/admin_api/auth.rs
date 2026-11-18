@@ -11,11 +11,32 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
+async fn password_matches(stored: String, password: String) -> Result<bool, (StatusCode, String)> {
+    crate::web::password::verify_password_blocking(stored, password).await
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AdminUser {
     pub id: String,
     pub username: String,
     pub is_admin: bool,
+}
+
+fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| peer.map(|address| address.ip().to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn extract_admin_token(headers: &HeaderMap) -> Option<String> {
@@ -57,25 +78,27 @@ pub(super) async fn require_admin_auth(
         )
     })?;
 
-    let row: Option<(String, String, bool)> = sqlx::query_as(
-        r#"
-        SELECT u.id, u.username, u.is_admin
-        FROM access_tokens t
-        JOIN users u ON u.id = t.user_id
-        WHERE t.token = $1
-        "#,
-    )
-    .bind(&token)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let (user_id, username, is_admin) = row.ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            "登录凭证无效或已过期，请重新登录".to_string(),
-        )
-    })?;
+    let identity = state
+        .caches
+        .admin_token_user_cache
+        .try_get_with(token.clone(), async {
+            let row: Option<(String, String, bool)> = sqlx::query_as(
+                "SELECT u.id, u.username, u.is_admin FROM access_tokens t JOIN users u ON u.id=t.user_id WHERE t.token=$1",
+            )
+            .bind(&token)
+            .fetch_optional(&state.db)
+            .await?;
+            row.map(Arc::new).ok_or(sqlx::Error::RowNotFound)
+        })
+        .await
+        .map_err(|error| {
+            if matches!(error.as_ref(), sqlx::Error::RowNotFound) {
+                (StatusCode::UNAUTHORIZED, "登录凭证无效或已过期，请重新登录".to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            }
+        })?;
+    let (user_id, username, is_admin) = (identity.0.clone(), identity.1.clone(), identity.2);
 
     if !is_admin {
         return Err((
@@ -84,14 +107,20 @@ pub(super) async fn require_admin_auth(
         ));
     }
 
-    let db = state.db.clone();
-    let tok = token.clone();
-    tokio::spawn(async move {
-        let _ = sqlx::query("UPDATE access_tokens SET last_used_at = NOW() WHERE token = $1")
-            .bind(&tok)
-            .execute(&db)
-            .await;
-    });
+    let touch = state
+        .caches
+        .token_touch_debounce
+        .try_get_with(token.clone(), async {
+            sqlx::query("UPDATE access_tokens SET last_used_at = NOW() WHERE token = $1")
+                .bind(&token)
+                .execute(&state.db)
+                .await?;
+            Ok::<(), sqlx::Error>(())
+        })
+        .await;
+    if let Err(error) = touch {
+        tracing::warn!("更新管理 API 访问令牌 last_used_at 失败: {}", error);
+    }
 
     req.extensions_mut().insert(AdminUser {
         id: user_id,
@@ -112,13 +141,24 @@ pub(super) struct AdminLoginReq {
 pub(super) async fn admin_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     Json(payload): Json<AdminLoginReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let username = payload.username.trim();
     if username.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "请输入用户名".to_string()));
     }
+    if payload.password.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
+    }
 
+    let client_ip = client_ip(&headers, peer.map(|axum::extract::ConnectInfo(addr)| addr));
+    if state.login_rate_limited(username, &client_ip).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录失败次数过多，请稍后重试".to_string(),
+        ));
+    }
     let user_row: Option<(String, String, bool)> =
         sqlx::query_as("SELECT id, password_hash, is_admin FROM users WHERE username = $1")
             .bind(username)
@@ -126,35 +166,71 @@ pub(super) async fn admin_login(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let (user_id, is_admin) = match user_row {
-        Some((uid, stored_pw, admin)) => {
-            if !stored_pw.is_empty() && stored_pw != payload.password {
-                return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
-            }
-            (uid, admin)
+    let (user_id, is_admin) = if let Some((uid, stored_pw, admin)) = user_row {
+        if stored_pw.is_empty()
+            || !password_matches(stored_pw.clone(), payload.password.clone()).await?
+        {
+            state.record_failed_login(username, &client_ip).await;
+            return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
         }
-        None => {
-            // 若库中尚无任何用户，自动初始化首个系统管理员账号
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-                .fetch_one(&state.db)
-                .await
-                .unwrap_or(0);
-            if count == 0 {
-                let new_id = Uuid::new_v4().simple().to_string()[..16].to_string();
-                sqlx::query(
-                    "INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, $2, $3, TRUE)",
-                )
-                .bind(&new_id)
-                .bind(username)
-                .bind(&payload.password)
+        if !stored_pw.starts_with("$pbkdf2-sha256$") {
+            let upgraded =
+                crate::web::password::hash_password_blocking(payload.password.clone()).await?;
+            sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+                .bind(upgraded)
+                .bind(&uid)
                 .execute(&state.db)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                (new_id, true)
-            } else {
-                return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
-            }
         }
+        (uid, admin)
+    } else {
+        (String::new(), false)
+    };
+
+    let (user_id, is_admin) = if user_id.is_empty() {
+        let users_exist: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users)")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if users_exist {
+            state.record_failed_login(username, &client_ip).await;
+            return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
+        }
+        let candidate_hash =
+            crate::web::password::hash_password_blocking(payload.password.clone()).await?;
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(724981662)")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if count != 0 {
+            return Err((StatusCode::UNAUTHORIZED, "用户名或密码错误".to_string()));
+        }
+        let new_id = Uuid::new_v4().simple().to_string()[..16].to_string();
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, is_admin) VALUES ($1, $2, $3, TRUE)",
+        )
+        .bind(&new_id)
+        .bind(username)
+        .bind(candidate_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (new_id, true)
+    } else {
+        (user_id, is_admin)
     };
 
     if !is_admin {
@@ -164,6 +240,11 @@ pub(super) async fn admin_login(
         ));
     }
 
+    state
+        .caches
+        .failed_login_attempts
+        .invalidate(&format!("user:{}", username.to_lowercase()))
+        .await;
     let client_ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -173,53 +254,26 @@ pub(super) async fn admin_login(
         .collect::<String>();
     let stable_device_id = format!("admin-web-{}", user_id);
 
-    let existing_token: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT token FROM access_tokens
-        WHERE user_id = $1 AND client_name = 'RX-Emby Admin'
-        ORDER BY last_used_at DESC
-        LIMIT 1
-        "#,
+    let removed_tokens: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM access_tokens WHERE user_id = $1 AND client_name = 'RX-Emby Admin' RETURNING token",
     )
     .bind(&user_id)
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await
-    .unwrap_or(None);
-
-    let token = if let Some(tok) = existing_token {
-        sqlx::query(
-            "UPDATE access_tokens SET device_id = $2, device_name = $3, last_used_at = NOW() WHERE token = $1",
-        )
-        .bind(&tok)
-        .bind(&stable_device_id)
-        .bind(&client_ua)
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let _ = sqlx::query(
-            "DELETE FROM access_tokens WHERE user_id = $1 AND client_name = 'RX-Emby Admin' AND token <> $2",
-        )
-        .bind(&user_id)
-        .bind(&tok)
-        .execute(&state.db)
-        .await;
-        tok
-    } else {
-        let new_tok = Uuid::new_v4().simple().to_string();
-        sqlx::query(
-            "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(&new_tok)
-        .bind(&user_id)
-        .bind(&stable_device_id)
-        .bind(&client_ua)
-        .bind("RX-Emby Admin")
-        .execute(&state.db)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        new_tok
-    };
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::web::emby_api::invalidate_token_cache(&state, &removed_tokens).await;
+    let token = Uuid::new_v4().simple().to_string();
+    sqlx::query(
+        "INSERT INTO access_tokens (token, user_id, device_id, device_name, client_name) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&token)
+    .bind(&user_id)
+    .bind(&stable_device_id)
+    .bind(&client_ua)
+    .bind("RX-Emby Admin")
+    .execute(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(json!({
         "token": token,
@@ -247,4 +301,29 @@ pub(super) async fn admin_logout(
 
 pub(super) async fn admin_me(Extension(user): Extension<AdminUser>) -> Json<Value> {
     Json(json!({ "user": user }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_ip, password_matches};
+
+    #[test]
+    fn client_ip_uses_connect_info_without_proxy_headers() {
+        let ip = client_ip(
+            &axum::http::HeaderMap::new(),
+            Some("192.0.2.8:1234".parse().unwrap()),
+        );
+        assert_eq!(ip, "192.0.2.8");
+    }
+
+    #[tokio::test]
+    async fn admin_login_password_check_accepts_pbkdf2_hashes() {
+        let encoded = crate::web::password::hash_password_blocking("admin-secret".into())
+            .await
+            .unwrap();
+        assert!(password_matches(encoded.clone(), "admin-secret".into())
+            .await
+            .unwrap());
+        assert!(!password_matches(encoded, "wrong".into()).await.unwrap());
+    }
 }

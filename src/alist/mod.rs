@@ -12,6 +12,44 @@ use std::{
 use tracing::{debug, info, warn};
 
 type HmacSha256 = Hmac<Sha256>;
+#[derive(Debug)]
+struct AlistUnauthorized;
+impl std::fmt::Display for AlistUnauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AList Unauthorized")
+    }
+}
+impl std::error::Error for AlistUnauthorized {}
+fn is_unauthorized(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AlistUnauthorized>().is_some()
+}
+
+const MAX_API_JSON_BYTES: usize = 16 * 1024 * 1024;
+
+async fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+) -> Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_API_JSON_BYTES as u64)
+    {
+        return Err(anyhow!(
+            "AList JSON 响应超过 {} 字节上限",
+            MAX_API_JSON_BYTES
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_API_JSON_BYTES {
+            return Err(anyhow!(
+                "AList JSON 响应超过 {} 字节上限",
+                MAX_API_JSON_BYTES
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
 
 fn refresh_completed_since(request_started: Instant, last_refresh: Option<Instant>) -> bool {
     last_refresh.is_some_and(|refreshed_at| refreshed_at > request_started)
@@ -152,7 +190,9 @@ impl AppState {
             .await
             .context("请求 AList 登录接口失败")?;
 
-        let body: AlistResp<LoginData> = resp.json().await.context("解析 AList 登录响应失败")?;
+        let body: AlistResp<LoginData> = read_json_bounded(resp)
+            .await
+            .context("解析 AList 登录响应失败")?;
         if body.code != 200 {
             return Err(anyhow!(
                 "AList 登录失败 (code={}): {}",
@@ -217,7 +257,7 @@ impl AppState {
                 let total_start = Instant::now();
                 let fs_data = match self.call_alist_fs_get(&full_path, effective_ua, false).await {
                     Ok(data) => data,
-                    Err(e) if e.to_string().contains("401") => {
+                    Err(e) if is_unauthorized(&e) => {
                         warn!("AList Token 失效，触发自动重登并重试 /api/fs/get");
                         self.call_alist_fs_get(&full_path, effective_ua, true).await?
                     }
@@ -363,7 +403,7 @@ impl AppState {
     async fn call_alist_fs_list(&self, full_dir: &str) -> Result<Vec<FsListItem>> {
         match self.call_alist_fs_list_inner(full_dir, false).await {
             Ok(items) => Ok(items),
-            Err(e) if e.to_string().contains("401") => {
+            Err(e) if is_unauthorized(&e) => {
                 warn!("AList Token 失效，触发自动重登并重试 /api/fs/list");
                 self.call_alist_fs_list_inner(full_dir, true).await
             }
@@ -397,16 +437,17 @@ impl AppState {
 
         let status = resp.status();
         if status.as_u16() == 401 {
-            return Err(anyhow!("401 Unauthorized"));
+            return Err(AlistUnauthorized.into());
         }
         if !status.is_success() {
             return Err(anyhow!("AList /api/fs/list HTTP 错误: {}", status));
         }
 
-        let body: AlistResp<FsListData> =
-            resp.json().await.context("解析 /api/fs/list 响应失败")?;
+        let body: AlistResp<FsListData> = read_json_bounded(resp)
+            .await
+            .context("解析 /api/fs/list 响应失败")?;
         if body.code == 401 {
-            return Err(anyhow!("401 Unauthorized: {}", body.message));
+            return Err(AlistUnauthorized.into());
         }
         if body.code != 200 {
             return Err(anyhow!(
@@ -444,15 +485,17 @@ impl AppState {
 
         let status = resp.status();
         if status.as_u16() == 401 {
-            return Err(anyhow!("401 Unauthorized"));
+            return Err(AlistUnauthorized.into());
         }
         if !status.is_success() {
             return Err(anyhow!("AList /api/fs/get HTTP 错误: {}", status));
         }
 
-        let body: AlistResp<FsGetData> = resp.json().await.context("解析 /api/fs/get 响应失败")?;
+        let body: AlistResp<FsGetData> = read_json_bounded(resp)
+            .await
+            .context("解析 /api/fs/get 响应失败")?;
         if body.code == 401 {
-            return Err(anyhow!("401 Unauthorized: {}", body.message));
+            return Err(AlistUnauthorized.into());
         }
         if body.code != 200 {
             return Err(anyhow!(

@@ -23,7 +23,11 @@ pub(super) async fn list_configs(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     for r in &mut rows {
-        if r.value_type == "secret" && !r.config_value.is_empty() {
+        let is_secret = r.value_type == "secret" && !r.config_value.is_empty();
+        let has_proxy_credentials = r.config_key == "tmdb.proxy_url"
+            && reqwest::Url::parse(&r.config_value)
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+        if is_secret || has_proxy_credentials {
             r.config_value = "********".to_string();
         }
     }
@@ -36,19 +40,80 @@ pub(super) struct UpdateConfigsReq {
     updates: HashMap<String, String>,
 }
 
+async fn validate_config_update(key: &str, value: &str) -> Result<(), String> {
+    let url_scheme = match key {
+        "tmdb.api_base_url" | "tmdb.image_base_url" | "alist.base_url" => {
+            Some(&["http", "https"][..])
+        }
+        "tmdb.proxy_url" => Some(&["http", "https", "socks5", "socks5h"][..]),
+        _ => None,
+    };
+    if let Some(schemes) = url_scheme {
+        if value.trim().is_empty() && key == "alist.base_url" {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(value).map_err(|_| format!("配置 {} 必须是有效 URL", key))?;
+        if !schemes.contains(&url.scheme()) || url.host_str().is_none() {
+            return Err(format!("配置 {} URL scheme/host 无效", key));
+        }
+    }
+    if key == "sync.strm_txt_source" {
+        if value.starts_with("http://") || value.starts_with("https://") {
+            reqwest::Url::parse(value).map_err(|_| "同步源 URL 无效".to_string())?;
+        } else {
+            if ["/dev/", "/proc/", "/sys/"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+            {
+                return Err("禁止读取系统伪文件路径".into());
+            }
+            let metadata = tokio::fs::metadata(value)
+                .await
+                .map_err(|_| "本地同步源必须是常规文件".to_string())?;
+            if !metadata.is_file() {
+                return Err("本地同步源必须是常规文件".into());
+            }
+        }
+    }
+    if key == "image_cache.cache_dir" {
+        let path = std::path::Path::new(value);
+        if value.trim().is_empty()
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err("图片缓存目录不能为空或包含 .. 路径段".into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn update_configs(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateConfigsReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    for (k, v) in payload.updates {
-        if v == "********" {
-            continue;
-        }
+    for (key, value) in &payload.updates {
+        validate_config_update(key, value)
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    }
+    let updates: Vec<(String, String)> = payload
+        .updates
+        .into_iter()
+        .filter(|(_, value)| value != "********")
+        .collect();
+    if !updates.is_empty() {
+        let (keys, values): (Vec<String>, Vec<String>) = updates.into_iter().unzip();
         sqlx::query(
-            "UPDATE system_configs SET config_value = $1, updated_at = NOW() WHERE config_key = $2",
+            r#"
+            UPDATE system_configs AS config
+            SET config_value = update_data.config_value, updated_at = NOW()
+            FROM UNNEST($1::text[], $2::text[]) AS update_data(config_key, config_value)
+            WHERE config.config_key = update_data.config_key
+            "#,
         )
-        .bind(&v)
-        .bind(&k)
+        .bind(&keys)
+        .bind(&values)
         .execute(&state.db)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -73,29 +138,12 @@ pub(super) async fn update_configs(
 }
 
 pub(super) async fn trigger_sync(State(state): State<Arc<AppState>>) -> Json<Value> {
-    if state
-        .sync_ctrl
-        .is_syncing
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if !crate::sync::try_trigger_sync(&state) {
         return Json(json!({
             "status": "already_running",
             "message": "同步任务已在运行中，正在展示实时进度"
         }));
     }
-
-    *state.sync_ctrl.progress.write().await = Some(crate::state::SyncProgress {
-        log_id: None,
-        stage: "starting".to_string(),
-        step: 1,
-        total_steps: 5,
-        percent: 5,
-        message: "正在初始化同步任务…".to_string(),
-        scanned_lines: 0,
-        valid_records: 0,
-        started_at: chrono::Utc::now(),
-    });
-    state.sync_ctrl.manual_trigger.notify_one();
 
     // 短暂等待后台任务写入 running 日志行，确保前端立即查询即可看到对应批次
     for _ in 0..10 {
@@ -162,7 +210,7 @@ pub(super) async fn list_sync_logs(
         )
         .fetch_one(&state.db)
         .await
-        .unwrap_or((0, 0, 0, 0));
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let val = json!({
             "total": stats.0,
@@ -231,25 +279,36 @@ pub(super) async fn trigger_cache_evict(
 pub(super) async fn get_admin_overview(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    state.prune_stale_sessions();
-    let cfg = state.config.load();
-    let active_sessions = state.sessions.len();
+    let state_for_load = state.clone();
+    let mut payload = state
+        .caches
+        .admin_stats_cache
+        .try_get_with("overview".to_string(), async move {
+            build_admin_overview_payload(&state_for_load)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-    if let Some(mut cached) = state.caches.admin_stats_cache.get("overview").await {
-        if let Some(sys) = cached.get_mut("system").and_then(|v| v.as_object_mut()) {
-            sys.insert("active_sessions".to_string(), json!(active_sessions));
-        }
-        return Ok(Json(cached));
+    let active_sessions = state
+        .sessions
+        .iter()
+        .filter(|entry| entry.is_active())
+        .count();
+    if let Some(system) = payload.get_mut("system").and_then(Value::as_object_mut) {
+        system.insert("active_sessions".to_string(), json!(active_sessions));
     }
+    Ok(Json(payload))
+}
 
-    // 1. 统计去重后在库影视总数及各刮削状态占比（单次扫描 + 分组去重）
+async fn build_admin_overview_payload(state: &AppState) -> Result<Value, sqlx::Error> {
+    let cfg = state.config.load();
     let scraped_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_works w WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)",
     )
     .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
-
+    .await?;
     let (verified_folders_count, pending_count, conflict_count, failed_count, ignored_count): (
         i64,
         i64,
@@ -268,19 +327,12 @@ pub(super) async fn get_admin_overview(
         "#,
     )
     .fetch_one(&state.db)
-    .await
-    .unwrap_or((0, 0, 0, 0, 0));
-
-    let total_media = scraped_count;
-
+    .await?;
     let total_episodes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.is_ignored = FALSE",
     )
     .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
-
-    // 2. 五大分类统计
+    .await?;
     let cat_rows: Vec<(String, i64)> = sqlx::query_as(
         r#"
         SELECT w.category, COUNT(*)
@@ -291,43 +343,32 @@ pub(super) async fn get_admin_overview(
         "#,
     )
     .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-
+    .await?;
     let categories: Vec<Value> = cat_rows
         .into_iter()
         .map(|(cat, count)| json!({ "category": cat, "count": count }))
         .collect();
-
-    // 3. 图片缓存与最近同步
     let (cache_files, cache_bytes): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::bigint FROM image_cache_index",
     )
     .fetch_one(&state.db)
-    .await
-    .unwrap_or((0, 0));
-
+    .await?;
     let last_sync: Option<SyncLogRow> = sqlx::query_as(
         "SELECT id, started_at, finished_at, duration_ms, total_lines, added_episodes, deleted_episodes, new_media_items, status, error_message FROM sync_logs ORDER BY id DESC LIMIT 1",
     )
     .fetch_optional(&state.db)
-    .await
-    .unwrap_or(None);
-
+    .await?;
     let vlib_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM virtual_libraries WHERE is_enabled = TRUE")
             .fetch_one(&state.db)
-            .await
-            .unwrap_or(0);
-
+            .await?;
     let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
         .fetch_one(&state.db)
-        .await
-        .unwrap_or(1);
+        .await?;
 
-    let payload = json!({
+    Ok(json!({
         "media": {
-            "total_media": total_media,
+            "total_media": scraped_count,
             "total_episodes": total_episodes,
             "scraped_count": scraped_count,
             "verified_folders_count": verified_folders_count,
@@ -348,19 +389,11 @@ pub(super) async fn get_admin_overview(
             "alist_base_url": cfg.alist_base_url,
             "auto_background_scraper": cfg.scraper_auto_background,
             "tmdb_rate_limit": cfg.tmdb_rate_limit_per_sec,
-            "active_sessions": active_sessions,
             "vlib_count": vlib_count,
             "user_count": user_count
         },
         "last_sync": last_sync
-    });
-    state
-        .caches
-        .admin_stats_cache
-        .insert("overview".to_string(), payload.clone())
-        .await;
-
-    Ok(Json(payload))
+    }))
 }
 
 pub(super) async fn get_resource_metrics(
@@ -395,7 +428,7 @@ pub(super) async fn get_resource_metrics(
     )
     .fetch_all(&state.db)
     .await
-    .unwrap_or_default();
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let uptime_sec = (chrono::Utc::now() - state.monitor.started_at)
         .num_seconds()

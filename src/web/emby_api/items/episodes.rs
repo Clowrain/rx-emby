@@ -4,15 +4,20 @@ use serde_json::json;
 /// 某部剧的季列表（供 `ParentId=work_x` + IncludeItemTypes=Season 与 `/Shows/:id/Seasons` 复用）
 pub(in crate::web::emby_api) async fn get_seasons_for_media(
     state: &AppState,
-    _user_id: &str,
+    user_id: &str,
     work_id: i64,
     search_term: Option<&str>,
+    start_index: i64,
+    limit: i64,
 ) -> Result<Value, (StatusCode, String)> {
     let cfg = state.config.load();
-    let _ = state
+    if let Err(error) = state
         .scraper
         .priority_tx
-        .try_send(ScrapeTask::WorkSeasons(work_id));
+        .try_send(ScrapeTask::WorkSeasons(work_id))
+    {
+        tracing::debug!(work_id, %error, "failed to enqueue season metadata prewarm");
+    }
 
     let series_poster: Option<String> =
         sqlx::query_scalar("SELECT poster_path FROM media_works WHERE id = $1")
@@ -25,7 +30,7 @@ pub(in crate::web::emby_api) async fn get_seasons_for_media(
     let search_pattern = build_search_pattern(search_term);
     let mut seasons_sql = DynSql::new(
         r#"
-        SELECT ep_s.season_number, ws.name, ws.overview, ws.poster_path, ws.air_date
+        SELECT ep_s.season_number, ws.name, ws.overview, ws.poster_path, ws.air_date, COUNT(*) OVER() AS total_count
         FROM (
             SELECT DISTINCT sf.season_number
             FROM sync_files sf
@@ -45,12 +50,36 @@ pub(in crate::web::emby_api) async fn get_seasons_for_media(
         ));
     }
     seasons_sql.push(" ORDER BY ep_s.season_number ASC");
+    seasons_sql.push_pagination(limit.clamp(1, 200), start_index.max(0))?;
     let season_rows: Vec<SeasonListRow> =
         sqlx::query_as_with::<Postgres, SeasonListRow, _>(&seasons_sql.sql, seasons_sql.args)
             .fetch_all(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let total_count = season_rows.first().map(|row| row.total_count).unwrap_or(0);
+    let media_meta: Option<(Option<i32>, String)> =
+        sqlx::query_as("SELECT tmdb_id, media_type FROM media_works WHERE id = $1")
+            .bind(work_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let (tmdb_id, media_type) = media_meta.unwrap_or((None, "tv".to_string()));
+    let history_map = crate::web::emby_api::sessions::load_media_episode_user_data(
+        state,
+        user_id,
+        work_id,
+        tmdb_id,
+        &media_type,
+    )
+    .await?;
+    let present: Vec<(i32, i32)> = sqlx::query_as(
+        "SELECT DISTINCT sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = $1 AND f.is_ignored = FALSE",
+    )
+    .bind(work_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let items: Vec<Value> = season_rows
         .into_iter()
         .map(|row| {
@@ -63,6 +92,22 @@ pub(in crate::web::emby_api) async fn get_seasons_for_media(
                 }
             });
             let has_poster = row.poster_path.is_some() || series_poster.is_some();
+            let season_episodes: Vec<_> = present
+                .iter()
+                .filter(|(season, _)| *season == snum)
+                .collect();
+            let played_count = season_episodes
+                .iter()
+                .filter(|(_, episode)| {
+                    history_map
+                        .get(&(snum, *episode))
+                        .is_some_and(|history| history.is_played)
+                })
+                .count();
+            let season_histories: Vec<_> = season_episodes
+                .iter()
+                .filter_map(|(_, episode)| history_map.get(&(snum, *episode)))
+                .collect();
             let mut obj = json!({
                 "Id": format!("season_{}_{}", work_id, snum),
                 "Name": name,
@@ -73,6 +118,12 @@ pub(in crate::web::emby_api) async fn get_seasons_for_media(
                 "IndexNumber": snum,
                 "Overview": row.overview,
                 "PremiereDate": row.air_date,
+                "UserData": {
+                    "PlaybackPositionTicks": season_histories.iter().map(|history| history.position_ticks).max().unwrap_or(0),
+                    "PlayCount": season_histories.iter().map(|history| history.play_count).max().unwrap_or(0),
+                    "Played": !season_episodes.is_empty() && played_count == season_episodes.len(),
+                    "IsFavorite": false
+                },
                 "ImageTags": if has_poster { json!({"Primary": crate::web::emby_api::images::image_path_tag(row.poster_path.as_deref().or(series_poster.as_deref()))}) } else { json!({}) }
             });
             if has_poster {
@@ -84,7 +135,8 @@ pub(in crate::web::emby_api) async fn get_seasons_for_media(
 
     Ok(json!({
         "Items": items,
-        "TotalRecordCount": items.len()
+        "StartIndex": start_index.max(0),
+        "TotalRecordCount": total_count
     }))
 }
 
@@ -96,12 +148,17 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
     work_id: i64,
     season_number: Option<i32>,
     search_term: Option<&str>,
+    start_index: i64,
+    limit: i64,
 ) -> Result<Value, (StatusCode, String)> {
     let cfg = state.config.load();
-    let _ = state
+    if let Err(error) = state
         .scraper
         .priority_tx
-        .try_send(ScrapeTask::WorkSeasons(work_id));
+        .try_send(ScrapeTask::WorkSeasons(work_id))
+    {
+        tracing::debug!(work_id, %error, "failed to enqueue season metadata prewarm");
+    }
 
     let media_meta: Option<(Option<i32>, String, String)> =
         sqlx::query_as("SELECT tmdb_id, media_type, title FROM media_works WHERE id = $1")
@@ -111,9 +168,14 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let (tmdb_id, _mtype, series_title) =
         media_meta.unwrap_or((None, "tv".to_string(), String::new()));
-    let history_map =
-        load_media_episode_histories(state, user_id, work_id, tmdb_id, &_mtype).await?;
+    let history_map = crate::web::emby_api::sessions::load_media_episode_user_data(
+        state, user_id, work_id, tmdb_id, &_mtype,
+    )
+    .await?;
 
+    let favorite: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_favorites WHERE user_id=$1 AND (work_id=$2 OR (tmdb_id IS NOT NULL AND tmdb_id=$3 AND media_type=$4)))")
+        .bind(user_id).bind(work_id).bind(tmdb_id).bind(&_mtype).fetch_one(&state.db).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
     let search_pattern = build_search_pattern(search_term);
     let mut episodes_sql = DynSql::new(
         r#"
@@ -141,6 +203,13 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
         ));
     }
     episodes_sql.push(" ORDER BY sf.season_number ASC, sf.episode_number ASC, COALESCE(sf.priority_override, sf.priority_score + f.priority_boost) DESC, sf.id ASC");
+    let total_sql = format!("SELECT COUNT(*) FROM ({}) episodes", episodes_sql.sql);
+    let total_args = episodes_sql.args.clone();
+    let total: i64 = sqlx::query_scalar_with::<Postgres, i64, _>(&total_sql, total_args)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    episodes_sql.push_pagination(limit.clamp(1, 200), start_index.max(0))?;
     let eps: Vec<EpisodeGroupRow> =
         sqlx::query_as_with::<Postgres, EpisodeGroupRow, _>(&episodes_sql.sql, episodes_sql.args)
             .fetch_all(&state.db)
@@ -150,10 +219,10 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
     let items: Vec<Value> = eps
         .into_iter()
         .map(|ep| {
-            let (position, duration, played) = history_map
+            let history = history_map
                 .get(&(ep.season_number, ep.episode_number))
-                .copied()
-                .unwrap_or((0, 0, false));
+                .cloned()
+                .unwrap_or_default();
             build_episode_item_json(EpisodeJsonInput {
                 server_id: cfg.server_id.clone(),
                 work_id,
@@ -165,10 +234,13 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
                 air_date: ep.air_date,
                 still_path: ep.still_path,
                 poster_path: None,
-                playback_position_ticks: position,
-                duration_ticks: duration,
+                playback_position_ticks: history.position_ticks,
+                duration_ticks: history.duration_ticks,
                 runtime_seconds: ep.runtime,
-                is_played: played,
+                is_played: history.is_played,
+                is_favorite: favorite,
+                play_count: history.play_count,
+                last_played_date: history.last_played_date,
                 media_sources: None,
                 series_primary_image_tag: false,
             })
@@ -177,7 +249,8 @@ pub(in crate::web::emby_api) async fn get_episodes_for_media(
 
     Ok(json!({
         "Items": items,
-        "TotalRecordCount": items.len()
+        "StartIndex": start_index.max(0),
+        "TotalRecordCount": total
     }))
 }
 
@@ -223,7 +296,7 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
         .transpose()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let build = |count_only: bool| -> Result<DynSql, (StatusCode, String)> {
+    let build = async |count_only: bool| -> Result<DynSql, (StatusCode, String)> {
         let mut sql = DynSql::new(
             r#"
             WITH filtered_episodes AS (
@@ -241,6 +314,7 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
                   AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)
             "#,
         );
+        push_metadata_query_filters(state, user_id, q, &mut sql).await?;
         if let Some(cat) = &category_filter {
             sql.push_bind_push(" AND m.category = ", cat.clone(), "")?;
         }
@@ -262,25 +336,25 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
         if count_only {
             sql.push("SELECT COUNT(*) FROM filtered_episodes");
         } else {
-            sql.push("SELECT work_id, tmdb_id, series_title, season_number, episode_number, episode_title, overview, still_path, air_date, runtime FROM filtered_episodes ORDER BY year DESC NULLS LAST, work_id DESC, season_number ASC, episode_number ASC LIMIT ");
-            sql.bind(limit)?;
-            sql.push(" OFFSET ");
-            sql.bind(offset)?;
+            sql.push("SELECT work_id, tmdb_id, series_title, season_number, episode_number, episode_title, overview, still_path, air_date, runtime, COUNT(*) OVER() AS total_count FROM filtered_episodes ORDER BY year DESC NULLS LAST, work_id DESC, season_number ASC, episode_number ASC");
+            sql.push_pagination(limit, offset)?;
         }
         Ok(sql)
     };
 
-    let page_sql = build(false)?;
+    let page_sql = build(false).await?;
     let rows: Vec<EpisodeListRow> =
         sqlx::query_as_with::<Postgres, EpisodeListRow, _>(&page_sql.sql, page_sql.args)
             .fetch_all(&state.db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let total = if !rows.is_empty() && (rows.len() as i64) < limit {
-        offset + rows.len() as i64
+    let total = if let Some(row) = rows.first() {
+        row.total_count
+    } else if offset == 0 {
+        0
     } else {
-        let count_sql = build(true)?;
+        let count_sql = build(true).await?;
         sqlx::query_scalar_with::<Postgres, i64, _>(&count_sql.sql, count_sql.args)
             .fetch_one(&state.db)
             .await
@@ -293,7 +367,7 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
         vec![]
     } else {
         sqlx::query_as(
-            "SELECT work_id, tmdb_id, season_number, episode_number, position_ticks, duration_ticks, is_played FROM play_histories WHERE user_id=$1 AND (work_id = ANY($2) OR (tmdb_id IS NOT NULL AND tmdb_id = ANY($3) AND media_type = 'tv')) ORDER BY (work_id = ANY($2)) DESC, (work_id IS NOT NULL) DESC",
+            "SELECT work_id, tmdb_id, season_number, episode_number, position_ticks, duration_ticks, is_played, play_count, last_played_at AS last_played_date FROM play_histories WHERE user_id=$1 AND (work_id = ANY($2) OR (tmdb_id IS NOT NULL AND tmdb_id = ANY($3) AND media_type = 'tv')) ORDER BY (work_id = ANY($2)) DESC, (work_id IS NOT NULL) DESC",
         )
         .bind(user_id)
         .bind(&page_wids)
@@ -309,6 +383,8 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
             history.position_ticks,
             history.duration_ticks,
             history.is_played,
+            history.play_count,
+            history.last_played_date,
         );
         if let Some(work_id) = history.work_id {
             episode_history_by_work
@@ -324,6 +400,7 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
         }
     }
 
+    let favorites = load_user_favorite_keys(state, user_id).await?;
     let cfg = state.config.load();
     let items: Vec<Value> = rows
         .into_iter()
@@ -345,7 +422,8 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
                 air_date: r.air_date,
                 runtime: r.runtime,
             };
-            let (position, duration, played) = history.unwrap_or((0, 0, false));
+            let (position, duration, played, play_count, last_played_date) =
+                history.unwrap_or((0, 0, false, 0, None));
             build_episode_item_json(EpisodeJsonInput {
                 server_id: cfg.server_id.clone(),
                 work_id: r.work_id,
@@ -361,6 +439,9 @@ pub(in crate::web::emby_api) async fn get_episodes_listing(
                 duration_ticks: duration,
                 runtime_seconds: ep.runtime,
                 is_played: played,
+                is_favorite: is_media_favorited(&favorites, r.work_id, r.tmdb_id, "tv"),
+                play_count,
+                last_played_date,
                 media_sources: None,
                 series_primary_image_tag: false,
             })
@@ -381,10 +462,8 @@ mod sql_tests {
         let source = include_str!("episodes.rs");
         let implementation = source.split("#[cfg(test)]").next().unwrap();
         assert!(implementation.contains("tmdb_id = ANY($3) AND media_type = 'tv'"));
-        assert!(
-            implementation
-                .contains("ORDER BY (work_id = ANY($2)) DESC, (work_id IS NOT NULL) DESC")
-        );
+        assert!(implementation
+            .contains("ORDER BY (work_id = ANY($2)) DESC, (work_id IS NOT NULL) DESC"));
         assert!(!implementation.contains("work_id IS NULL AND tmdb_id IS NOT NULL"));
     }
 
@@ -392,12 +471,12 @@ mod sql_tests {
     fn global_episode_sql_uses_flat_top_n_and_folder_work_id() {
         let source = include_str!("episodes.rs");
         let implementation = source.split("#[cfg(test)]").next().unwrap();
-        assert!(
-            implementation
-                .contains("SELECT DISTINCT ON (fx.work_id, sfx.season_number, sfx.episode_number)")
-        );
+        assert!(implementation
+            .contains("SELECT DISTINCT ON (fx.work_id, sfx.season_number, sfx.episode_number)"));
         assert!(!implementation.contains("sfx.work_id"));
-        assert!(implementation.contains("ORDER BY year DESC NULLS LAST, work_id DESC, season_number ASC, episode_number ASC LIMIT"));
+        assert!(implementation.contains(
+            "ORDER BY year DESC NULLS LAST, work_id DESC, season_number ASC, episode_number ASC"
+        ));
         let selection = implementation
             .find("SELECT DISTINCT ON (fx.work_id, sfx.season_number, sfx.episode_number)")
             .unwrap();
@@ -405,10 +484,8 @@ mod sql_tests {
             .find("ORDER BY fx.work_id, sfx.season_number, sfx.episode_number")
             .unwrap();
         assert!(selection < dedup_sort);
-        assert!(
-            implementation[selection..dedup_sort]
-                .contains("JOIN media_works m ON m.id = fx.work_id")
-        );
+        assert!(implementation[selection..dedup_sort]
+            .contains("JOIN media_works m ON m.id = fx.work_id"));
     }
 }
 
@@ -421,10 +498,13 @@ struct EpisodeListingHistoryRow {
     position_ticks: i64,
     duration_ticks: i64,
     is_played: bool,
+    play_count: i32,
+    last_played_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(sqlx::FromRow)]
 struct EpisodeListRow {
+    total_count: i64,
     work_id: i64,
     tmdb_id: Option<i32>,
     series_title: String,
@@ -460,7 +540,15 @@ pub async fn get_show_seasons(
 
     let search_term = q.search_term.as_deref();
     Ok(Json(
-        get_seasons_for_media(&state, &user_id, wid, search_term).await?,
+        get_seasons_for_media(
+            &state,
+            &user_id,
+            wid,
+            search_term,
+            q.start_index,
+            q.limit.unwrap_or(50).clamp(1, 200),
+        )
+        .await?,
     ))
 }
 
@@ -474,8 +562,17 @@ pub(in crate::web::emby_api) struct ShowEpisodesQuery {
     user_id: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
-    #[serde(rename = "api_key", alias = "ApiKey", alias = "X-Emby-Token")]
+    #[serde(
+        rename = "api_key",
+        alias = "ApiKey",
+        alias = "X-Emby-Token",
+        alias = "x-emby-token"
+    )]
     api_key: Option<String>,
+    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    start_index: i64,
+    #[serde(rename = "Limit", alias = "limit")]
+    limit: Option<i64>,
 }
 
 pub async fn get_show_episodes(
@@ -512,6 +609,8 @@ pub async fn get_show_episodes(
         wid,
         target_season,
         q.search_term.as_deref(),
+        q.start_index,
+        q.limit.unwrap_or(50).clamp(1, 200),
     )
     .await?;
     Ok(Json(res))

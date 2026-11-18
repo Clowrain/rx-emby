@@ -1,18 +1,72 @@
 pub mod tmdb;
 
+async fn invalidate_admin_stats(state: &AppState) {
+    for key in ["overview", "smart_view_options"] {
+        state
+            .caches
+            .admin_stats_cache
+            .invalidate(&key.to_string())
+            .await;
+    }
+}
+
+fn broadcast_verified_work(state: &AppState, work_id: i64, category: &str) {
+    let library = match category {
+        "电影" | "movie" => "lib_movie",
+        "电视剧" | "tv" => "lib_tv",
+        "动漫" | "anime" => "lib_anime",
+        "纪录片" | "documentary" => "lib_doc",
+        "综艺" | "variety" => "lib_variety",
+        _ => return,
+    };
+    state.session_hub.broadcast(
+        None,
+        "LibraryChanged",
+        serde_json::json!({
+            "ItemsAdded": [format!("work_{work_id}")], "ItemsUpdated": [format!("work_{work_id}")],
+            "ItemsRemoved": [], "FoldersAddedTo": [library], "FoldersRemovedFrom": []
+        }),
+    );
+}
+
 use crate::state::{AppState, ScrapeTask};
 use anyhow::Result;
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tmdb::ScrapedMetadata;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{mpsc, Notify},
+    time::sleep,
+};
 use tracing::{debug, error, info};
+
+async fn invalidate_work_image_meta(
+    cache: &moka::future::Cache<String, Option<(String, String)>>,
+    work_id: i64,
+) {
+    for key in [
+        format!("work_{work_id}:Primary"),
+        format!("work_{work_id}:Backdrop"),
+        format!("media_{work_id}:Primary"),
+        format!("media_{work_id}:Backdrop"),
+    ] {
+        cache.invalidate(&key).await;
+    }
+}
 
 #[derive(sqlx::FromRow, Debug)]
 struct PendingFolderRow {
     id: i64,
     root_dir: String,
     inferred_media_type: String,
+    category: String,
     parsed_tmdb_id: Option<i32>,
     clean_title: String,
     year: Option<i32>,
@@ -36,60 +90,158 @@ struct WorkSummaryRow {
     metadata_retry_count: i16,
 }
 
+/// 所有刮削入口共享活动状态；任务未提供可计量总量时不推算百分比。
+#[derive(Default)]
+pub struct ScrapeRuntime {
+    active: AtomicUsize,
+    manual_sweep: AtomicBool,
+    last_finished_unix: AtomicI64,
+    wake: Notify,
+}
+
+pub struct ScrapeSnapshot {
+    pub running: bool,
+    pub current_progress_percentage: Option<f64>,
+    pub last_execution_finished: Option<chrono::DateTime<Utc>>,
+}
+
+struct ScrapeActivity<'a>(&'a ScrapeRuntime);
+
+impl Drop for ScrapeActivity<'_> {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.0
+                .last_finished_unix
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
+        }
+    }
+}
+
+impl ScrapeRuntime {
+    pub fn snapshot(&self) -> ScrapeSnapshot {
+        let running = self.active.load(Ordering::Relaxed) > 0;
+        let finished = self.last_finished_unix.load(Ordering::Relaxed);
+        ScrapeSnapshot {
+            running,
+            current_progress_percentage: running.then_some(0.0),
+            last_execution_finished: (finished > 0)
+                .then(|| chrono::DateTime::from_timestamp(finished, 0))
+                .flatten(),
+        }
+    }
+
+    fn begin_task(&self) -> ScrapeActivity<'_> {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        ScrapeActivity(self)
+    }
+
+    pub fn request_sweep(&self) {
+        self.manual_sweep.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+}
+
+/// 将缺少 TMDB 扩展元数据的正式作品加入既有持久化刷新队列，并唤醒目录扫描。
+pub async fn request_scheduled_scrape(state: &AppState) -> Result<()> {
+    let cfg = state.config.load();
+    anyhow::ensure!(
+        !cfg.tmdb_api_key.is_empty() && cfg.tmdb_api_key != "your_tmdb_api_key",
+        "尚未配置 TMDB API Key"
+    );
+    sqlx::query(
+        r#"
+        UPDATE media_works
+        SET metadata_refresh_requested = TRUE,
+            metadata_retry_count = 0,
+            metadata_retry_at = NULL
+        WHERE NOT is_locked AND tmdb_id IS NOT NULL
+          AND (metadata_version < 2 OR metadata_fetched_at IS NULL)
+        "#,
+    )
+    .execute(&state.db)
+    .await?;
+    state.scraper.runtime.request_sweep();
+    Ok(())
+}
+
 /// 启动后台四级优先级智能刮削协程
-pub fn spawn_scrape_worker(state: Arc<AppState>, mut priority_rx: mpsc::Receiver<ScrapeTask>) {
+pub fn spawn_scrape_worker(
+    state: Arc<AppState>,
+    mut priority_rx: mpsc::Receiver<ScrapeTask>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("TMDB 智能刮削调度器已启动（支持 Staging 校验、P0 实时插队与分集追更补齐）");
-
+        let mut poll_delay = Duration::from_millis(200);
         loop {
-            tokio::select! {
+            let task = tokio::select! {
                 _ = state.shutdown_token.cancelled() => {
                     info!("收到停机信号，刮削调度器退出");
                     break;
                 }
-                Some(task) = priority_rx.recv() => {
-                    match task {
-                        ScrapeTask::Folder(fid) => {
-                            if let Err(e) = scrape_single_folder_with_mode(&state, fid, true).await {
-                                debug!("P0 实时刮削目录 {} 失败: {:#}", fid, e);
-                            }
-                        }
-                        ScrapeTask::WorkSeasons(wid) => {
-                            if let Err(e) = scrape_work_seasons_by_id(&state, wid, true).await {
-                                debug!("P0 实时刷新作品 {} 分集失败: {:#}", wid, e);
-                            }
-                        }
+                Some(task) = priority_rx.recv() => Some((task, true)),
+                _ = state.scraper.runtime.wake.notified() => None,
+                _ = sleep(poll_delay) => None,
+            };
+            let next_task = match task {
+                Some(task) => Some(task),
+                None => match fetch_next_pending_task(&state).await {
+                    Ok(task) => task.map(|task| (task, false)),
+                    Err(e) => {
+                        error!("查询待刮削队列异常: {:#}", e);
+                        poll_delay = Duration::from_secs(5);
+                        continue;
                     }
+                },
+            };
+            let Some((task, priority)) = next_task else {
+                poll_delay = Duration::from_secs(3);
+                continue;
+            };
+            let result = match task {
+                ScrapeTask::Folder(fid) => {
+                    scrape_single_folder_with_mode(&state, fid, priority).await
                 }
-                _ = sleep(Duration::from_millis(200)) => {
-                    match fetch_next_pending_task(&state).await {
-                        Ok(Some(ScrapeTask::Folder(fid))) => {
-                            if let Err(e) = scrape_single_folder_with_mode(&state, fid, false).await {
-                                debug!("常规队列刮削目录 {} 失败: {:#}", fid, e);
-                                sleep(Duration::from_secs(1)).await;
-                            }
-                        }
-                        Ok(Some(ScrapeTask::WorkSeasons(wid))) => {
-                            if let Err(e) = scrape_work_seasons_by_id(&state, wid, false).await {
-                                debug!("常规队列刷新作品 {} 失败: {:#}", wid, e);
-                                sleep(Duration::from_secs(1)).await;
-                            }
-                        }
-                        Ok(None) => {
-                            sleep(Duration::from_secs(3)).await;
-                        }
-                        Err(e) => {
-                            error!("查询待刮削队列异常: {:#}", e);
-                            sleep(Duration::from_secs(5)).await;
-                        }
-                    }
+                ScrapeTask::WorkSeasons(wid) => {
+                    scrape_work_seasons_by_id(&state, wid, priority).await
                 }
-            }
+            };
+            poll_delay = if let Err(e) = result {
+                debug!("刮削任务 {:?} 失败: {:#}", task, e);
+                Duration::from_secs(1)
+            } else {
+                Duration::from_millis(200)
+            };
         }
-    });
+    })
 }
 
 async fn fetch_next_pending_task(state: &AppState) -> Result<Option<ScrapeTask>> {
+    let manual_sweep = state
+        .scraper
+        .runtime
+        .manual_sweep
+        .swap(false, Ordering::Relaxed);
+    let result = fetch_next_pending_task_with_mode(state, manual_sweep).await;
+    if manual_sweep && result.is_err() {
+        state
+            .scraper
+            .runtime
+            .manual_sweep
+            .store(true, Ordering::SeqCst);
+    } else if manual_sweep && !matches!(&result, Ok(None)) {
+        state
+            .scraper
+            .runtime
+            .manual_sweep
+            .store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+async fn fetch_next_pending_task_with_mode(
+    state: &AppState,
+    manual_sweep: bool,
+) -> Result<Option<ScrapeTask>> {
     let cfg = state.config.load();
     if cfg.tmdb_api_key.is_empty() || cfg.tmdb_api_key == "your_tmdb_api_key" {
         return Ok(None);
@@ -113,7 +265,7 @@ async fn fetch_next_pending_task(state: &AppState) -> Result<Option<ScrapeTask>>
         return Ok(Some(ScrapeTask::WorkSeasons(wid)));
     }
 
-    if !cfg.scraper_auto_background {
+    if !cfg.scraper_auto_background && !manual_sweep {
         return Ok(None);
     }
 
@@ -315,6 +467,17 @@ fn verify_tmdb_match(candidate: TmdbMatch<'_>) -> std::result::Result<(), String
 }
 
 async fn upsert_media_work(state: &AppState, meta: &ScrapedMetadata) -> Result<i64> {
+    let previous_images: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT poster_path, backdrop_path FROM media_works WHERE tmdb_id = $1 AND media_type = $2",
+    )
+    .bind(meta.tmdb_id)
+    .bind(&meta.media_type)
+    .fetch_optional(&state.db)
+    .await?;
+    let image_metadata_changed = previous_images
+        .as_ref()
+        .map(|(poster, backdrop)| poster != &meta.poster_path || backdrop != &meta.backdrop_path)
+        .unwrap_or(meta.poster_path.is_some() || meta.backdrop_path.is_some());
     let extra_json = serde_json::to_value(&meta.extra)?;
     let wid: i64 = sqlx::query_scalar(
         r#"
@@ -365,7 +528,10 @@ async fn upsert_media_work(state: &AppState, meta: &ScrapedMetadata) -> Result<i
     .fetch_one(&state.db)
     .await?;
 
-    state.caches.image_meta_cache.invalidate_all();
+    if image_metadata_changed {
+        invalidate_work_image_meta(&state.caches.image_meta_cache, wid).await;
+    }
+    state.caches.metadata_tag_map_cache.invalidate_all();
     Ok(wid)
 }
 
@@ -378,8 +544,9 @@ pub async fn scrape_single_folder_with_mode(
     folder_id: i64,
     is_p0: bool,
 ) -> Result<()> {
+    let _activity = state.scraper.runtime.begin_task();
     let row: Option<PendingFolderRow> = sqlx::query_as(
-        "SELECT id, root_dir, inferred_media_type, parsed_tmdb_id, clean_title, year, retry_count, scrape_state, work_id, is_locked FROM sync_folders WHERE id = $1",
+        "SELECT id, root_dir, inferred_media_type, category, parsed_tmdb_id, clean_title, year, retry_count, scrape_state, work_id, is_locked FROM sync_folders WHERE id = $1",
     )
     .bind(folder_id)
     .fetch_optional(&state.db)
@@ -391,14 +558,17 @@ pub async fn scrape_single_folder_with_mode(
 
     if folder.is_locked {
         if let Some(wid) = folder.work_id {
-            let _ = scrape_work_seasons_by_id(state, wid, is_p0).await;
+            scrape_work_seasons_by_id(state, wid, is_p0).await?;
+            broadcast_verified_work(state, wid, &folder.category);
         }
         return Ok(());
     }
 
     if folder.scrape_state == "verified" {
         if let Some(wid) = folder.work_id {
-            return scrape_work_seasons_by_id(state, wid, is_p0).await;
+            scrape_work_seasons_by_id(state, wid, is_p0).await?;
+            broadcast_verified_work(state, wid, &folder.category);
+            return Ok(());
         }
     }
 
@@ -454,8 +624,7 @@ pub async fn scrape_single_folder_with_mode(
             WHERE tmdb_id = $1 AND media_type = $2
               AND metadata_version >= 2
               AND metadata_fetched_at > NOW() - INTERVAL '1 day'
-              AND NOT metadata_refresh_requested
-            LIMIT 1
+                LIMIT 1
             "#,
         )
         .bind(tid)
@@ -485,7 +654,8 @@ pub async fn scrape_single_folder_with_mode(
                 .execute(&state.db)
                 .await?;
 
-                state.caches.admin_stats_cache.invalidate_all();
+                invalidate_admin_stats(state).await;
+                broadcast_verified_work(state, work.id, &folder.category);
                 if work.media_type == "tv" {
                     scrape_tv_seasons(state, work.id, tid, work.year.or(folder.year), is_p0)
                         .await?;
@@ -602,7 +772,8 @@ pub async fn scrape_single_folder_with_mode(
             .execute(&state.db)
             .await?;
 
-            state.caches.admin_stats_cache.invalidate_all();
+            invalidate_admin_stats(state).await;
+            broadcast_verified_work(state, work_id, &meta.category);
             info!(
                 "✅ [Scraper] 目录刮削并校验通过 folder_id={} -> work_id={} tmdb_id={} type={} title={:?}",
                 folder.id, work_id, meta.tmdb_id, meta.media_type, meta.title
@@ -637,7 +808,7 @@ pub async fn scrape_single_folder_with_mode(
             .bind(folder.id)
             .execute(&state.db)
             .await?;
-            state.caches.admin_stats_cache.invalidate_all();
+            invalidate_admin_stats(state).await;
             info!(
                 "⚠️ [Scraper] 目录校验存疑 folder_id={}: {}",
                 folder.id, conflict_reason
@@ -660,7 +831,7 @@ pub async fn scrape_single_folder_with_mode(
             .bind(folder.id)
             .execute(&state.db)
             .await?;
-            state.caches.admin_stats_cache.invalidate_all();
+            invalidate_admin_stats(state).await;
             return Err(e);
         }
     }
@@ -670,6 +841,7 @@ pub async fn scrape_single_folder_with_mode(
 
 /// 刷新正式作品（扩展元数据 + 剧集季/分集）
 pub async fn scrape_work_seasons_by_id(state: &AppState, work_id: i64, is_p0: bool) -> Result<()> {
+    let _activity = state.scraper.runtime.begin_task();
     let row: Option<WorkSummaryRow> = sqlx::query_as(
         "SELECT id, media_type, tmdb_id, title, original_title, year, is_locked, metadata_version, metadata_refresh_requested, metadata_retry_count FROM media_works WHERE id = $1",
     )
@@ -699,7 +871,7 @@ pub async fn scrape_work_seasons_by_id(state: &AppState, work_id: i64, is_p0: bo
         {
             Ok(meta) => {
                 let _ = upsert_media_work(state, &meta).await?;
-                state.caches.admin_stats_cache.invalidate_all();
+                invalidate_admin_stats(state).await;
             }
             Err(e) => {
                 let retries = work.metadata_retry_count.saturating_add(1);
@@ -732,6 +904,7 @@ pub async fn scrape_tv_seasons(
     series_year: Option<i32>,
     is_p0: bool,
 ) -> Result<()> {
+    let _activity = state.scraper.runtime.begin_task();
     // 1. 确保所有关联物理源包含的季都在 work_seasons 中存在
     sqlx::query(
         r#"
@@ -805,16 +978,31 @@ pub async fn scrape_tv_seasons(
     .await?;
 
     if pending_seasons.is_empty() {
-        state.caches.image_meta_cache.invalidate_all();
         return Ok(());
     }
 
     let current_year = Utc::now().year();
+    let mut season_image_changed = false;
+    let mut updated_season_posters = HashSet::new();
+    let mut updated_still_episodes = HashSet::new();
 
     for (season_num, attempts) in pending_seasons {
         let next_attempt = (attempts.max(0) + 1).min(5);
         match state.fetch_tmdb_season(tmdb_id, season_num).await {
             Ok(Some(season_meta)) => {
+                if let Some(new_poster) = season_meta.poster_path.as_ref() {
+                    let old_poster: Option<Option<String>> = sqlx::query_scalar(
+                        "SELECT poster_path FROM work_seasons WHERE work_id = $1 AND season_number = $2",
+                    )
+                    .bind(work_id)
+                    .bind(season_num)
+                    .fetch_optional(&state.db)
+                    .await?;
+                    if old_poster.as_ref().and_then(Option::as_ref) != Some(new_poster) {
+                        season_image_changed = true;
+                        updated_season_posters.insert(season_num);
+                    }
+                }
                 sqlx::query(
                     r#"
                     UPDATE work_seasons SET
@@ -846,6 +1034,15 @@ pub async fn scrape_tv_seasons(
                     || (!has_any_air_date
                         && series_year.map(|y| y >= current_year - 1).unwrap_or(false));
 
+                let old_stills: HashMap<i32, Option<String>> = sqlx::query_as(
+                    "SELECT episode_number, still_path FROM work_episodes WHERE work_id = $1 AND season_number = $2",
+                )
+                .bind(work_id)
+                .bind(season_num)
+                .fetch_all(&state.db)
+                .await?
+                .into_iter()
+                .collect();
                 let mut ep_nums = Vec::with_capacity(season_meta.episodes.len());
                 let mut names = Vec::with_capacity(season_meta.episodes.len());
                 let mut overviews = Vec::with_capacity(season_meta.episodes.len());
@@ -855,6 +1052,11 @@ pub async fn scrape_tv_seasons(
                 let mut incompletes = Vec::with_capacity(season_meta.episodes.len());
 
                 for ep in season_meta.episodes {
+                    if ep.still_path.is_some()
+                        && old_stills.get(&ep.episode_number) != Some(&ep.still_path)
+                    {
+                        updated_still_episodes.insert((season_num, ep.episode_number));
+                    }
                     let has_still = ep.still_path.is_some();
                     let has_overview = ep.overview.is_some();
                     let has_real_name = ep
@@ -981,7 +1183,24 @@ pub async fn scrape_tv_seasons(
         }
     }
 
-    state.caches.image_meta_cache.invalidate_all();
+    for season_num in updated_season_posters {
+        state
+            .caches
+            .image_meta_cache
+            .invalidate(&format!("season_{work_id}_{season_num}:Primary"))
+            .await;
+    }
+    for (season_num, episode_num) in &updated_still_episodes {
+        for key in [
+            format!("ep_{work_id}_{season_num}_{episode_num}:Primary"),
+            format!("ep_{work_id}_{season_num}_{episode_num}:Backdrop"),
+        ] {
+            state.caches.image_meta_cache.invalidate(&key).await;
+        }
+    }
+    if season_image_changed || !updated_still_episodes.is_empty() {
+        invalidate_work_image_meta(&state.caches.image_meta_cache, work_id).await;
+    }
     Ok(())
 }
 
@@ -1026,7 +1245,7 @@ pub async fn promote_folder_manually(
         .execute(&state.db)
         .await?;
 
-        state.caches.admin_stats_cache.invalidate_all();
+        invalidate_admin_stats(state).await;
         if meta.media_type == "tv" {
             let _ = scrape_tv_seasons(state, work_id, tid, meta.year.or(folder_row.2), true).await;
         }
@@ -1062,7 +1281,7 @@ pub async fn promote_folder_manually(
         .execute(&state.db)
         .await?;
 
-        state.caches.admin_stats_cache.invalidate_all();
+        invalidate_admin_stats(state).await;
         Ok(work_id)
     }
 }
@@ -1086,4 +1305,91 @@ fn is_placeholder_episode_title(name: &str, ep_num: i32) -> bool {
     trimmed == format!("第{}集", ep_num)
         || trimmed == format!("第 {} 集", ep_num)
         || trimmed.eq_ignore_ascii_case(&format!("episode {}", ep_num))
+}
+
+#[cfg(test)]
+mod scheduled_task_tests {
+    use super::*;
+
+    #[test]
+    fn activity_guard_reports_running_until_last_concurrent_task_finishes() {
+        let runtime = ScrapeRuntime::default();
+        assert!(!runtime.snapshot().running);
+        let first = runtime.begin_task();
+        let second = runtime.begin_task();
+        assert!(runtime.snapshot().running);
+        drop(first);
+        assert!(runtime.snapshot().running);
+        drop(second);
+        assert!(!runtime.snapshot().running);
+    }
+
+    #[tokio::test]
+    async fn manual_request_wakes_worker_and_enables_sweep() {
+        let runtime = ScrapeRuntime::default();
+        runtime.request_sweep();
+        assert!(runtime.manual_sweep.load(Ordering::Relaxed));
+        tokio::time::timeout(Duration::from_millis(50), runtime.wake.notified())
+            .await
+            .expect("manual request should retain a wake permit");
+    }
+
+    #[tokio::test]
+    #[ignore = "需要 TEST_DATABASE_URL；使用单连接临时表隔离队列数据"]
+    async fn scheduled_scrape_enqueues_missing_metadata_and_manually_drains_pending_folders() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("设置测试数据库连接");
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE media_works (
+                id BIGINT PRIMARY KEY, tmdb_id INTEGER, is_locked BOOLEAN DEFAULT FALSE,
+                metadata_version SMALLINT DEFAULT 0, metadata_fetched_at TIMESTAMPTZ,
+                metadata_refresh_requested BOOLEAN DEFAULT FALSE,
+                metadata_retry_count SMALLINT DEFAULT 0, metadata_retry_at TIMESTAMPTZ
+            );
+            CREATE TEMP TABLE sync_folders (
+                id BIGINT PRIMARY KEY, scrape_state TEXT, is_ignored BOOLEAN DEFAULT FALSE,
+                is_locked BOOLEAN DEFAULT FALSE, scrape_priority INTEGER DEFAULT 0
+            );
+            INSERT INTO media_works (id, tmdb_id, is_locked, metadata_version, metadata_fetched_at)
+            VALUES (1, 101, TRUE, 0, NULL), (2, 102, FALSE, 0, NULL),
+                   (3, 103, FALSE, 2, NOW()), (4, NULL, FALSE, 0, NULL);
+            INSERT INTO sync_folders (id, scrape_state) VALUES (5, 'pending');
+        "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut cfg = crate::config::BootstrapFileConfig::default().into_dynamic();
+        cfg.tmdb_api_key = "fixture".into();
+        cfg.scraper_auto_background = false;
+        let (tx, _rx) = mpsc::channel(4);
+        let state = AppState::new(cfg, db.clone(), tx).unwrap();
+        assert!(fetch_next_pending_task(&state).await.unwrap().is_none());
+        request_scheduled_scrape(&state).await.unwrap();
+        let queued: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM media_works WHERE metadata_refresh_requested ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(queued, vec![2]);
+        assert!(matches!(
+            fetch_next_pending_task(&state).await.unwrap(),
+            Some(ScrapeTask::WorkSeasons(2))
+        ));
+        sqlx::query("UPDATE media_works SET metadata_refresh_requested = FALSE WHERE id = 2")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fetch_next_pending_task(&state).await.unwrap(),
+            Some(ScrapeTask::Folder(5))
+        ));
+        db.close().await;
+    }
 }

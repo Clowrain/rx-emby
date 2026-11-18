@@ -11,6 +11,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+async fn invalidate_admin_stats(state: &AppState) {
+    for key in ["overview", "smart_view_options"] {
+        state
+            .caches
+            .admin_stats_cache
+            .invalidate(&key.to_string())
+            .await;
+    }
+}
+
+async fn invalidate_work_image_meta(state: &AppState, work_id: i64) {
+    for key in [
+        format!("work_{work_id}:Primary"),
+        format!("work_{work_id}:Backdrop"),
+        format!("media_{work_id}:Primary"),
+        format!("media_{work_id}:Backdrop"),
+    ] {
+        state.caches.image_meta_cache.invalidate(&key).await;
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct AdminMediaQuery {
     category: Option<String>,
@@ -20,6 +41,35 @@ pub(super) struct AdminMediaQuery {
     sort_order: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+async fn broadcast_work_visibility(state: &AppState, work_id: i64, visible: bool) {
+    let category: Option<String> =
+        sqlx::query_scalar("SELECT category FROM media_works WHERE id = $1")
+            .bind(work_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    let library = match category.as_deref() {
+        Some("电影") | Some("movie") => "lib_movie",
+        Some("电视剧") | Some("tv") => "lib_tv",
+        Some("动漫") | Some("anime") => "lib_anime",
+        Some("纪录片") | Some("documentary") => "lib_doc",
+        Some("综艺") | Some("variety") => "lib_variety",
+        _ => return,
+    };
+    state.session_hub.broadcast(
+        None,
+        "LibraryChanged",
+        json!({
+            "ItemsAdded": if visible { vec![format!("work_{work_id}")] } else { vec![] },
+            "ItemsRemoved": if visible { vec![] } else { vec![format!("work_{work_id}")] },
+            "ItemsUpdated": if visible { vec![format!("work_{work_id}")] } else { vec![] },
+            "FoldersAddedTo": if visible { vec![library] } else { vec![] },
+            "FoldersRemovedFrom": if visible { vec![] } else { vec![library] }
+        }),
+    );
 }
 
 fn build_admin_media_order_clause(sort_by: Option<&str>, is_asc: bool) -> &'static str {
@@ -90,7 +140,14 @@ pub(super) async fn list_admin_media(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let kw = kw_raw.map(|s| format!("%{}%", s));
+    let kw = kw_raw.map(|s| {
+        format!(
+            "%{}%",
+            s.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        )
+    });
     let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
 
     let is_asc = q
@@ -107,7 +164,7 @@ pub(super) async fn list_admin_media(
         WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
           AND ($1::text IS NULL OR w.category = $1)
           AND ($2::text IS NULL OR w.media_type = $2)
-          AND ($3::text IS NULL OR w.title ILIKE $3 OR w.original_title ILIKE $3 OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
+          AND ($3::text IS NULL OR w.title ILIKE $3 ESCAPE '\\' OR w.original_title ILIKE $3 ESCAPE '\\' OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
         "#,
     )
     .bind(&q.category)
@@ -129,7 +186,7 @@ pub(super) async fn list_admin_media(
         WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
           AND ($1::text IS NULL OR w.category = $1)
           AND ($2::text IS NULL OR w.media_type = $2)
-          AND ($3::text IS NULL OR w.title ILIKE $3 OR w.original_title ILIKE $3 OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
+          AND ($3::text IS NULL OR w.title ILIKE $3 ESCAPE '\\' OR w.original_title ILIKE $3 ESCAPE '\\' OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
         ORDER BY {order_clause}
         LIMIT $5 OFFSET $6
         "#,
@@ -229,10 +286,13 @@ pub(super) async fn get_admin_media_detail(
     };
 
     if media.media_type == "tv" {
-        let _ = state
+        if let Err(error) = state
             .scraper
             .priority_tx
-            .try_send(ScrapeTask::WorkSeasons(work_id));
+            .try_send(ScrapeTask::WorkSeasons(work_id))
+        {
+            tracing::debug!(work_id, %error, "failed to enqueue season metadata prewarm");
+        }
     }
 
     let folders: Vec<AdminLinkedFolderRow> = sqlx::query_as(
@@ -347,6 +407,12 @@ pub(super) async fn bind_tmdb_id(
         return Err((StatusCode::BAD_REQUEST, "请提供有效的 TMDB ID".into()));
     };
 
+    let old_category: Option<String> =
+        sqlx::query_scalar("SELECT category FROM media_works WHERE id = $1")
+            .bind(work_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let folder_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM sync_folders WHERE work_id = $1")
         .bind(work_id)
         .fetch_all(&state.db)
@@ -367,8 +433,44 @@ pub(super) async fn bind_tmdb_id(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_admin_stats(&state).await;
+    invalidate_work_image_meta(&state, target_work_id).await;
+    broadcast_work_visibility(&state, target_work_id, true).await;
+    if target_work_id != work_id {
+        let remaining_folders: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_folders WHERE work_id = $1 AND is_ignored = FALSE",
+        )
+        .bind(work_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        invalidate_work_image_meta(&state, work_id).await;
+        if remaining_folders == 0 {
+            if let Some(category) = old_category.as_deref() {
+                let library = match category {
+                    "电影" | "movie" => Some("lib_movie"),
+                    "电视剧" | "tv" => Some("lib_tv"),
+                    "动漫" | "anime" => Some("lib_anime"),
+                    "纪录片" | "documentary" => Some("lib_doc"),
+                    "综艺" | "variety" => Some("lib_variety"),
+                    _ => None,
+                };
+                if let Some(library) = library {
+                    state.session_hub.broadcast(
+                        None,
+                        "LibraryChanged",
+                        json!({
+                            "ItemsAdded": [],
+                            "ItemsRemoved": [format!("work_{work_id}")],
+                            "ItemsUpdated": [],
+                            "FoldersAddedTo": [],
+                            "FoldersRemovedFrom": [library]
+                        }),
+                    );
+                }
+            }
+        }
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -397,8 +499,9 @@ pub(super) async fn scrape_one_now(
             )
         })?;
 
-    state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_admin_stats(&state).await;
+    invalidate_work_image_meta(&state, work_id).await;
+    broadcast_work_visibility(&state, work_id, true).await;
 
     Ok(Json(
         json!({ "status": "ok", "message": "作品及分集元数据刷新成功" }),
@@ -423,8 +526,9 @@ pub(super) async fn toggle_ignore_media(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_admin_stats(&state).await;
+    invalidate_work_image_meta(&state, work_id).await;
+    broadcast_work_visibility(&state, work_id, !payload.ignore).await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -548,7 +652,14 @@ pub(super) async fn list_staging_folders(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let kw = kw_raw.map(|s| format!("%{}%", s));
+    let kw = kw_raw.map(|s| {
+        format!(
+            "%{}%",
+            s.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        )
+    });
     let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
 
     let total: i64 = sqlx::query_scalar(
@@ -558,7 +669,7 @@ pub(super) async fn list_staging_folders(
         WHERE f.is_ignored = $1
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
-          AND ($4::text IS NULL OR f.clean_title ILIKE $4 OR f.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
+          AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\\' OR f.root_dir ILIKE $4 ESCAPE '\\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
         "#,
     )
     .bind(ignored_filter)
@@ -584,7 +695,7 @@ pub(super) async fn list_staging_folders(
         WHERE f.is_ignored = $1
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
-          AND ($4::text IS NULL OR f.clean_title ILIKE $4 OR f.root_dir ILIKE $4 OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
+          AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\\' OR f.root_dir ILIKE $4 ESCAPE '\\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
         ORDER BY f.updated_at DESC, f.id DESC
         LIMIT $6 OFFSET $7
         "#,
@@ -627,8 +738,7 @@ pub(super) async fn scrape_staging_folder(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_admin_stats(&state).await;
 
     let (scrape_state, conflict_reason, work_id) =
         state_after.unwrap_or(("pending".into(), None, None));
@@ -660,8 +770,9 @@ pub(super) async fn promote_staging_folder(
     .await
     .map_err(|e| (StatusCode::BAD_GATEWAY, format!("手动发布失败: {:#}", e)))?;
 
-    state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_admin_stats(&state).await;
+    invalidate_work_image_meta(&state, work_id).await;
+    broadcast_work_visibility(&state, work_id, true).await;
 
     Ok(Json(json!({
         "status": "ok",
@@ -679,6 +790,13 @@ pub(super) async fn toggle_ignore_staging_folder(
     Path(folder_id): Path<i64>,
     Json(payload): Json<ToggleIgnoreReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    let linked_work: Option<i64> =
+        sqlx::query_scalar("SELECT work_id FROM sync_folders WHERE id = $1")
+            .bind(folder_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .flatten();
     sqlx::query("UPDATE sync_folders SET is_ignored = $1, updated_at = NOW() WHERE id = $2")
         .bind(payload.ignore)
         .bind(folder_id)
@@ -686,8 +804,11 @@ pub(super) async fn toggle_ignore_staging_folder(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_admin_stats(&state).await;
+    if let Some(work_id) = linked_work {
+        invalidate_work_image_meta(&state, work_id).await;
+        broadcast_work_visibility(&state, work_id, !payload.ignore).await;
+    }
 
     Ok(Json(json!({
         "status": "ok",
@@ -704,14 +825,25 @@ pub(super) async fn batch_scrape_staging_folders(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<BatchScrapeReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let count = payload.folder_ids.len();
+    let mut queued = 0;
+    let mut rejected = 0;
     for fid in payload.folder_ids {
-        let _ = state.scraper.priority_tx.try_send(ScrapeTask::Folder(fid));
+        match state.scraper.priority_tx.try_send(ScrapeTask::Folder(fid)) {
+            Ok(()) => queued += 1,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => rejected += 1,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("刮削队列已关闭，成功加入 {} 个目录，剩余任务未提交", queued),
+                ));
+            }
+        }
     }
     Ok(Json(json!({
-        "status": "ok",
-        "queued": count,
-        "message": format!("已将 {} 个目录加入高优先级刮削队列", count)
+        "status": if rejected == 0 { "ok" } else { "partial" },
+        "queued": queued,
+        "rejected": rejected,
+        "message": format!("已将 {} 个目录加入高优先级刮削队列，{} 个因队列已满未提交", queued, rejected)
     })))
 }
 
@@ -729,8 +861,7 @@ pub(super) async fn retry_failed_scrapes(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.caches.admin_stats_cache.invalidate_all();
-    state.caches.image_meta_cache.invalidate_all();
+    invalidate_admin_stats(&state).await;
 
     Ok(Json(json!({
         "status": "ok",

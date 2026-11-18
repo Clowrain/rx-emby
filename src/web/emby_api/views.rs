@@ -1,14 +1,14 @@
 use super::auth::resolve_valid_user_id_with_query;
 use super::images::compute_cover_image_tag;
 use super::playback::PlaybackQuery;
-use crate::smart_views::{VirtualLibraryRule, can_access_view};
+use crate::smart_views::{can_access_view, VirtualLibraryRule};
 use crate::state::AppState;
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::HeaderMap,
+    Json,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -34,22 +34,18 @@ pub(crate) async fn user_access_scope(
     user_id: &str,
 ) -> Result<Arc<UserAccessScope>, (axum::http::StatusCode, String)> {
     let allowed_categories = get_user_allowed_categories(state, user_id).await?;
-    let rows = if let Some(rows) = state.caches.enabled_vlibs_cache.get("enabled").await {
-        rows
-    } else {
-        let rows: Vec<(i32, String, Value)> = sqlx::query_as(
-            "SELECT id, name, filter_rules FROM virtual_libraries WHERE is_enabled = TRUE",
-        )
-        .fetch_all(&state.db)
+    let rows = state
+        .caches
+        .enabled_vlibs_cache
+        .try_get_with("enabled".to_string(), async {
+            sqlx::query_as::<_, (i32, String, Value)>(
+                "SELECT id, name, filter_rules FROM virtual_libraries WHERE is_enabled = TRUE",
+            )
+            .fetch_all(&state.db)
+            .await
+        })
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        state
-            .caches
-            .enabled_vlibs_cache
-            .insert("enabled".to_string(), rows.clone())
-            .await;
-        rows
-    };
     let virtual_libraries = rows
         .into_iter()
         .filter_map(|(id, name, filter_rules)| {
@@ -155,11 +151,7 @@ pub(super) async fn get_user_views(
         } else {
             "tvshows"
         };
-        let image_tag = format!(
-            "{}_{}",
-            compute_cover_image_tag(cover_image.as_deref(), revision),
-            revision
-        );
+        let image_tag = compute_cover_image_tag(cover_image.as_deref(), revision);
         // 视图仅投放 Primary：图片接口对视图的 Backdrop 与 Primary 返回同一资源，
         // 同时投放会诱发客户端冗余拉取
         items.push(json!({
@@ -175,7 +167,8 @@ pub(super) async fn get_user_views(
 
     Ok(Json(json!({
         "Items": items,
-        "TotalRecordCount": items.len()
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0
     })))
 }
 
@@ -184,32 +177,56 @@ pub(super) async fn get_user_allowed_categories(
     state: &AppState,
     user_id: &str,
 ) -> Result<Option<Vec<String>>, (axum::http::StatusCode, String)> {
-    if let Some(categories) = state.caches.user_categories_cache.get(user_id).await {
-        return Ok(categories);
-    }
-    let row: Option<(bool, Vec<String>)> =
-        sqlx::query_as("SELECT is_admin, allowed_categories FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (is_admin, cats) = row.ok_or_else(|| {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "用户不存在".to_string(),
-        )
-    })?;
-    let categories = if is_admin || cats.iter().any(|c| c == "*") {
-        None
-    } else {
-        Some(cats)
-    };
     state
         .caches
         .user_categories_cache
-        .insert(user_id.to_owned(), categories.clone())
-        .await;
-    Ok(categories)
+        .try_get_with(user_id.to_owned(), async {
+            let row: Option<(bool, Vec<String>)> =
+                sqlx::query_as("SELECT is_admin, allowed_categories FROM users WHERE id = $1")
+                    .bind(user_id)
+                    .fetch_optional(&state.db)
+                    .await?;
+            let (is_admin, categories) = row.ok_or(sqlx::Error::RowNotFound)?;
+            Ok::<Option<Vec<String>>, sqlx::Error>(
+                if is_admin || categories.iter().any(|c| c == "*") {
+                    None
+                } else {
+                    Some(normalize_allowed_categories(categories))
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            if matches!(error.as_ref(), sqlx::Error::RowNotFound) {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "用户不存在".to_string(),
+                )
+            } else {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                )
+            }
+        })
+}
+
+fn normalize_allowed_categories(categories: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(categories.len());
+    for category in categories {
+        let value = match category.as_str() {
+            "lib_movie" => "电影",
+            "lib_tv" => "电视剧",
+            "lib_anime" => "动漫",
+            "lib_doc" => "纪录片",
+            "lib_variety" => "综艺",
+            _ => category.as_str(),
+        };
+        if !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_owned());
+        }
+    }
+    normalized
 }
 
 /// 统计某个虚拟媒体库规则当前在库内命中的影视作品数
@@ -241,32 +258,34 @@ pub(super) fn base_library_category(item_id: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod access_scope_tests {
-    use super::{AccessibleVirtualLibrary, UserAccessScope};
+    use super::{normalize_allowed_categories, AccessibleVirtualLibrary, UserAccessScope};
+
+    #[test]
+    fn category_ids_and_display_names_normalize_to_same_acl_value() {
+        assert_eq!(
+            normalize_allowed_categories(vec!["lib_movie".into(), "电影".into()]),
+            vec!["电影"]
+        );
+    }
 
     #[test]
     fn empty_restricted_categories_and_no_libraries_means_no_access() {
-        assert!(
-            UserAccessScope {
-                allowed_categories: Some(vec![]),
-                virtual_libraries: vec![],
-            }
-            .has_no_access()
-        );
-        assert!(
-            !UserAccessScope {
-                allowed_categories: None,
-                virtual_libraries: vec![],
-            }
-            .has_no_access()
-        );
-        assert!(
-            !UserAccessScope {
-                allowed_categories: Some(vec![]),
-                virtual_libraries: vec![AccessibleVirtualLibrary {
-                    filter_rules: serde_json::json!({"media_type":"movie"}),
-                }],
-            }
-            .has_no_access()
-        );
+        assert!(UserAccessScope {
+            allowed_categories: Some(vec![]),
+            virtual_libraries: vec![],
+        }
+        .has_no_access());
+        assert!(!UserAccessScope {
+            allowed_categories: None,
+            virtual_libraries: vec![],
+        }
+        .has_no_access());
+        assert!(!UserAccessScope {
+            allowed_categories: Some(vec![]),
+            virtual_libraries: vec![AccessibleVirtualLibrary {
+                filter_rules: serde_json::json!({"media_type":"movie"}),
+            }],
+        }
+        .has_no_access());
     }
 }
