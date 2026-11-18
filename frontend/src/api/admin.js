@@ -17,6 +17,13 @@ export function setAdminToken(token) {
   }
 }
 
+export function embyImageUrl(path) {
+  const token = getAdminToken()
+  if (!token) return path
+  const sep = path.includes('?') ? '&' : '?'
+  return `${path}${sep}api_key=${encodeURIComponent(token)}`
+}
+
 export function clearAdminToken() {
   try {
     localStorage.removeItem(TOKEN_KEY)

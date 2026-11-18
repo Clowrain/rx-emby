@@ -51,7 +51,7 @@
           <div class="flex gap-4 bg-slate-950/60 p-4 rounded-2xl border border-slate-800/90">
             <img
               v-if="media.poster_path"
-              :src="`/emby/Items/work_${media.id}/Images/Primary`"
+              :src="embyImageUrl(`/emby/Items/work_${media.id}/Images/Primary`)"
               :alt="`${media.title} 海报`"
               width="96"
               height="144"
@@ -200,7 +200,7 @@
               <div class="flex gap-3.5 items-start">
                 <img
                   v-if="media.media_type !== 'movie' && grp.rep.still_path"
-                  :src="`/emby/Items/ep_${media.id}_${grp.rep.season_number}_${grp.rep.episode_number}/Images/Primary`"
+                  :src="embyImageUrl(`/emby/Items/ep_${media.id}_${grp.rep.season_number}_${grp.rep.episode_number}/Images/Primary`)"
                   :alt="grp.headerLabel"
                   width="128"
                   height="72"
@@ -330,7 +330,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { Zap, X, Star, FolderGit2, HardDrive } from 'lucide-vue-next'
-import { adminApi } from '../api/admin'
+import { adminApi, embyImageUrl } from '../api/admin'
 import { useToast } from '../composables/useToast'
 
 const props = defineProps({

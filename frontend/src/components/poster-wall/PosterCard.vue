@@ -1,5 +1,6 @@
 <script setup>
 import { Film, Layers, Star, Link2, Sparkles, Eye, EyeOff } from 'lucide-vue-next'
+import { embyImageUrl } from '../../api/admin'
 
 const props = defineProps({
   item: { type: Object, required: true },
@@ -34,7 +35,7 @@ function statusBadgeClass(item) {
       <div class="aspect-[2/3] bg-slate-950 relative overflow-hidden flex items-center justify-center">
         <img
           v-if="item.poster_path"
-          :src="`/emby/Items/work_${item.id}/Images/Primary`"
+          :src="embyImageUrl(`/emby/Items/work_${item.id}/Images/Primary`)"
           :alt="`${displayTitle(item)} 海报`"
           width="300"
           height="450"
