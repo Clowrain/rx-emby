@@ -164,7 +164,7 @@ pub(super) async fn list_admin_media(
         WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
           AND ($1::text IS NULL OR w.category = $1)
           AND ($2::text IS NULL OR w.media_type = $2)
-          AND ($3::text IS NULL OR w.title ILIKE $3 ESCAPE '\\' OR w.original_title ILIKE $3 ESCAPE '\\' OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
+          AND ($3::text IS NULL OR w.title ILIKE $3 ESCAPE '\' OR w.original_title ILIKE $3 ESCAPE '\' OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
         "#,
     )
     .bind(&q.category)
@@ -186,7 +186,7 @@ pub(super) async fn list_admin_media(
         WHERE EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = w.id AND f.is_ignored = FALSE)
           AND ($1::text IS NULL OR w.category = $1)
           AND ($2::text IS NULL OR w.media_type = $2)
-          AND ($3::text IS NULL OR w.title ILIKE $3 ESCAPE '\\' OR w.original_title ILIKE $3 ESCAPE '\\' OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
+          AND ($3::text IS NULL OR w.title ILIKE $3 ESCAPE '\' OR w.original_title ILIKE $3 ESCAPE '\' OR ($4::int4 IS NOT NULL AND w.tmdb_id = $4))
         ORDER BY {order_clause}
         LIMIT $5 OFFSET $6
         "#,
@@ -687,7 +687,7 @@ pub(super) async fn list_staging_folders(
         WHERE f.is_ignored = $1
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
-          AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\\' OR f.root_dir ILIKE $4 ESCAPE '\\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
+          AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\' OR f.root_dir ILIKE $4 ESCAPE '\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
           AND (
             $6::text IS NULL
             OR ($6 = 'type_conflict' AND f.conflict_reason LIKE '类型冲突%')
@@ -723,7 +723,7 @@ pub(super) async fn list_staging_folders(
         WHERE f.is_ignored = $1
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
-          AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\\' OR f.root_dir ILIKE $4 ESCAPE '\\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
+          AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\' OR f.root_dir ILIKE $4 ESCAPE '\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
           AND (
             $8::text IS NULL
             OR ($8 = 'type_conflict' AND f.conflict_reason LIKE '类型冲突%')
