@@ -74,26 +74,31 @@ pub(in crate::web::emby_api) async fn get_resume_items_inner(
     let access_scope = user_access_scope(state, user_id).await?;
     let mut history_sql = DynSql::new(
         r#"
-        SELECT ph.work_id, ph.tmdb_id, ph.media_type, ph.season_number, ph.episode_number,
-               ph.position_ticks, ph.duration_ticks, ph.is_played, ph.play_count, ph.last_played_at AS last_played_date,
+        SELECT work_id, tmdb_id, media_type, season_number, episode_number,
+               position_ticks, duration_ticks, is_played, play_count, last_played_date,
                COUNT(*) OVER() AS total_count
-        FROM play_histories ph
-        JOIN LATERAL (
-            SELECT m.id, m.media_type, m.tmdb_id, m.title, m.year, m.overview, m.poster_path, m.category,
-                   m.genres, m.networks, m.tags, m.rating
-            FROM media_works m
-            WHERE m.id = ph.work_id
-               OR (ph.tmdb_id IS NOT NULL AND m.tmdb_id = ph.tmdb_id AND m.media_type = ph.media_type)
-            ORDER BY (m.id = ph.work_id) DESC, m.id DESC
-            LIMIT 1
-        ) m ON TRUE
-        WHERE ph.hidden_from_resume = FALSE AND ph.user_id = $1 AND ph.is_played = FALSE AND ph.position_ticks > 0
-          AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)
-          AND (m.media_type = 'movie' OR EXISTS (
-              SELECT 1 FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id
-              WHERE f.work_id = m.id AND f.is_ignored = FALSE
-                AND sf.season_number = ph.season_number AND sf.episode_number = ph.episode_number
-          ))
+        FROM (
+            SELECT DISTINCT ON (m.id)
+                   ph.work_id, ph.tmdb_id, ph.media_type, ph.season_number, ph.episode_number,
+                   ph.position_ticks, ph.duration_ticks, ph.is_played, ph.play_count,
+                   ph.last_played_at AS last_played_date, ph.last_played_at
+            FROM play_histories ph
+            JOIN LATERAL (
+                SELECT m.id, m.media_type, m.tmdb_id, m.title, m.year, m.overview, m.poster_path, m.category,
+                       m.genres, m.networks, m.tags, m.rating
+                FROM media_works m
+                WHERE m.id = ph.work_id
+                   OR (ph.tmdb_id IS NOT NULL AND m.tmdb_id = ph.tmdb_id AND m.media_type = ph.media_type)
+                ORDER BY (m.id = ph.work_id) DESC, m.id DESC
+                LIMIT 1
+            ) m ON TRUE
+            WHERE ph.hidden_from_resume = FALSE AND ph.user_id = $1 AND ph.is_played = FALSE AND ph.position_ticks > 0
+              AND EXISTS (SELECT 1 FROM sync_folders f WHERE f.work_id = m.id AND f.is_ignored = FALSE)
+              AND (m.media_type = 'movie' OR EXISTS (
+                  SELECT 1 FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id
+                  WHERE f.work_id = m.id AND f.is_ignored = FALSE
+                    AND sf.season_number = ph.season_number AND sf.episode_number = ph.episode_number
+              ))
         "#,
     );
     history_sql.bind(user_id.to_string())?;
@@ -133,7 +138,7 @@ pub(in crate::web::emby_api) async fn get_resume_items_inner(
             " AND (m.title ILIKE {pattern_param} OR EXISTS (SELECT 1 FROM work_episodes we WHERE we.work_id = m.id AND we.season_number = ph.season_number AND we.episode_number = ph.episode_number AND we.title ILIKE {pattern_param}) OR EXISTS (SELECT 1 FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE f.work_id = m.id AND f.is_ignored = FALSE AND sf.season_number = ph.season_number AND sf.episode_number = ph.episode_number AND sf.file_name ILIKE {pattern_param}))"
         ));
     }
-    history_sql.push(" ORDER BY ph.last_played_at DESC");
+    history_sql.push(" ORDER BY m.id, ph.last_played_at DESC) deduped ORDER BY last_played_at DESC");
     history_sql.push_pagination(limit, q.start_index.max(0))?;
     let histories: Vec<HistoryRecordRow> =
         sqlx::query_as_with::<sqlx::Postgres, HistoryRecordRow, _>(
@@ -492,6 +497,19 @@ mod tests {
         assert!(sql.contains(&format!("DISTINCT ON ({dedup_key})")));
         assert!(sql.contains(&format!("ORDER BY {dedup_key}, ph.last_played_at DESC")));
         assert!(!sql.contains("m.media_type = 'movie'"));
+    }
+
+    #[test]
+    fn resume_deduplicates_by_work_id_and_orders_by_latest_play() {
+        let source = include_str!("history.rs");
+        let resume = source
+            .find("pub(in crate::web::emby_api) async fn get_resume_items_inner")
+            .unwrap();
+        let next_up = source.find("pub async fn get_next_up_items").unwrap();
+        let sql = &source[resume..next_up];
+        assert!(sql.contains("DISTINCT ON (m.id)"));
+        assert!(sql.contains("ORDER BY m.id, ph.last_played_at DESC"));
+        assert!(sql.contains("ORDER BY last_played_at DESC"));
     }
 
     #[test]

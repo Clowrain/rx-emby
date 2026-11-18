@@ -51,6 +51,7 @@ pub(in crate::web::emby_api) fn build_episode_item_json(input: EpisodeJsonInput)
         "ServerId": server_id,
         "SeriesId": format!("work_{work_id}"),
         "SeasonId": format!("season_{work_id}_{season_number}"),
+        "ParentId": format!("season_{work_id}_{season_number}"),
         "Type": "Episode",
         "IsFolder": false,
         "IndexNumber": episode_number,

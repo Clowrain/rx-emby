@@ -597,7 +597,7 @@ pub fn build_alist_client() -> Result<Client> {
     Client::builder()
         .no_proxy() // 内网 AList 强制直连，绕过系统环境变量代理
         .redirect(reqwest::redirect::Policy::none()) // 禁用自动重定向以便捕获 Location
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(35))
         .tcp_keepalive(Duration::from_secs(60))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(32)
