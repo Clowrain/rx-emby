@@ -102,7 +102,10 @@ pub(super) async fn get_search_hints(
         sqlx::query_as_with::<sqlx::Postgres, HintRow, _>(&item_sql.sql, item_sql.args)
             .fetch_all(&state.db)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| {
+                tracing::error!("客户端搜索主条目失败 (term={}): {}", term, e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?
     } else {
         Vec::new()
     };
@@ -151,7 +154,10 @@ pub(super) async fn get_search_hints(
         sqlx::query_as_with::<sqlx::Postgres, HintRow, _>(&episode_sql.sql, episode_sql.args)
             .fetch_all(&state.db)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| {
+                tracing::error!("客户端搜索分集失败 (term={}): {}", term, e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?
     } else {
         Vec::new()
     };
@@ -210,14 +216,17 @@ fn parse_type_filter(
         .filter(|value| !value.is_empty())
     {
         has_value = true;
-        let normalized: &'static str = match value.to_ascii_lowercase().as_str() {
-            "movie" => "Movie",
-            "series" | "tv" => "Series",
-            "episode" => "Episode",
+        let expanded: &[&'static str] = match value.to_ascii_lowercase().as_str() {
+            "movie" => &["Movie"],
+            "series" | "tv" => &["Series"],
+            "episode" => &["Episode"],
+            "video" => &["Movie", "Series", "Episode"],
             _ => continue,
         };
-        if !types.contains(&normalized) {
-            types.push(normalized);
+        for normalized in expanded {
+            if !types.contains(normalized) {
+                types.push(normalized);
+            }
         }
     }
     has_value.then_some(types)
@@ -243,6 +252,10 @@ mod tests {
         assert_eq!(
             parse_type_filter(None, Some("Series")),
             Some(vec!["Series"])
+        );
+        assert_eq!(
+            parse_type_filter(None, Some("Video")),
+            Some(vec!["Movie", "Series", "Episode"])
         );
         assert_eq!(parse_type_filter(None, None), None);
     }

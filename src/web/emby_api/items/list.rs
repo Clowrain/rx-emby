@@ -428,7 +428,10 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
         sqlx::query_as_with::<Postgres, MediaListRow, _>(&sql.sql, sql.args)
             .fetch_all(&state.db)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!("查询媒体列表失败: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
 
     let total = if rows.is_empty() && offset == 0 && limit > 0 {
         0
