@@ -128,6 +128,9 @@ export const adminApi = {
     const qs = new URLSearchParams(params).toString()
     return requestJson(`/api/admin/staging/folders?${qs}`)
   },
+  listStagingFolderFiles(folderId) {
+    return requestJson(`/api/admin/staging/folders/${folderId}/files`)
+  },
   scrapeStagingFolder(folderId) {
     return requestJson(`/api/admin/staging/folders/${folderId}/scrape`, { method: 'POST' })
   },

@@ -24,12 +24,15 @@ import {
   Send,
   Eye,
   EyeOff,
-  FolderGit2
+  FolderGit2,
+  ExternalLink,
+  FileSearch
 } from 'lucide-vue-next'
 import { adminApi } from '../api/admin'
 import { useToast } from '../composables/useToast'
 import PosterCard from './poster-wall/PosterCard.vue'
 import BindTmdbModal from './poster-wall/BindTmdbModal.vue'
+import StagingInspectorDrawer from './poster-wall/StagingInspectorDrawer.vue'
 
 const props = defineProps({
   initialCategory: { type: String, default: '' },
@@ -77,10 +80,18 @@ const filters = reactive({
   viewMode: 'works', // 'works' | 'staging'
   isIgnored: 'false',
   stagingState: 'pending',
+  reasonKind: '',
   category: props.initialCategory || '',
   keyword: '',
   sortBy: 'updated_at',
   sortOrder: 'desc'
+})
+
+const reasonCounts = ref(null)
+const inspectDrawer = reactive({
+  folder: null,
+  files: [],
+  loading: false
 })
 
 const bindModal = reactive({
@@ -112,6 +123,12 @@ function selectCategory(val) {
 function selectStagingTab(st) {
   filters.isIgnored = st.isIgnored
   filters.stagingState = st.state
+  filters.reasonKind = ''
+  resetAndLoad()
+}
+
+function selectReasonKind(kind) {
+  filters.reasonKind = filters.reasonKind === kind ? '' : kind
   resetAndLoad()
 }
 
@@ -155,10 +172,12 @@ async function loadData({ silent = false } = {}) {
       }
       if (filters.category !== '') params.category = filters.category
       if (filters.keyword.trim() !== '') params.keyword = filters.keyword.trim()
+      if (filters.reasonKind !== '') params.reason_kind = filters.reasonKind
 
       const data = await adminApi.listStagingFolders(params)
       stagingFolders.value = data.items || []
       total.value = data.total ?? stagingFolders.value.length
+      reasonCounts.value = data.reason_counts || null
     }
   } catch (err) {
     toast.error('加载列表失败：' + err.message)
@@ -289,6 +308,40 @@ function openBindStagingModal(folder) {
   bindModal.tmdbId = folder.hint_tmdb_id || ''
   bindModal.mediaType = folder.media_type || ''
   bindModal.visible = true
+}
+
+async function openInspectDrawer(folder) {
+  inspectDrawer.folder = folder
+  inspectDrawer.files = []
+  inspectDrawer.loading = true
+  try {
+    const data = await adminApi.listStagingFolderFiles(folder.id)
+    inspectDrawer.files = data.files || []
+  } catch (err) {
+    toast.error('加载文件明细失败：' + err.message)
+  } finally {
+    inspectDrawer.loading = false
+  }
+}
+
+async function handleAcceptHintTmdb(folder, overrideMediaType = null) {
+  if (!folder.hint_tmdb_id) return
+  scrapingId.value = folder.id
+  try {
+    const res = await adminApi.promoteStagingFolder(folder.id, {
+      tmdb_id: folder.hint_tmdb_id,
+      media_type: overrideMediaType || folder.media_type || null
+    })
+    toast.success(res.message)
+    if (inspectDrawer.folder?.id === folder.id) {
+      inspectDrawer.folder = null
+    }
+    await loadData({ silent: true })
+  } catch (err) {
+    toast.error('采纳发布失败：' + err.message)
+  } finally {
+    scrapingId.value = null
+  }
 }
 
 async function submitBindTmdb() {
@@ -475,6 +528,101 @@ onMounted(() => {
             <RotateCcw class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
             <span>重试全部失败/存疑项</span>
           </button>
+
+          <!-- 原因分诊胶囊栏（仅在校验存疑/未匹配下展示） -->
+          <div
+            v-if="reasonCounts && (filters.stagingState === 'conflict' || filters.stagingState === 'failed')"
+            class="w-full flex flex-wrap items-center gap-1.5 pt-2 mt-1 border-t border-slate-800/60"
+          >
+            <span class="text-[11px] text-slate-400 mr-1">原因分诊：</span>
+            <button
+              type="button"
+              @click="selectReasonKind('')"
+              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors"
+              :class="
+                filters.reasonKind === ''
+                  ? 'bg-indigo-600/25 border-indigo-500/50 text-indigo-200'
+                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+              "
+            >
+              全部
+            </button>
+            <template v-if="filters.stagingState === 'conflict'">
+              <button
+                type="button"
+                @click="selectReasonKind('type_conflict')"
+                class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+                :class="
+                  filters.reasonKind === 'type_conflict'
+                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                    : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+                "
+              >
+                类型冲突 ({{ reasonCounts.type_conflict }})
+              </button>
+              <button
+                type="button"
+                @click="selectReasonKind('title_conflict')"
+                class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+                :class="
+                  filters.reasonKind === 'title_conflict'
+                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                    : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+                "
+              >
+                片名差异 ({{ reasonCounts.title_conflict }})
+              </button>
+              <button
+                type="button"
+                @click="selectReasonKind('year_conflict')"
+                class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+                :class="
+                  filters.reasonKind === 'year_conflict'
+                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                    : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+                "
+              >
+                年份偏差 ({{ reasonCounts.year_conflict }})
+              </button>
+            </template>
+            <button
+              type="button"
+              @click="selectReasonKind('has_hint')"
+              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+              :class="
+                filters.reasonKind === 'has_hint'
+                  ? 'bg-sky-500/20 border-sky-500/50 text-sky-200'
+                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+              "
+            >
+              带提示 TMDB ({{ reasonCounts.has_hint }})
+            </button>
+            <button
+              type="button"
+              @click="selectReasonKind('no_hint')"
+              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+              :class="
+                filters.reasonKind === 'no_hint'
+                  ? 'bg-slate-700/60 border-slate-500/50 text-slate-200'
+                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+              "
+            >
+              无提示 TMDB ({{ reasonCounts.no_hint }})
+            </button>
+            <button
+              v-if="filters.stagingState === 'failed' && reasonCounts.no_reason > 0"
+              type="button"
+              @click="selectReasonKind('no_reason')"
+              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+              :class="
+                filters.reasonKind === 'no_reason'
+                  ? 'bg-rose-500/20 border-rose-500/50 text-rose-200'
+                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+              "
+            >
+              历史无报错记录 ({{ reasonCounts.no_reason }})
+            </button>
+          </div>
         </div>
         <div v-else class="text-xs text-slate-400">
           仅展示已通过校验并入库的正式作品（点击卡片可查看关联目录并调整多版本权重）
@@ -593,8 +741,29 @@ onMounted(() => {
               <span class="px-2 py-0.5 rounded-md text-[11px] font-mono bg-emerald-950/80 text-emerald-300 border border-emerald-500/30">
                 {{ f.file_count }} 个视频
               </span>
-              <span v-if="f.hint_tmdb_id" class="px-2 py-0.5 rounded-md text-[11px] font-mono bg-sky-950/80 text-sky-300 border border-sky-500/30">
-                提示 TMDB #{{ f.hint_tmdb_id }}
+              <span
+                v-if="f.hint_tmdb_id"
+                class="inline-flex items-center rounded-md text-[11px] font-mono bg-sky-950/80 border border-sky-500/30 overflow-hidden"
+              >
+                <a
+                  :href="`https://www.themoviedb.org/${f.media_type === 'tv' ? 'tv' : 'movie'}/${f.hint_tmdb_id}`"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="px-2 py-0.5 text-sky-300 hover:text-sky-200 inline-flex items-center gap-1"
+                  title="在 TMDB 查看该候选条目"
+                >
+                  <span>提示 TMDB #{{ f.hint_tmdb_id }}</span>
+                  <ExternalLink class="w-3 h-3" aria-hidden="true" />
+                </a>
+                <button
+                  type="button"
+                  @click="handleAcceptHintTmdb(f)"
+                  :disabled="scrapingId === f.id"
+                  class="cursor-pointer px-2 py-0.5 bg-sky-600/30 hover:bg-sky-600/50 text-sky-200 border-l border-sky-500/30 font-sans font-medium disabled:opacity-50"
+                  title="直接按该提示 TMDB ID 绑定发布"
+                >
+                  采纳
+                </button>
               </span>
               <span
                 class="px-2 py-0.5 rounded-md text-[11px] font-medium"
@@ -607,19 +776,40 @@ onMounted(() => {
               >
                 {{ f.scrape_state }}
               </span>
+              <span v-if="f.scrape_state === 'failed' && f.retry_count > 0" class="text-[11px] font-mono text-slate-400">
+                已重试 {{ f.retry_count }} 次
+              </span>
             </div>
 
             <div class="text-xs font-mono text-slate-400 break-all">{{ f.folder_path }}</div>
 
             <div
-              v-if="f.conflict_reason"
-              class="text-xs text-amber-300 bg-amber-950/50 border border-amber-500/30 rounded-xl px-3 py-1.5"
+              v-if="f.conflict_reason || f.scrape_state === 'failed'"
+              role="alert"
+              class="text-xs rounded-xl px-3 py-1.5 border"
+              :class="
+                f.scrape_state === 'failed'
+                  ? 'text-rose-200 bg-rose-950/50 border-rose-500/30'
+                  : 'text-amber-300 bg-amber-950/50 border-amber-500/30'
+              "
             >
-              校验冲突原因：{{ f.conflict_reason }}
+              {{ f.scrape_state === 'failed' ? '失败原因：' : '校验冲突原因：' }}
+              {{
+                f.conflict_reason ||
+                  '历史未匹配记录（暂无详细报错，可点击「立即刮削」或「排查文件」定位原因）'
+              }}
             </div>
           </div>
 
           <div class="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              @click="openInspectDrawer(f)"
+              class="cursor-pointer px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-medium flex items-center gap-1.5"
+            >
+              <FileSearch class="w-3.5 h-3.5" aria-hidden="true" />
+              <span>排查文件</span>
+            </button>
             <button
               type="button"
               @click="handleScrapeStagingFolder(f)"
@@ -673,6 +863,19 @@ onMounted(() => {
       :binding="binding"
       @close="bindModal.visible = false"
       @submit="submitBindTmdb"
+    />
+
+    <StagingInspectorDrawer
+      :folder="inspectDrawer.folder"
+      :files="inspectDrawer.files"
+      :files-loading="inspectDrawer.loading"
+      :busy="inspectDrawer.folder ? scrapingId === inspectDrawer.folder.id : false"
+      @close="inspectDrawer.folder = null"
+      @scrape="handleScrapeStagingFolder"
+      @open-bind="openBindStagingModal"
+      @accept-hint="handleAcceptHintTmdb($event)"
+      @accept-hint-movie="handleAcceptHintTmdb($event, 'movie')"
+      @publish-without-tmdb="handlePublishWithoutTmdb"
     />
   </section>
 </template>

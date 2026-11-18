@@ -609,6 +609,7 @@ pub(super) struct StagingFoldersQuery {
     is_ignored: Option<bool>,
     category: Option<String>,
     keyword: Option<String>,
+    reason_kind: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -625,6 +626,7 @@ struct StagingFolderRow {
     scrape_state: String,
     conflict_reason: Option<String>,
     retry_count: i32,
+    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
     is_locked: bool,
     is_ignored: bool,
     priority_boost: i32,
@@ -632,6 +634,16 @@ struct StagingFolderRow {
     work_title: Option<String>,
     file_count: i64,
     updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct StagingReasonCounts {
+    type_conflict: i64,
+    title_conflict: i64,
+    year_conflict: i64,
+    has_hint: i64,
+    no_hint: i64,
+    no_reason: i64,
 }
 
 pub(super) async fn list_staging_folders(
@@ -661,6 +673,12 @@ pub(super) async fn list_staging_folders(
         )
     });
     let kw_tmdb_id: Option<i32> = kw_raw.and_then(|s| s.parse::<i32>().ok());
+    let reason_kind = q
+        .reason_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let total: i64 = sqlx::query_scalar(
         r#"
@@ -670,6 +688,15 @@ pub(super) async fn list_staging_folders(
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
           AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\\' OR f.root_dir ILIKE $4 ESCAPE '\\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
+          AND (
+            $6::text IS NULL
+            OR ($6 = 'type_conflict' AND f.conflict_reason LIKE '类型冲突%')
+            OR ($6 = 'title_conflict' AND f.conflict_reason LIKE '片名冲突%')
+            OR ($6 = 'year_conflict' AND f.conflict_reason LIKE '年份冲突%')
+            OR ($6 = 'has_hint' AND f.parsed_tmdb_id IS NOT NULL)
+            OR ($6 = 'no_hint' AND f.parsed_tmdb_id IS NULL)
+            OR ($6 = 'no_reason' AND f.conflict_reason IS NULL)
+          )
         "#,
     )
     .bind(ignored_filter)
@@ -677,6 +704,7 @@ pub(super) async fn list_staging_folders(
     .bind(&q.category)
     .bind(&kw)
     .bind(kw_tmdb_id)
+    .bind(&reason_kind)
     .fetch_one(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -686,7 +714,7 @@ pub(super) async fn list_staging_folders(
         SELECT
             f.id, f.root_dir AS folder_path, f.clean_title AS parsed_title, f.year AS parsed_year, f.parsed_tmdb_id AS hint_tmdb_id,
             f.inferred_media_type AS media_type, f.category, f.scrape_state, f.conflict_reason,
-            f.retry_count::int4 AS retry_count, f.is_locked, f.is_ignored, f.priority_boost,
+            f.retry_count::int4 AS retry_count, f.next_retry_at, f.is_locked, f.is_ignored, f.priority_boost,
             f.work_id, w.title AS work_title,
             (SELECT COUNT(*) FROM sync_files sf WHERE sf.folder_id = f.id) AS file_count,
             f.updated_at
@@ -696,6 +724,15 @@ pub(super) async fn list_staging_folders(
           AND ($2::text IS NULL OR f.scrape_state = $2)
           AND ($3::text IS NULL OR f.category = $3)
           AND ($4::text IS NULL OR f.clean_title ILIKE $4 ESCAPE '\\' OR f.root_dir ILIKE $4 ESCAPE '\\' OR ($5::int4 IS NOT NULL AND f.parsed_tmdb_id = $5))
+          AND (
+            $8::text IS NULL
+            OR ($8 = 'type_conflict' AND f.conflict_reason LIKE '类型冲突%')
+            OR ($8 = 'title_conflict' AND f.conflict_reason LIKE '片名冲突%')
+            OR ($8 = 'year_conflict' AND f.conflict_reason LIKE '年份冲突%')
+            OR ($8 = 'has_hint' AND f.parsed_tmdb_id IS NOT NULL)
+            OR ($8 = 'no_hint' AND f.parsed_tmdb_id IS NULL)
+            OR ($8 = 'no_reason' AND f.conflict_reason IS NULL)
+          )
         ORDER BY f.updated_at DESC, f.id DESC
         LIMIT $6 OFFSET $7
         "#,
@@ -707,11 +744,75 @@ pub(super) async fn list_staging_folders(
     .bind(kw_tmdb_id)
     .bind(limit)
     .bind(offset)
+    .bind(&reason_kind)
     .fetch_all(&state.db)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(json!({ "items": items, "total": total })))
+    let reason_counts: Option<StagingReasonCounts> = if matches!(state_filter.as_deref(), Some("conflict" | "failed")) {
+        Some(
+            sqlx::query_as(
+                r#"
+                SELECT
+                    COUNT(*) FILTER (WHERE f.conflict_reason LIKE '类型冲突%') AS type_conflict,
+                    COUNT(*) FILTER (WHERE f.conflict_reason LIKE '片名冲突%') AS title_conflict,
+                    COUNT(*) FILTER (WHERE f.conflict_reason LIKE '年份冲突%') AS year_conflict,
+                    COUNT(*) FILTER (WHERE f.parsed_tmdb_id IS NOT NULL) AS has_hint,
+                    COUNT(*) FILTER (WHERE f.parsed_tmdb_id IS NULL) AS no_hint,
+                    COUNT(*) FILTER (WHERE f.conflict_reason IS NULL) AS no_reason
+                FROM sync_folders f
+                WHERE f.is_ignored = $1
+                  AND f.scrape_state = $2
+                  AND ($3::text IS NULL OR f.category = $3)
+                "#,
+            )
+            .bind(ignored_filter)
+            .bind(&state_filter)
+            .bind(&q.category)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    Ok(Json(json!({ "items": items, "total": total, "reason_counts": reason_counts })))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct StagingFileRow {
+    id: i64,
+    file_name: String,
+    alist_path: String,
+    season_number: i32,
+    episode_number: i32,
+    version_tag: String,
+    container: String,
+    file_size_bytes: Option<i64>,
+    subtitles: Vec<String>,
+}
+
+pub(super) async fn list_staging_folder_files(
+    State(state): State<Arc<AppState>>,
+    Path(folder_id): Path<i64>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let files: Vec<StagingFileRow> = sqlx::query_as(
+        r#"
+        SELECT id, file_name, alist_path, season_number, episode_number,
+               version_tag, container, file_size_bytes, subtitles
+        FROM sync_files
+        WHERE folder_id = $1
+        ORDER BY season_number ASC, episode_number ASC, id ASC
+        LIMIT 500
+        "#,
+    )
+    .bind(folder_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "files": files })))
 }
 
 pub(super) async fn scrape_staging_folder(

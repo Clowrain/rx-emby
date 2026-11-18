@@ -63,6 +63,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(media::list_staging_folders),
         )
         .route(
+            "/api/admin/staging/folders/:id/files",
+            get(media::list_staging_folder_files),
+        )
+        .route(
             "/api/admin/staging/folders/:id/scrape",
             post(media::scrape_staging_folder),
         )

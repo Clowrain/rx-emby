@@ -822,10 +822,12 @@ pub async fn scrape_single_folder_with_mode(
                 _ => 168,
             };
             let next_at = Utc::now() + ChronoDuration::hours(backoff_hours);
+            let fail_reason: String = format!("{:#}", e).chars().take(500).collect();
 
             sqlx::query(
-                "UPDATE sync_folders SET scrape_state = 'failed', retry_count = $1, next_retry_at = $2, updated_at = NOW() WHERE id = $3",
+                "UPDATE sync_folders SET scrape_state = 'failed', conflict_reason = $1, retry_count = $2, next_retry_at = $3, updated_at = NOW() WHERE id = $4",
             )
+            .bind(&fail_reason)
             .bind(next_retry)
             .bind(next_at)
             .bind(folder.id)
