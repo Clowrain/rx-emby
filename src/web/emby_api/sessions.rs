@@ -380,6 +380,9 @@ async fn broadcast_playback_user_data(
     let (Some(item_id), Some(target)) = (item_id, target) else {
         return;
     };
+    if !state.session_hub.has_user_connections(user_id) {
+        return;
+    }
     let media = PlayedHistoryMedia {
         work_id: target.work_id,
         tmdb_id: target.tmdb_id,
@@ -864,11 +867,34 @@ pub(super) async fn session_progress_with_identity(
 
     // A completed episode from an earlier session is a rewatch; count it only on
     // this session's first completion, never on repeated >=90% heartbeats.
-    let first_completion = auto_completed
-        && !state
+    let claimed_completion = if auto_completed && body.position_ticks > 0 && target.is_some() {
+        let mut entry = state
             .sessions
-            .get(&sid)
-            .is_some_and(|session| session.completed_in_session);
+            .entry(sid.clone())
+            .or_insert_with(|| crate::state::PlaybackSession {
+                session_id: sid.clone(),
+                user_id: user_id.clone(),
+                device_id: device_id.clone(),
+                device_name: device_name.clone(),
+                client_name: client_name.clone(),
+                current_episode_id: ep_id,
+                position_ticks: body.position_ticks,
+                next_ep_prewarmed: false,
+                completed_in_session: false,
+                last_activity: std::time::Instant::now(),
+            });
+        if entry.user_id != user_id {
+            return StatusCode::FORBIDDEN;
+        }
+        if entry.completed_in_session {
+            false
+        } else {
+            entry.completed_in_session = true;
+            true
+        }
+    } else {
+        false
+    };
 
     // 2. 持久化播放进度到 play_histories 表
     if body.position_ticks > 0 {
@@ -885,19 +911,7 @@ pub(super) async fn session_progress_with_identity(
             } else {
                 body.position_ticks
             };
-            let was_played: Result<bool, StatusCode> = sqlx::query_scalar(
-                "SELECT COALESCE(BOOL_OR(is_played), FALSE) FROM play_histories WHERE user_id=$1 AND (work_id=$2 OR ($3::int4 IS NOT NULL AND tmdb_id=$3 AND media_type=$4)) AND season_number=$5 AND episode_number=$6",
-            )
-            .bind(&user_id).bind(mid).bind(tmdb_id).bind(&mtype).bind(snum).bind(epnum)
-            .fetch_one(&state.db).await.map_err(|error| {
-                tracing::error!("读取播放完成状态失败: {}", error);
-                StatusCode::INTERNAL_SERVER_ERROR
-            });
-            let was_played = match was_played {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            if upsert_play_history(
+            if upsert_play_history_with_rewatch(
                 &state,
                 PlayHistoryUpsert {
                     user_id: &user_id,
@@ -911,20 +925,18 @@ pub(super) async fn session_progress_with_identity(
                     is_played: auto_completed,
                     overwrite_played: false,
                 },
+                claimed_completion,
             )
             .await
             .is_err()
             {
+                if claimed_completion {
+                    if let Some(mut entry) = state.sessions.get_mut(&sid) {
+                        entry.completed_in_session = false;
+                    }
+                }
                 tracing::error!("写入播放进度失败");
                 return StatusCode::INTERNAL_SERVER_ERROR;
-            }
-            if first_completion && was_played {
-                if let Err(error) = sqlx::query("UPDATE play_histories SET play_count=LEAST(play_count::bigint + 1, 2147483647)::int WHERE user_id=$1 AND (work_id=$2 OR ($3::int4 IS NOT NULL AND tmdb_id=$3 AND media_type=$4)) AND season_number=$5 AND episode_number=$6")
-                    .bind(&user_id).bind(mid).bind(tmdb_id).bind(&mtype).bind(snum).bind(epnum)
-                    .execute(&state.db).await {
-                    tracing::error!("增加重播次数失败: {}", error);
-                    return StatusCode::INTERNAL_SERVER_ERROR;
-                }
             }
         }
     }
@@ -1345,14 +1357,13 @@ async fn resolve_source_item_target(
     else {
         return Ok(None);
     };
-    let Some((wid, snum, epnum)): Option<(i64, i32, i32)> = sqlx::query_as(
-        "SELECT f.work_id, sf.season_number, sf.episode_number FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id WHERE sf.id = $1 AND f.work_id IS NOT NULL AND f.is_ignored = FALSE",
-    ).bind(sid).fetch_optional(&state.db).await? else { return Ok(None) };
-    let Some((tmdb_id, mtype)): Option<(Option<i32>, String)> =
-        sqlx::query_as("SELECT tmdb_id, media_type FROM media_works WHERE id = $1")
-            .bind(wid)
-            .fetch_optional(&state.db)
-            .await?
+    let Some((wid, snum, epnum, tmdb_id, mtype)): Option<(i64, i32, i32, Option<i32>, String)> =
+        sqlx::query_as(
+            "SELECT f.work_id, sf.season_number, sf.episode_number, m.tmdb_id, m.media_type FROM sync_files sf JOIN sync_folders f ON f.id = sf.folder_id JOIN media_works m ON m.id = f.work_id WHERE sf.id = $1 AND f.work_id IS NOT NULL AND f.is_ignored = FALSE",
+        )
+        .bind(sid)
+        .fetch_optional(&state.db)
+        .await?
     else {
         return Ok(None);
     };
@@ -1592,6 +1603,14 @@ async fn upsert_play_history(
     state: &AppState,
     input: PlayHistoryUpsert<'_>,
 ) -> Result<(), sqlx::Error> {
+    upsert_play_history_with_rewatch(state, input, false).await
+}
+
+async fn upsert_play_history_with_rewatch(
+    state: &AppState,
+    input: PlayHistoryUpsert<'_>,
+    increment_rewatch: bool,
+) -> Result<(), sqlx::Error> {
     let PlayHistoryUpsert {
         user_id,
         work_id,
@@ -1656,7 +1675,7 @@ async fn upsert_play_history(
         }
         let conflict_clause = history_conflict_clause(tmdb_id);
         let insert_sql = format!(
-            "INSERT INTO play_histories (user_id, work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played, play_count, last_played_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $9 THEN 1 ELSE 0 END,NOW()) {conflict_clause} SET hidden_from_resume = FALSE, play_count = LEAST(play_histories.play_count::bigint + CASE WHEN EXCLUDED.is_played AND NOT play_histories.is_played THEN 1 ELSE 0 END, 2147483647)::int, work_id = EXCLUDED.work_id, tmdb_id = COALESCE(EXCLUDED.tmdb_id, play_histories.tmdb_id), position_ticks = EXCLUDED.position_ticks, duration_ticks = CASE WHEN EXCLUDED.duration_ticks > 0 THEN EXCLUDED.duration_ticks ELSE play_histories.duration_ticks END, is_played = CASE WHEN $10 THEN EXCLUDED.is_played ELSE (EXCLUDED.is_played OR play_histories.is_played) END, last_played_at = NOW()"
+            "INSERT INTO play_histories (user_id, work_id, tmdb_id, media_type, season_number, episode_number, position_ticks, duration_ticks, is_played, play_count, last_played_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $9 THEN 1 ELSE 0 END,NOW()) {conflict_clause} SET hidden_from_resume = FALSE, play_count = LEAST(play_histories.play_count::bigint + CASE WHEN EXCLUDED.is_played AND (NOT play_histories.is_played OR $11) THEN 1 ELSE 0 END, 2147483647)::int, work_id = EXCLUDED.work_id, tmdb_id = COALESCE(EXCLUDED.tmdb_id, play_histories.tmdb_id), position_ticks = EXCLUDED.position_ticks, duration_ticks = CASE WHEN EXCLUDED.duration_ticks > 0 THEN EXCLUDED.duration_ticks ELSE play_histories.duration_ticks END, is_played = CASE WHEN $10 THEN EXCLUDED.is_played ELSE (EXCLUDED.is_played OR play_histories.is_played) END, last_played_at = NOW()"
         );
         sqlx::query(&insert_sql)
             .bind(user_id)
@@ -1669,6 +1688,7 @@ async fn upsert_play_history(
             .bind(duration_ticks)
             .bind(is_played)
             .bind(overwrite_played)
+            .bind(increment_rewatch)
             .execute(&mut *tx)
             .await?;
         if media_type == "tv" && overwrite_played && !is_played && episode_number > 0 {

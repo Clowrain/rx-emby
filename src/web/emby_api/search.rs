@@ -98,11 +98,14 @@ pub(super) async fn get_search_hints(
     item_sql.bind(include_items)?;
     access_scope.push_sql_predicate(&mut item_sql)?;
     item_sql.push(" ORDER BY m.rating DESC, m.year DESC NULLS LAST, m.id DESC LIMIT $3");
-    let items: Vec<HintRow> =
+    let items: Vec<HintRow> = if include_items {
         sqlx::query_as_with::<sqlx::Postgres, HintRow, _>(&item_sql.sql, item_sql.args)
             .fetch_all(&state.db)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        Vec::new()
+    };
 
     // 文件名独立 EXISTS 保持 trigram 索引谓词可见；目录必须非忽略。
     let mut episode_sql = DynSql::new(
@@ -144,11 +147,14 @@ pub(super) async fn get_search_hints(
     access_scope.push_sql_predicate(&mut episode_sql)?;
     episode_sql
         .push(" ORDER BY m.rating DESC, we.season_number ASC, we.episode_number ASC LIMIT $2");
-    let episodes: Vec<HintRow> =
+    let episodes: Vec<HintRow> = if include_episodes {
         sqlx::query_as_with::<sqlx::Postgres, HintRow, _>(&episode_sql.sql, episode_sql.args)
             .fetch_all(&state.db)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        Vec::new()
+    };
 
     let hints: Vec<Value> = items
         .into_iter()

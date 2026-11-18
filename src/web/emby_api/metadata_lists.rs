@@ -428,33 +428,33 @@ async fn metadata_by_name(
         .fetch_one(&state.db)
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let resolved_name = if exists {
+    let name = if exists {
         name.to_string()
     } else {
         let tag_map = cached_tag_lookup_map(state, col_expr, prefix).await?;
-        tag_map
+        let resolved = tag_map
             .get(name)
             .cloned()
-            .ok_or((StatusCode::NOT_FOUND, "元数据条目不存在".to_string()))?
+            .ok_or((StatusCode::NOT_FOUND, "元数据条目不存在".to_string()))?;
+        let mut sql = DynSql::new(
+            "SELECT EXISTS(SELECT 1 FROM media_works m JOIN sync_folders f ON f.work_id=m.id AND f.is_ignored=FALSE WHERE ",
+        );
+        let param = sql.bind(resolved.clone())?;
+        sql.push(&format!("{param} = ANY({col_expr})"));
+        scope.push_sql_predicate(&mut sql)?;
+        sql.push(")");
+        let visible: bool = sqlx::query_scalar_with(&sql.sql, sql.args)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        if !visible {
+            return Err((StatusCode::NOT_FOUND, "元数据条目不存在".to_string()));
+        }
+        resolved
     };
-    let name = resolved_name.as_str();
-    let mut sql = DynSql::new(
-        "SELECT EXISTS(SELECT 1 FROM media_works m JOIN sync_folders f ON f.work_id=m.id AND f.is_ignored=FALSE WHERE ",
-    );
-    let param = sql.bind(name.to_string())?;
-    sql.push(&format!("{param} = ANY({col_expr})"));
-    scope.push_sql_predicate(&mut sql)?;
-    sql.push(")");
-    let exists: bool = sqlx::query_scalar_with(&sql.sql, sql.args)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    if !exists {
-        return Err((StatusCode::NOT_FOUND, "元数据条目不存在".to_string()));
-    }
     Ok(Json(
         json!({"Name": name, "ServerId": state.config.load().server_id,
-        "Id": stable_tag_id(prefix, name), "Type": emby_type}),
+        "Id": stable_tag_id(prefix, &name), "Type": emby_type}),
     ))
 }
 
@@ -594,11 +594,17 @@ pub(super) async fn get_years(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        sql.push_bind_push(
-            " AND m.year::text ILIKE ",
-            format!("%{}%", escape_like(term)),
-            "",
-        )?;
+        if term.len() == 4 && term.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(year_num) = term.parse::<i32>() {
+                sql.push_bind_push(" AND m.year = ", year_num, "")?;
+            }
+        } else {
+            sql.push_bind_push(
+                " AND m.year::text ILIKE ",
+                format!("%{}%", escape_like(term)),
+                "",
+            )?;
+        }
     }
     sql.push(") years ORDER BY year DESC");
     sql.push_pagination(q.limit.unwrap_or(200).clamp(1, 500), q.start_index.max(0))?;

@@ -163,6 +163,12 @@ impl SessionHub {
             }
         });
     }
+
+    pub fn has_user_connections(&self, user_id: &str) -> bool {
+        self.connections
+            .iter()
+            .any(|entry| entry.user_id == user_id)
+    }
 }
 
 pub struct AlistAuthManager {

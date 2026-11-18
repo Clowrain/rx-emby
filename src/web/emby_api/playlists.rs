@@ -544,7 +544,7 @@ fn paginate_visible_entries(
     let entries: Vec<(i64, String)> = visible_entries
         .into_iter()
         .skip(offset)
-        .take(limit.unwrap_or(usize::MAX))
+        .take(limit.unwrap_or(5000).min(5000))
         .collect();
     let mut unique_page_ids = Vec::with_capacity(entries.len());
     let mut seen_page_ids = HashSet::with_capacity(entries.len());

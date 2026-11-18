@@ -412,19 +412,7 @@ async fn get_season_detail(
         return Err((StatusCode::NOT_FOUND, "条目不存在".to_string()));
     };
 
-    let child_count: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(DISTINCT (sf.season_number, sf.episode_number))
-        FROM sync_files sf
-        JOIN sync_folders f ON f.id = sf.folder_id
-        WHERE f.work_id = $1 AND f.is_ignored = FALSE AND sf.season_number = $2
-        "#,
-    )
-    .bind(wid)
-    .bind(snum)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let child_count = present.len() as i64;
 
     let season_name = name.unwrap_or_else(|| {
         if snum == 0 {

@@ -430,7 +430,9 @@ pub(in crate::web::emby_api) async fn get_user_items_inner(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let total = if !rows.is_empty() && (rows.len() as i64) < limit {
+    let total = if rows.is_empty() && offset == 0 && limit > 0 {
+        0
+    } else if !rows.is_empty() && (rows.len() as i64) < limit {
         offset + rows.len() as i64
     } else {
         let mut count_sql = DynSql::new("SELECT COUNT(*) FROM media_works m WHERE ");

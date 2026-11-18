@@ -1,6 +1,6 @@
 use super::views::base_library_category;
 use super::{
-    auth::{extract_emby_token, resolve_auth_context},
+    auth::resolve_auth_context,
     ids::{parse_episode_id, parse_season_id},
 };
 use crate::smart_views::VirtualLibraryRule;
@@ -34,6 +34,14 @@ fn image_child_work_id(item_id: &str) -> Option<i64> {
 
 fn is_supported_image_type(image_type: &str) -> bool {
     image_type.eq_ignore_ascii_case("Primary") || image_type.eq_ignore_ascii_case("Backdrop")
+}
+
+fn image_meta_cache_key(item_id: &str, image_type: &str, user_id: &str) -> String {
+    if item_id.starts_with("pl_") || item_id.starts_with("col_") {
+        format!("{item_id}:{image_type}:{user_id}")
+    } else {
+        format!("{item_id}:{image_type}")
+    }
 }
 
 fn playlist_collection_cover_permitted(
@@ -267,9 +275,8 @@ async fn get_item_image_inner(
         .await;
     }
 
-    // Playlist/collection art inherits its parent's ACL; anonymous callers may
-    // only access legacy public collections, never private playlists.
-    if item_id.starts_with("pl_") || item_id.starts_with("col_") {
+    // Playlist/collection art inherits its parent's ACL and media category ACL.
+    let auth = if item_id.starts_with("pl_") || item_id.starts_with("col_") {
         let collection = item_id.starts_with("col_");
         let prefix = if collection { "col_" } else { "pl_" };
         let id = item_id
@@ -277,12 +284,7 @@ async fn get_item_image_inner(
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|id| *id > 0)
             .ok_or((StatusCode::BAD_REQUEST, "无效的资源 ID".to_string()))?;
-        let token = extract_emby_token(&headers, api_key);
-        let auth = if token.is_some() {
-            Some(resolve_auth_context(&state, &headers, api_key).await?)
-        } else {
-            None
-        };
+        let auth = resolve_auth_context(&state, &headers, api_key).await?;
         let table = if collection {
             "collections"
         } else {
@@ -297,18 +299,20 @@ async fn get_item_image_inner(
         let Some(owner) = owner else {
             return Err((StatusCode::NOT_FOUND, "列表不存在".into()));
         };
-        let auth_user = auth
-            .as_ref()
-            .map(|context| (context.user_id.as_str(), context.is_admin));
-        let permitted =
-            playlist_collection_cover_permitted(collection, owner.as_deref(), auth_user);
+        let permitted = playlist_collection_cover_permitted(
+            collection,
+            owner.as_deref(),
+            Some((auth.user_id.as_str(), auth.is_admin)),
+        );
         if !permitted {
             return Err((StatusCode::NOT_FOUND, "暂无图片".into()));
         }
-    }
+        auth
+    } else {
+        // Media artwork is protected by the same ignored-folder and category ACL as details/playback.
+        resolve_auth_context(&state, &headers, api_key).await?
+    };
 
-    // Media artwork is protected by the same ignored-folder and category ACL as details/playback.
-    let auth = resolve_auth_context(&state, &headers, api_key).await?;
     let work_id = parse_episode_id(&item_id)
         .map(|(id, _, _)| id)
         .or_else(|| parse_season_id(&item_id).map(|(id, _)| id))
@@ -317,8 +321,9 @@ async fn get_item_image_inner(
         super::items::ensure_media_accessible(&state, &auth.user_id, work_id).await?;
     }
 
-    // 短 TTL 元数据缓存：热门海报/背景图的 DB 定位查询不再逐请求打库
-    let meta_cache_key = format!("{}:{}", item_id, image_type);
+    // 短 TTL 元数据缓存：热门海报/背景图的 DB 定位查询不再逐请求打库；
+    // 播放列表/合集封面需按用户隔离缓存键，避免跨用户绕过子项分类 ACL。
+    let meta_cache_key = image_meta_cache_key(&item_id, &image_type, &auth.user_id);
     let resolved = state
         .caches
         .image_meta_cache
@@ -993,5 +998,21 @@ mod tests {
             image_path_tag(Some("/covers/b.jpg"))
         );
         assert_eq!(image_path_tag(None), "");
+    }
+
+    #[test]
+    fn list_image_meta_cache_keys_are_scoped_per_user() {
+        assert_ne!(
+            super::image_meta_cache_key("col_1", "Primary", "alice"),
+            super::image_meta_cache_key("col_1", "Primary", "bob")
+        );
+        assert_ne!(
+            super::image_meta_cache_key("pl_2", "Backdrop", "alice"),
+            super::image_meta_cache_key("pl_2", "Backdrop", "bob")
+        );
+        assert_eq!(
+            super::image_meta_cache_key("work_10", "Primary", "alice"),
+            super::image_meta_cache_key("work_10", "Primary", "bob")
+        );
     }
 }

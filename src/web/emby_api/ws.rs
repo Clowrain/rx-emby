@@ -192,7 +192,13 @@ async fn dispatch_playback_report(
         is_admin,
         identity,
     } = context;
-    let report = authenticated_report(data.clone(), user_id, token, is_admin).ok()?;
+    let report = match authenticated_report(data.clone(), user_id, token, is_admin) {
+        Ok(report) => report,
+        Err(error) => {
+            tracing::debug!("忽略无效的 WebSocket 播放状态上报: {}", error);
+            return None;
+        }
+    };
     let state = State(state.clone());
     let headers = headers.clone();
     let query = Query(SessionReportPayload::default());
@@ -243,6 +249,13 @@ async fn process_reports_in_order<F>(
     while let Some((kind, data)) = reports.recv().await {
         process(kind, data).await;
     }
+}
+
+async fn send_ws_message(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), socket.send(message)).await,
+        Ok(Ok(()))
+    )
 }
 
 async fn handle_ws_connection(
@@ -307,7 +320,7 @@ async fn handle_ws_connection(
                 outgoing = outbound.recv() => {
                     let Some(outgoing) = outgoing else { break; };
                     if !sessions_subscribed && outgoing.kind == crate::state::HubEventKind::Sessions { continue; }
-                    if socket.send(Message::Text(outgoing.message)).await.is_err() { break; }
+                    if !send_ws_message(&mut socket, Message::Text(outgoing.message)).await { break; }
                 }
                 incoming = socket.recv() => {
                     let Some(Ok(message)) = incoming else { break; };
@@ -317,12 +330,12 @@ async fn handle_ws_connection(
                             let kind = message.get("MessageType").and_then(Value::as_str).unwrap_or("");
                             match kind {
                                 "KeepAlive" => {
-                                    if socket.send(Message::Text(json!({"MessageType":"KeepAlive"}).to_string())).await.is_err() { break; }
+                                    if !send_ws_message(&mut socket, Message::Text(json!({"MessageType":"KeepAlive"}).to_string())).await { break; }
                                 }
                                 "SessionsStart" => {
                                     sessions_subscribed = true;
                                     let sessions = sessions_start_payload(&state, is_admin, &user_id);
-                                    if socket.send(Message::Text(json!({"MessageType":"Sessions", "Data":sessions}).to_string())).await.is_err() { break; }
+                                    if !send_ws_message(&mut socket, Message::Text(json!({"MessageType":"Sessions", "Data":sessions}).to_string())).await { break; }
                                 }
                                 "SessionsStop" => sessions_subscribed = false,
                                 "ReportPlaybackStart" | "ReportPlaybackProgress" | "ReportPlaybackStopped" => {
@@ -334,7 +347,7 @@ async fn handle_ws_connection(
                                 _ => {}
                             }
                         }
-                        Message::Ping(bytes) => { if socket.send(Message::Pong(bytes)).await.is_err() { break; } }
+                        Message::Ping(bytes) => { if !send_ws_message(&mut socket, Message::Pong(bytes)).await { break; } }
                         Message::Close(_) => break,
                         _ => {}
                     }
