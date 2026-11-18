@@ -191,18 +191,24 @@ function resetAndLoad() {
   loadData()
 }
 
-function prevPage() {
+function prevPage(scrollTop = false) {
   if (offset.value >= pageSize) {
     offset.value -= pageSize
     loadData()
+    if (scrollTop) window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 }
 
-function nextPage() {
+function nextPage(scrollTop = false) {
   if (offset.value + pageSize < total.value) {
     offset.value += pageSize
     loadData()
+    if (scrollTop) window.scrollTo({ top: 0, behavior: 'smooth' })
   }
+}
+
+function scrollToTop() {
+  window.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
 async function handleScrapeWork(item) {
@@ -528,107 +534,12 @@ onMounted(() => {
             <RotateCcw class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
             <span>重试全部失败/存疑项</span>
           </button>
-
-          <!-- 原因分诊胶囊栏（仅在校验存疑/未匹配下展示） -->
-          <div
-            v-if="reasonCounts && (filters.stagingState === 'conflict' || filters.stagingState === 'failed')"
-            class="w-full flex flex-wrap items-center gap-1.5 pt-2 mt-1 border-t border-slate-800/60"
-          >
-            <span class="text-[11px] text-slate-400 mr-1">原因分诊：</span>
-            <button
-              type="button"
-              @click="selectReasonKind('')"
-              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors"
-              :class="
-                filters.reasonKind === ''
-                  ? 'bg-indigo-600/25 border-indigo-500/50 text-indigo-200'
-                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
-              "
-            >
-              全部
-            </button>
-            <template v-if="filters.stagingState === 'conflict'">
-              <button
-                type="button"
-                @click="selectReasonKind('type_conflict')"
-                class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
-                :class="
-                  filters.reasonKind === 'type_conflict'
-                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
-                    : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
-                "
-              >
-                类型冲突 ({{ reasonCounts.type_conflict }})
-              </button>
-              <button
-                type="button"
-                @click="selectReasonKind('title_conflict')"
-                class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
-                :class="
-                  filters.reasonKind === 'title_conflict'
-                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
-                    : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
-                "
-              >
-                片名差异 ({{ reasonCounts.title_conflict }})
-              </button>
-              <button
-                type="button"
-                @click="selectReasonKind('year_conflict')"
-                class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
-                :class="
-                  filters.reasonKind === 'year_conflict'
-                    ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
-                    : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
-                "
-              >
-                年份偏差 ({{ reasonCounts.year_conflict }})
-              </button>
-            </template>
-            <button
-              type="button"
-              @click="selectReasonKind('has_hint')"
-              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
-              :class="
-                filters.reasonKind === 'has_hint'
-                  ? 'bg-sky-500/20 border-sky-500/50 text-sky-200'
-                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
-              "
-            >
-              带提示 TMDB ({{ reasonCounts.has_hint }})
-            </button>
-            <button
-              type="button"
-              @click="selectReasonKind('no_hint')"
-              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
-              :class="
-                filters.reasonKind === 'no_hint'
-                  ? 'bg-slate-700/60 border-slate-500/50 text-slate-200'
-                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
-              "
-            >
-              无提示 TMDB ({{ reasonCounts.no_hint }})
-            </button>
-            <button
-              v-if="filters.stagingState === 'failed' && reasonCounts.no_reason > 0"
-              type="button"
-              @click="selectReasonKind('no_reason')"
-              class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
-              :class="
-                filters.reasonKind === 'no_reason'
-                  ? 'bg-rose-500/20 border-rose-500/50 text-rose-200'
-                  : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
-              "
-            >
-              历史无报错记录 ({{ reasonCounts.no_reason }})
-            </button>
-          </div>
         </div>
         <div v-else class="text-xs text-slate-400">
           仅展示已通过校验并入库的正式作品（点击卡片可查看关联目录并调整多版本权重）
         </div>
 
-        <div class="flex flex-wrap items-center gap-3 tabular-nums">
+        <div class="flex flex-wrap items-center gap-3 tabular-nums shrink-0">
           <div
             v-if="filters.viewMode === 'works'"
             class="flex items-center gap-1.5 bg-slate-950/70 border border-slate-800 rounded-lg px-2 py-1"
@@ -663,7 +574,7 @@ onMounted(() => {
           <div class="flex gap-1.5">
             <button
               type="button"
-              @click="prevPage"
+              @click="prevPage(false)"
               :disabled="offset === 0"
               class="cursor-pointer bg-slate-900 hover:bg-slate-800 border border-slate-700/80 disabled:opacity-35 disabled:cursor-not-allowed px-2.5 py-1 rounded-lg text-xs transition-colors flex items-center gap-1"
             >
@@ -672,7 +583,7 @@ onMounted(() => {
             </button>
             <button
               type="button"
-              @click="nextPage"
+              @click="nextPage(false)"
               :disabled="offset + pageSize >= total"
               class="cursor-pointer bg-slate-900 hover:bg-slate-800 border border-slate-700/80 disabled:opacity-35 disabled:cursor-not-allowed px-2.5 py-1 rounded-lg text-xs transition-colors flex items-center gap-1"
             >
@@ -681,6 +592,101 @@ onMounted(() => {
             </button>
           </div>
         </div>
+      </div>
+
+      <!-- 原因分诊胶囊栏（独立成行，不挤压上方分页控件） -->
+      <div
+        v-if="filters.viewMode === 'staging' && reasonCounts && (filters.stagingState === 'conflict' || filters.stagingState === 'failed')"
+        class="flex flex-wrap items-center gap-1.5 pt-2.5 border-t border-slate-800/60"
+      >
+        <span class="text-[11px] text-slate-400 mr-1">原因分诊：</span>
+        <button
+          type="button"
+          @click="selectReasonKind('')"
+          class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors"
+          :class="
+            filters.reasonKind === ''
+              ? 'bg-indigo-600/25 border-indigo-500/50 text-indigo-200'
+              : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+          "
+        >
+          全部
+        </button>
+        <template v-if="filters.stagingState === 'conflict'">
+          <button
+            type="button"
+            @click="selectReasonKind('type_conflict')"
+            class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+            :class="
+              filters.reasonKind === 'type_conflict'
+                ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+            "
+          >
+            类型冲突 ({{ reasonCounts.type_conflict }})
+          </button>
+          <button
+            type="button"
+            @click="selectReasonKind('title_conflict')"
+            class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+            :class="
+              filters.reasonKind === 'title_conflict'
+                ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+            "
+          >
+            片名差异 ({{ reasonCounts.title_conflict }})
+          </button>
+          <button
+            type="button"
+            @click="selectReasonKind('year_conflict')"
+            class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+            :class="
+              filters.reasonKind === 'year_conflict'
+                ? 'bg-amber-500/20 border-amber-500/50 text-amber-200'
+                : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+            "
+          >
+            年份偏差 ({{ reasonCounts.year_conflict }})
+          </button>
+        </template>
+        <button
+          type="button"
+          @click="selectReasonKind('has_hint')"
+          class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+          :class="
+            filters.reasonKind === 'has_hint'
+              ? 'bg-sky-500/20 border-sky-500/50 text-sky-200'
+              : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+          "
+        >
+          带提示 TMDB ({{ reasonCounts.has_hint }})
+        </button>
+        <button
+          type="button"
+          @click="selectReasonKind('no_hint')"
+          class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+          :class="
+            filters.reasonKind === 'no_hint'
+              ? 'bg-slate-700/60 border-slate-500/50 text-slate-200'
+              : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+          "
+        >
+          无提示 TMDB ({{ reasonCounts.no_hint }})
+        </button>
+        <button
+          v-if="filters.stagingState === 'failed' && reasonCounts.no_reason > 0"
+          type="button"
+          @click="selectReasonKind('no_reason')"
+          class="cursor-pointer px-2.5 py-0.5 rounded-md text-[11px] border transition-colors tabular-nums"
+          :class="
+            filters.reasonKind === 'no_reason'
+              ? 'bg-rose-500/20 border-rose-500/50 text-rose-200'
+              : 'bg-slate-950/50 border-slate-800 text-slate-400 hover:text-slate-200'
+          "
+        >
+          历史无报错记录 ({{ reasonCounts.no_reason }})
+        </button>
       </div>
     </div>
 
@@ -857,6 +863,45 @@ onMounted(() => {
         </div>
       </div>
     </template>
+
+    <!-- 底部分页条（长列表无需滚回顶部即可翻页） -->
+    <div
+      v-if="!loading && total > 0"
+      class="card rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 tabular-nums"
+    >
+      <span class="text-xs text-slate-400">
+        共 <strong class="text-white font-mono">{{ total.toLocaleString() }}</strong> 项 · 第
+        <strong class="text-emerald-400 font-mono">{{ currentPage }}</strong> / {{ totalPages }} 页
+      </span>
+      <div class="flex items-center gap-2">
+        <button
+          type="button"
+          @click="scrollToTop"
+          class="cursor-pointer bg-slate-900 hover:bg-slate-800 border border-slate-700/80 px-2.5 py-1 rounded-lg text-xs text-slate-300 transition-colors flex items-center gap-1"
+        >
+          <ArrowUp class="w-3.5 h-3.5" aria-hidden="true" />
+          <span>返回顶部</span>
+        </button>
+        <button
+          type="button"
+          @click="prevPage(true)"
+          :disabled="offset === 0"
+          class="cursor-pointer bg-slate-900 hover:bg-slate-800 border border-slate-700/80 disabled:opacity-35 disabled:cursor-not-allowed px-2.5 py-1 rounded-lg text-xs transition-colors flex items-center gap-1"
+        >
+          <ChevronLeft class="w-3.5 h-3.5" aria-hidden="true" />
+          <span>上一页</span>
+        </button>
+        <button
+          type="button"
+          @click="nextPage(true)"
+          :disabled="offset + pageSize >= total"
+          class="cursor-pointer bg-slate-900 hover:bg-slate-800 border border-slate-700/80 disabled:opacity-35 disabled:cursor-not-allowed px-2.5 py-1 rounded-lg text-xs transition-colors flex items-center gap-1"
+        >
+          <span>下一页</span>
+          <ChevronRight class="w-3.5 h-3.5" aria-hidden="true" />
+        </button>
+      </div>
+    </div>
 
     <BindTmdbModal
       :modal="bindModal"
