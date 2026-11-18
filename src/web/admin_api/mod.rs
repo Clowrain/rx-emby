@@ -107,6 +107,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(media::toggle_ignore_staging_folder),
         )
         .route(
+            "/api/admin/staging/folders/:id/pause",
+            post(media::toggle_pause_staging_folder),
+        )
+        .route(
+            "/api/admin/staging/pause_batch",
+            post(media::batch_pause_staging_folders),
+        )
+        .route(
             "/api/admin/staging/scrape_batch",
             post(media::batch_scrape_staging_folders),
         )

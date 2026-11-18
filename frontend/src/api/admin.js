@@ -212,6 +212,20 @@ export const adminApi = {
       body: JSON.stringify({ ignore })
     })
   },
+  pauseStagingFolder(folderId, paused) {
+    return requestJson(`/api/admin/staging/folders/${folderId}/pause`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paused })
+    })
+  },
+  batchPauseStagingFolders(folderIds, paused) {
+    return requestJson('/api/admin/staging/pause_batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder_ids: folderIds, paused })
+    })
+  },
   batchScrapeStagingFolders(folderIds) {
     return requestJson('/api/admin/staging/scrape_batch', {
       method: 'POST',

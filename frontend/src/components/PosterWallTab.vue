@@ -26,7 +26,9 @@ import {
   EyeOff,
   FolderGit2,
   ExternalLink,
-  FileSearch
+  FileSearch,
+  PauseCircle,
+  PlayCircle
 } from 'lucide-vue-next'
 import { adminApi } from '../api/admin'
 import { useToast } from '../composables/useToast'
@@ -62,6 +64,7 @@ const categoryTabs = [
 
 const stagingStateTabs = [
   { key: 'pending', label: '待刮削', icon: Clock, isIgnored: 'false', state: 'pending' },
+  { key: 'paused', label: '暂停刮削', icon: PauseCircle, isIgnored: 'false', state: 'paused' },
   { key: 'conflict', label: '校验存疑', icon: ShieldAlert, isIgnored: 'false', state: 'conflict' },
   { key: 'failed', label: '未匹配', icon: AlertTriangle, isIgnored: 'false', state: 'failed' },
   { key: 'ignored', label: '已屏蔽', icon: Trash2, isIgnored: 'true', state: 'all' },
@@ -274,6 +277,33 @@ async function handleToggleIgnoreStaging(folder) {
     await loadData({ silent: true })
   } catch (err) {
     toast.error('操作失败：' + err.message)
+  }
+}
+
+async function handleTogglePauseStaging(folder) {
+  const nextPaused = folder.scrape_state !== 'paused'
+  try {
+    const res = await adminApi.pauseStagingFolder(folder.id, nextPaused)
+    toast.info(res.message)
+    window.dispatchEvent(new CustomEvent('rx-scrape-task-started'))
+    await loadData({ silent: true })
+  } catch (err) {
+    toast.error('操作失败：' + err.message)
+  }
+}
+
+async function handleBatchPauseCurrentPage(paused) {
+  const ids = stagingFolders.value
+    .filter(f => !f.is_ignored && f.scrape_state !== 'verified')
+    .map(f => f.id)
+  if (ids.length === 0) return toast.warn('当前页没有可操作的目录')
+  try {
+    const res = await adminApi.batchPauseStagingFolders(ids, paused)
+    toast.success(res.message)
+    window.dispatchEvent(new CustomEvent('rx-scrape-task-started'))
+    await loadData({ silent: true })
+  } catch (err) {
+    toast.error('批量操作失败：' + err.message)
   }
 }
 
@@ -536,6 +566,26 @@ onMounted(() => {
             <RotateCcw class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
             <span>重试全部失败/存疑项</span>
           </button>
+
+          <button
+            v-if="filters.isIgnored === 'false' && filters.stagingState === 'pending'"
+            type="button"
+            @click="handleBatchPauseCurrentPage(true)"
+            class="cursor-pointer px-3 py-1 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-amber-200 border border-slate-700 transition-colors flex items-center gap-1.5"
+          >
+            <PauseCircle class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>本页移入暂停刮削</span>
+          </button>
+
+          <button
+            v-if="filters.isIgnored === 'false' && filters.stagingState === 'paused'"
+            type="button"
+            @click="handleBatchPauseCurrentPage(false)"
+            class="cursor-pointer px-3 py-1 rounded-lg text-xs font-medium bg-sky-600/20 hover:bg-sky-600/35 text-sky-200 border border-sky-500/30 transition-colors flex items-center gap-1.5"
+          >
+            <PlayCircle class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>本页恢复待刮削</span>
+          </button>
         </div>
         <div v-else class="text-xs text-slate-400">
           仅展示已通过校验并入库的正式作品（点击卡片可查看关联目录并调整多版本权重）
@@ -777,12 +827,13 @@ onMounted(() => {
                 class="px-2 py-0.5 rounded-md text-[11px] font-medium"
                 :class="{
                   'bg-slate-800 text-slate-300': f.scrape_state === 'pending',
+                  'bg-slate-800/90 text-amber-200 border border-amber-500/30': f.scrape_state === 'paused',
                   'bg-amber-950 text-amber-300 border border-amber-500/40': f.scrape_state === 'conflict',
                   'bg-rose-950 text-rose-300 border border-rose-500/40': f.scrape_state === 'failed',
                   'bg-emerald-950 text-emerald-300 border border-emerald-500/40': f.scrape_state === 'verified'
                 }"
               >
-                {{ f.scrape_state }}
+                {{ f.scrape_state === 'paused' ? '暂停刮削' : f.scrape_state }}
               </span>
               <span v-if="f.scrape_state === 'failed' && f.retry_count > 0" class="text-[11px] font-mono text-slate-400">
                 已重试 {{ f.retry_count }} 次
@@ -845,6 +896,22 @@ onMounted(() => {
             >
               <Send class="w-3.5 h-3.5" aria-hidden="true" />
               <span>无 TMDB 直接发布</span>
+            </button>
+
+            <button
+              v-if="!f.is_ignored && f.scrape_state !== 'verified'"
+              type="button"
+              @click="handleTogglePauseStaging(f)"
+              class="cursor-pointer px-3 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 border transition-colors"
+              :class="
+                f.scrape_state === 'paused'
+                  ? 'bg-sky-600/20 hover:bg-sky-600/35 border-sky-500/35 text-sky-200'
+                  : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-amber-200'
+              "
+            >
+              <PlayCircle v-if="f.scrape_state === 'paused'" class="w-3.5 h-3.5" aria-hidden="true" />
+              <PauseCircle v-else class="w-3.5 h-3.5" aria-hidden="true" />
+              <span>{{ f.scrape_state === 'paused' ? '恢复待刮削' : '暂停刮削' }}</span>
             </button>
 
             <button

@@ -1865,6 +1865,122 @@ pub(super) async fn cancel_scrape_task(
     Ok(Json(status))
 }
 
+#[derive(Deserialize)]
+pub(super) struct PauseFolderReq {
+    paused: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct BatchPauseFoldersReq {
+    folder_ids: Vec<i64>,
+    paused: bool,
+}
+
+/// 将单个待刮削/异常目录移入“暂停刮削”或恢复为“待刮削”
+pub(super) async fn toggle_pause_staging_folder(
+    State(state): State<Arc<AppState>>,
+    Path(folder_id): Path<i64>,
+    Json(payload): Json<PauseFolderReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let res = if payload.paused {
+        sqlx::query(
+            r#"
+            UPDATE sync_folders
+            SET scrape_state = 'paused', updated_at = NOW()
+            WHERE id = $1 AND scrape_state <> 'verified'
+            "#,
+        )
+        .bind(folder_id)
+        .execute(&state.db)
+        .await
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE sync_folders
+            SET scrape_state = 'pending',
+                retry_count = 0,
+                next_retry_at = NULL,
+                conflict_reason = NULL,
+                updated_at = NOW()
+            WHERE id = $1 AND scrape_state = 'paused'
+            "#,
+        )
+        .bind(folder_id)
+        .execute(&state.db)
+        .await
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if res.rows_affected() == 0 {
+        return Err((StatusCode::BAD_REQUEST, "目录不存在或当前状态不支持该操作".into()));
+    }
+
+    invalidate_admin_stats(&state).await;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "paused": payload.paused,
+        "message": if payload.paused {
+            "已移入「暂停刮削」，后台不会自动拉取该目录"
+        } else {
+            "已恢复至「待刮削」队列"
+        }
+    })))
+}
+
+/// 批量将目录移入“暂停刮削”或恢复为“待刮削”
+pub(super) async fn batch_pause_staging_folders(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchPauseFoldersReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if payload.folder_ids.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "请至少选择一个目录".into()));
+    }
+
+    let res = if payload.paused {
+        sqlx::query(
+            r#"
+            UPDATE sync_folders
+            SET scrape_state = 'paused', updated_at = NOW()
+            WHERE id = ANY($1) AND scrape_state <> 'verified'
+            "#,
+        )
+        .bind(&payload.folder_ids)
+        .execute(&state.db)
+        .await
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE sync_folders
+            SET scrape_state = 'pending',
+                retry_count = 0,
+                next_retry_at = NULL,
+                conflict_reason = NULL,
+                updated_at = NOW()
+            WHERE id = ANY($1) AND scrape_state = 'paused'
+            "#,
+        )
+        .bind(&payload.folder_ids)
+        .execute(&state.db)
+        .await
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let affected = res.rows_affected();
+    invalidate_admin_stats(&state).await;
+
+    Ok(Json(json!({
+        "status": "ok",
+        "affected": affected,
+        "paused": payload.paused,
+        "message": if payload.paused {
+            format!("已将 {} 个目录移入「暂停刮削」", affected)
+        } else {
+            format!("已将 {} 个目录恢复至「待刮削」", affected)
+        }
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_admin_media_order_clause;
