@@ -7,10 +7,13 @@ const props = defineProps<{
   rule: any
   options: any
   depth: number
+  backfilling?: boolean
 }>()
 
 const emit = defineEmits<{
   remove: [key: string]
+  backfill: []
+  openTasks: []
 }>()
 
 const filterQuery = ref('')
@@ -207,9 +210,26 @@ function toggleId(id: number) {
       <div v-else-if="field.source">
         <div
           v-if="mergedOptions.length === 0"
-          class="rounded-lg border border-amber-500/25 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/90 leading-relaxed"
+          class="rounded-lg border border-amber-500/25 bg-amber-950/20 px-3 py-2 text-xs text-amber-200/90 leading-relaxed flex flex-wrap items-center justify-between gap-2"
         >
-          当前暂无本地可选数据。请先在智能视图列表页点击「从本地刮削补齐」，补齐扩展信息后即可在此勾选。
+          <span>当前暂无本地可选数据，需先补齐 TMDB 扩展信息后才可在此勾选。</span>
+          <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              :disabled="backfilling"
+              @click="emit('backfill')"
+              class="cursor-pointer px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-medium transition-colors disabled:opacity-50"
+            >
+              {{ backfilling ? '正在加入队列…' : '立即补齐' }}
+            </button>
+            <button
+              type="button"
+              @click="emit('openTasks')"
+              class="cursor-pointer px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-[11px] transition-colors"
+            >
+              任务中心
+            </button>
+          </div>
         </div>
         <div v-else class="rounded-xl border border-slate-700/90 bg-slate-950 p-2 space-y-2">
           <input

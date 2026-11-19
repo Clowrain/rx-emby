@@ -201,6 +201,7 @@ async function pollStatus() {
         `刮削任务已完成：共处理 ${next.batch_done || prevBatchTotal} 项（成功 ${next.batch_succeeded || 0}，失败/存疑 ${next.batch_failed || 0}）`
       )
       emit('completed')
+      window.dispatchEvent(new CustomEvent('rx-scrape-task-completed'))
     }
     if (next.status === 'running' || next.status === 'paused') {
       dismissedCancelledBanner.value = false

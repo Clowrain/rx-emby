@@ -358,7 +358,7 @@ onUnmounted(() => {
           :initial-status="posterInitialStatus"
           @open-detail="drawerMediaId = $event"
         />
-        <VirtualLibrariesTab v-else-if="activeTab === 'vlib'" />
+        <VirtualLibrariesTab v-else-if="activeTab === 'vlib'" @open-tasks="switchTab('tasks')" />
         <BaseCoversTab v-else-if="activeTab === 'covers'" />
         <ActiveSessionsTab v-else-if="activeTab === 'sessions'" />
         <UsersAndSessionsTab v-else-if="activeTab === 'users'" />

@@ -17,7 +17,7 @@ function editor(api = {}) {
   const stubConfirm = async()=>true
   const stubApi = {listVirtualLibraries:async()=>({libraries:[]}),...api}
   const ctx = vm.createContext({
-    ref, reactive, computed, watch, onMounted:()=>{},
+    ref, reactive, computed, watch, onMounted:()=>{}, onUnmounted:()=>{}, defineEmits:()=>()=>{},
     coverImageUrl, dynamicCoverLabel, isDynamicCover, ruleBadges,
     useVirtualLibraries: (deps = {}) => useVirtualLibraries({
       api: stubApi,
@@ -27,9 +27,40 @@ function editor(api = {}) {
       ...deps
     })
   })
-  vm.runInContext(transformSync(script,{loader:'ts'}).code + '\nglobalThis.editor = {modal,openModal,submitModal,formError,saving,previewRules,previewCount};',ctx)
+  vm.runInContext(transformSync(script,{loader:'ts'}).code + '\nglobalThis.editor = {modal,openModal,submitModal,formError,saving,previewRules,previewCount,ruleOptions,optionsLoaded,needsMetadataBackfill,loadRuleOptions,backfillMetadata};',ctx)
   return ctx.editor
 }
+
+test('选项未加载完成或总数为 0 时不提示需补齐扩展信息，存在未补齐时才标记 needsMetadataBackfill', async()=>{
+  let releaseOptions
+  const e = editor({
+    smartViewOptions: () => new Promise(r => { releaseOptions = r })
+  })
+  assert.equal(e.optionsLoaded.value, false)
+  assert.equal(e.needsMetadataBackfill.value, false)
+
+  const loadingPromise = e.loadRuleOptions()
+  assert.equal(e.optionsLoaded.value, false)
+  assert.equal(e.needsMetadataBackfill.value, false)
+
+  releaseOptions({ networks: [], companies: [], collections: [], metadata: { total: 0, enriched: 0, queued: 0, failed: 0 } })
+  await loadingPromise
+  assert.equal(e.optionsLoaded.value, true)
+  assert.equal(e.needsMetadataBackfill.value, false)
+
+  const e2 = editor({
+    smartViewOptions: async () => ({ networks: [], companies: [], collections: [], metadata: { total: 10, enriched: 6, queued: 0, failed: 0 } })
+  })
+  await e2.loadRuleOptions()
+  assert.equal(e2.optionsLoaded.value, true)
+  assert.equal(e2.needsMetadataBackfill.value, true)
+})
+
+test('智能视图列表页不再包含顶部 TMDB 扩展信息补齐进度条卡片', () => {
+  const source = fs.readFileSync(new URL('../src/components/VirtualLibrariesTab.vue', import.meta.url), 'utf8')
+  assert.equal(source.includes('TMDB 扩展信息已补齐'), false)
+  assert.equal(source.includes('aria-label="TMDB 扩展信息补齐进度"'), false)
+})
 
 test('评分、倒置年份和小数集数不能保存', async()=>{
   for(const rules of [{min_rating:11},{year_min:2026,year_max:2020},{episodes_max:1.5}]) {

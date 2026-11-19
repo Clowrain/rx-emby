@@ -470,68 +470,96 @@ fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
     dst[3] = 255;
 }
 
-/// 方案 A：底部全宽渐变腰封 + 左侧竖线色条 + 视图名称（自适应字号与尾部省略号截断）
+/// 左上角腰封：顶部左上柔和暗化过渡 + 圆角深色腰封底板 + 左侧竖线色条 + 视图名称
 fn apply_title_banner(canvas: &mut RgbaImage, banner: CoverBanner<'_>) {
     let title = banner.title.trim();
     if title.is_empty() {
         return;
     }
 
-    // 1. 底部全宽平滑渐变暗色腰封（y: COVER_H-116 .. COVER_H）
-    let banner_h = 116u32;
-    let banner_top = COVER_H.saturating_sub(banner_h);
-    for y in banner_top..COVER_H {
-        let t = (y - banner_top) as f32 / banner_h as f32;
-        let smooth = t * t * (3.0 - 2.0 * t);
-        let alpha = (smooth * 0.86 * 255.0).round().clamp(0.0, 255.0) as u8;
-        let scrim_px = Rgba([10, 14, 23, alpha]);
-        for x in 0..COVER_W {
-            blend_pixel(canvas.get_pixel_mut(x, y), scrim_px);
-        }
-    }
-
-    // 2. 顶部极细微光分割线（左右渐隐）
-    let line_y = COVER_H.saturating_sub(88);
-    let margin_x = 40u32;
-    let line_span = (COVER_W - margin_x * 2) as f32;
-    for x in margin_x..(COVER_W - margin_x) {
-        let u = (x - margin_x) as f32 / line_span;
-        let edge_fade = (u * 4.0).min(1.0).min(((1.0 - u) * 4.0).min(1.0));
-        let alpha = (edge_fade * 0.14 * 255.0).round().clamp(0.0, 255.0) as u8;
-        blend_pixel(canvas.get_pixel_mut(x, line_y), Rgba([255, 255, 255, alpha]));
-    }
-
     let Some(font) = title_font() else {
         return;
     };
 
-    // 3. 计算单行自适应字号与省略号截断（安全区：x 58..920）
-    let text_x = 58.0f32;
-    let max_text_w = (COVER_W - 40) as f32 - text_x;
+    // 1. 计算左上角腰封单行自适应字号与省略号截断（最大文字宽度限制在画布左侧约 60%）
+    let max_text_w = 540.0f32;
     let (scale_px, fitted_title) = fit_banner_title(font, title, max_text_w);
     let scale = PxScale::from(scale_px);
+    let text_w = measure_text_width(font, scale, &fitted_title).ceil().max(24.0);
 
-    // 4. 绘制左侧圆角 Accent Bar（基础库天青蓝 / 智能视图琥珀金）
+    // 2. 左上角柔和渐变暗化衬底（y: 0..112），让左上角腰封与背景海报自然过渡
+    let top_scrim_h = 112u32;
+    for y in 0..top_scrim_h {
+        let ty = 1.0 - (y as f32 / top_scrim_h as f32);
+        let smooth_y = ty * ty * (3.0 - 2.0 * ty);
+        for x in 0..COVER_W {
+            let tx = 1.0 - (x as f32 / COVER_W as f32) * 0.45;
+            let alpha = (smooth_y * tx * 0.48 * 255.0).round().clamp(0.0, 255.0) as u8;
+            blend_pixel(canvas.get_pixel_mut(x, y), Rgba([10, 14, 23, alpha]));
+        }
+    }
+
+    // 3. 左上角圆角深色腰封胶囊底板 + 1px 微光描边（安全边距 left=28, top=24）
+    let pill_left = 28.0f32;
+    let pill_top = 24.0f32;
+    let pad_left = 18.0f32;
+    let bar_w = 5.0f32;
+    let gap = 12.0f32;
+    let pad_right = 22.0f32;
+    let pill_w = (pad_left + bar_w + gap + text_w + pad_right).min((COVER_W - 56) as f32);
+    let pill_h = (scale_px * 1.48).round().max(52.0);
+    let pill_hw = pill_w * 0.5;
+    let pill_hh = pill_h * 0.5;
+    let pill_cx = pill_left + pill_hw;
+    let pill_cy = pill_top + pill_hh;
+    let pill_r = 12.0f32;
+
+    let py0 = (pill_top - 2.0).max(0.0) as u32;
+    let py1 = (pill_top + pill_h + 2.0).min((COVER_H - 1) as f32) as u32;
+    let px0 = (pill_left - 2.0).max(0.0) as u32;
+    let px1 = (pill_left + pill_w + 2.0).min((COVER_W - 1) as f32) as u32;
+    for y in py0..=py1 {
+        for x in px0..=px1 {
+            let sdf = rounded_rect_sdf(
+                x as f32 - pill_cx,
+                y as f32 - pill_cy,
+                pill_hw,
+                pill_hh,
+                pill_r,
+            );
+            let fill_cov = (0.5 - sdf).clamp(0.0, 1.0);
+            if fill_cov > 0.0 {
+                let a = (fill_cov * 208.0).round().clamp(0.0, 255.0) as u8;
+                blend_pixel(canvas.get_pixel_mut(x, y), Rgba([10, 14, 23, a]));
+            }
+            let border_cov = (1.0 - (sdf + 0.5).abs()).clamp(0.0, 1.0);
+            if border_cov > 0.0 {
+                let a = (border_cov * 40.0).round().clamp(0.0, 255.0) as u8;
+                blend_pixel(canvas.get_pixel_mut(x, y), Rgba([255, 255, 255, a]));
+            }
+        }
+    }
+
+    // 4. 绘制内部左侧圆角 Accent Bar（基础库天青蓝 / 智能视图琥珀金）
     let accent_color = if banner.is_smart_view {
         [245u8, 158, 11]
     } else {
         [56u8, 189, 248]
     };
-    let baseline_y = (COVER_H - 30) as f32;
-    let bar_cx = 42.5f32;
-    let bar_cy = baseline_y - scale_px * 0.34;
-    let bar_hw = 2.5f32;
-    let bar_hh = scale_px * 0.44;
-    let y0 = (bar_cy - bar_hh - 2.0).max(0.0) as u32;
-    let y1 = (bar_cy + bar_hh + 2.0).min((COVER_H - 1) as f32) as u32;
-    let x0 = (bar_cx - bar_hw - 2.0).max(0.0) as u32;
-    let x1 = (bar_cx + bar_hw + 2.0).min((COVER_W - 1) as f32) as u32;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
+    let bar_hw = bar_w * 0.5;
+    let bar_hh = scale_px * 0.42;
+    let bar_cx = pill_left + pad_left + bar_hw;
+    let bar_cy = pill_cy;
+    let by0 = (bar_cy - bar_hh - 2.0).max(0.0) as u32;
+    let by1 = (bar_cy + bar_hh + 2.0).min((COVER_H - 1) as f32) as u32;
+    let bx0 = (bar_cx - bar_hw - 2.0).max(0.0) as u32;
+    let bx1 = (bar_cx + bar_hw + 2.0).min((COVER_W - 1) as f32) as u32;
+    for y in by0..=by1 {
+        for x in bx0..=bx1 {
             let sdf = rounded_rect_sdf(x as f32 - bar_cx, y as f32 - bar_cy, bar_hw, bar_hh, 2.5);
             let cov = (0.5 - sdf).clamp(0.0, 1.0);
             if cov > 0.0 {
-                let a = (cov * 240.0).round().clamp(0.0, 255.0) as u8;
+                let a = (cov * 242.0).round().clamp(0.0, 255.0) as u8;
                 blend_pixel(
                     canvas.get_pixel_mut(x, y),
                     Rgba([accent_color[0], accent_color[1], accent_color[2], a]),
@@ -540,7 +568,9 @@ fn apply_title_banner(canvas: &mut RgbaImage, banner: CoverBanner<'_>) {
         }
     }
 
-    // 5. 先绘制柔和暗色投影，再绘制高对比度微暖白文字
+    // 5. 先绘制柔和暗色投影，再绘制高对比度微暖白文字（垂直居中于胶囊内）
+    let text_x = pill_left + pad_left + bar_w + gap;
+    let baseline_y = pill_cy + scale_px * 0.34;
     draw_text_line(
         canvas,
         font,
@@ -548,7 +578,7 @@ fn apply_title_banner(canvas: &mut RgbaImage, banner: CoverBanner<'_>) {
         text_x + 1.5,
         baseline_y + 2.0,
         &fitted_title,
-        [0, 0, 0, 155],
+        [0, 0, 0, 160],
     );
     draw_text_line(
         canvas,
@@ -562,8 +592,8 @@ fn apply_title_banner(canvas: &mut RgbaImage, banner: CoverBanner<'_>) {
 }
 
 fn fit_banner_title(font: &FontArc, title: &str, max_width: f32) -> (f32, String) {
-    let mut size = 42.0f32;
-    while size >= 28.0 {
+    let mut size = 36.0f32;
+    while size >= 26.0 {
         let scale = PxScale::from(size);
         if measure_text_width(font, scale, title) <= max_width {
             return (size, title.to_string());
@@ -571,16 +601,16 @@ fn fit_banner_title(font: &FontArc, title: &str, max_width: f32) -> (f32, String
         size -= 2.0;
     }
 
-    let min_scale = PxScale::from(28.0);
+    let min_scale = PxScale::from(26.0);
     let mut truncated: String = title.chars().collect();
     while !truncated.is_empty() {
         truncated.pop();
         let candidate = format!("{truncated}...");
         if measure_text_width(font, min_scale, &candidate) <= max_width {
-            return (28.0, candidate);
+            return (26.0, candidate);
         }
     }
-    (28.0, "...".to_string())
+    (26.0, "...".to_string())
 }
 
 fn measure_text_width(font: &FontArc, scale: PxScale, text: &str) -> f32 {

@@ -20,6 +20,8 @@ export interface VirtualLibraryModalState {
 const props = defineProps<{
   modal: VirtualLibraryModalState
   ruleOptions: any
+  needsMetadataBackfill?: boolean
+  backfilling?: boolean
   saving: boolean
   previewing: boolean
   previewCount: number | null
@@ -32,6 +34,8 @@ const emit = defineEmits<{
   nextStep: []
   prevStep: []
   preview: []
+  backfill: []
+  openTasks: []
 }>()
 
 const showInfoSection = computed(() =>
@@ -209,7 +213,44 @@ const showRulesSection = computed(() =>
 
       <!-- 筛选规则区 -->
       <div v-if="showRulesSection" class="space-y-4">
-        <SmartRuleEditor v-model="modal.rules" :options="ruleOptions" />
+        <div
+          v-if="needsMetadataBackfill"
+          class="rounded-xl border border-amber-500/30 bg-amber-950/20 px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2.5 text-xs"
+        >
+          <div class="text-slate-300 leading-relaxed">
+            <span>
+              部分已刮削影视尚未补齐语言、时长、投票数或出品平台等扩展元数据（已补齐
+              <strong class="text-amber-300 font-mono tabular-nums">{{ (ruleOptions.metadata?.enriched || 0).toLocaleString() }}</strong>
+              /
+              <strong class="text-slate-200 font-mono tabular-nums">{{ (ruleOptions.metadata?.total || 0).toLocaleString() }}</strong>
+              部）。
+            </span>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              :disabled="backfilling"
+              @click="emit('backfill')"
+              class="cursor-pointer px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold transition-colors disabled:opacity-50"
+            >
+              {{ backfilling ? '正在加入队列…' : '立即补齐扩展信息' }}
+            </button>
+            <button
+              type="button"
+              @click="emit('openTasks')"
+              class="cursor-pointer px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition-colors"
+            >
+              前往任务中心
+            </button>
+          </div>
+        </div>
+        <SmartRuleEditor
+          v-model="modal.rules"
+          :options="ruleOptions"
+          :backfilling="backfilling"
+          @backfill="emit('backfill')"
+          @open-tasks="emit('openTasks')"
+        />
         <div class="flex items-center justify-between gap-3 text-xs pt-1">
           <button
             type="button"

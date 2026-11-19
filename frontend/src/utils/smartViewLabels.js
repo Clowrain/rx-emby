@@ -1,4 +1,4 @@
-import { embyImageUrl } from '../api/admin'
+import { embyImageUrl } from '../api/admin.js'
 import {
   COUNTRY_NAME_MAP,
   LANGUAGE_NAME_MAP,

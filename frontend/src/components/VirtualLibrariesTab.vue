@@ -1,8 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { onMounted, onUnmounted } from 'vue'
 import { Sparkles, Plus, Film, Tv, SlidersHorizontal, Trash2, Pencil, Power, RefreshCw } from 'lucide-vue-next'
-import { adminApi } from '../api/admin'
-import { useToast } from '../composables/useToast'
 import VirtualLibraryFormModal from './virtual-libraries/VirtualLibraryFormModal.vue'
 import { useVirtualLibraries } from '../composables/useVirtualLibraries.js'
 import {
@@ -12,11 +10,16 @@ import {
   ruleBadges
 } from '../utils/smartViewLabels.js'
 
+const emit = defineEmits<{
+  openTasks: []
+}>()
+
 const {
   loading,
   saving,
   seeding,
   backfilling,
+  refreshingCovers,
   previewing,
   togglingId,
   deletingId,
@@ -24,6 +27,7 @@ const {
   listQuery,
   previewCount,
   formError,
+  optionsLoaded,
   ruleOptions,
   libraries,
   coverBust,
@@ -31,8 +35,10 @@ const {
   filterTabs,
   filteredLibraries,
   metadataPercent,
+  needsMetadataBackfill,
   loadLibraries,
   loadRuleOptions,
+  handleRefreshDynamicCovers,
   openModal,
   openInfoModal,
   openRulesModal,
@@ -46,26 +52,23 @@ const {
   handleDelete
 } = useVirtualLibraries()
 
-const toast = useToast()
-const refreshingCovers = ref(false)
-
-async function handleRefreshDynamicCovers() {
-  if (refreshingCovers.value) return
-  refreshingCovers.value = true
-  try {
-    const res = await adminApi.refreshDynamicCovers()
-    coverBust.value = Date.now()
-    toast.success(res.message)
-  } catch (err: any) {
-    toast.error('刷新失败：' + err.message)
-  } finally {
-    refreshingCovers.value = false
-  }
+function handleScrapeCompleted() {
+  loadLibraries()
+  loadRuleOptions()
 }
 
 onMounted(() => {
   loadLibraries()
   loadRuleOptions()
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('rx-scrape-task-completed', handleScrapeCompleted)
+  }
+})
+
+onUnmounted(() => {
+  if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+    window.removeEventListener('rx-scrape-task-completed', handleScrapeCompleted)
+  }
 })
 </script>
 
@@ -100,47 +103,6 @@ onMounted(() => {
           <Plus class="w-3.5 h-3.5" aria-hidden="true" />
           <span>新建智能视图</span>
         </button>
-      </div>
-    </div>
-
-    <div
-      v-if="metadataPercent < 100 || (ruleOptions.metadata?.queued || 0) > 0 || (ruleOptions.metadata?.failed || 0) > 0"
-      class="card p-5 rounded-2xl space-y-3"
-    >
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <div class="space-y-1">
-          <div class="flex items-center gap-2.5 flex-wrap">
-            <p class="text-sm font-semibold text-slate-200 tabular-nums">
-              TMDB 扩展信息已补齐 {{ (ruleOptions.metadata?.enriched || 0).toLocaleString() }} / {{ (ruleOptions.metadata?.total || 0).toLocaleString() }} 部
-            </p>
-            <span class="px-2 py-0.5 rounded-md bg-slate-800/90 border border-slate-700/80 text-[11px] font-mono text-emerald-300 tabular-nums">
-              {{ metadataPercent }}%
-            </span>
-          </div>
-          <p class="text-slate-400 text-xs">
-            未补齐语言、时长、投票数等信息的影视暂不参与对应高级规则匹配。队列中 {{ ruleOptions.metadata?.queued || 0 }} 部，失败 {{ ruleOptions.metadata?.failed || 0 }} 部。
-          </p>
-        </div>
-        <div class="flex items-center gap-2">
-          <button
-            type="button"
-            @click="loadRuleOptions"
-            class="cursor-pointer px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700/80 text-xs font-medium text-slate-200 transition-colors"
-          >
-            刷新进度
-          </button>
-          <button
-            type="button"
-            @click="backfillMetadata"
-            :disabled="backfilling"
-            class="cursor-pointer px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition-colors disabled:opacity-50"
-          >
-            {{ backfilling ? '正在加入队列…' : '从本地刮削补齐' }}
-          </button>
-        </div>
-      </div>
-      <div class="h-1.5 rounded-full bg-slate-800/90 overflow-hidden" role="progressbar" :aria-valuenow="metadataPercent" aria-valuemin="0" aria-valuemax="100" aria-label="TMDB 扩展信息补齐进度">
-        <div class="h-full bg-emerald-500 transition-all duration-300" :style="{ width: `${metadataPercent}%` }" />
       </div>
     </div>
 
@@ -331,6 +293,8 @@ onMounted(() => {
     <VirtualLibraryFormModal
       :modal="modal"
       :rule-options="ruleOptions"
+      :needs-metadata-backfill="needsMetadataBackfill"
+      :backfilling="backfilling"
       :saving="saving"
       :previewing="previewing"
       :preview-count="previewCount"
@@ -340,6 +304,8 @@ onMounted(() => {
       @next-step="nextCreateStep"
       @prev-step="formError = ''; modal.step = 1"
       @preview="previewRules"
+      @backfill="backfillMetadata"
+      @open-tasks="modal.visible = false; emit('openTasks')"
     />
   </section>
 </template>

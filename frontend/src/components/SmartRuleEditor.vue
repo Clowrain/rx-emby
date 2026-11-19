@@ -11,7 +11,11 @@ import {
 } from '../utils/smartRuleFields.js'
 
 const rule = defineModel<any>({ required: true })
-const props = defineProps<{ options: any; depth?: number }>()
+const props = defineProps<{ options: any; depth?: number; backfilling?: boolean }>()
+const emit = defineEmits<{
+  backfill: []
+  openTasks: []
+}>()
 const depth = props.depth || 0
 
 const pickerOpen = ref(false)
@@ -140,7 +144,10 @@ function addGroup() {
           :rule="rule"
           :options="options"
           :depth="depth"
+          :backfilling="backfilling"
           @remove="removeField"
+          @backfill="emit('backfill')"
+          @open-tasks="emit('openTasks')"
         />
       </div>
 
@@ -191,7 +198,7 @@ function addGroup() {
             class="w-full px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-emerald-500"
           />
           <p v-if="hasAnyEmptySource" class="text-[11px] text-amber-300/80 px-0.5">
-            提示：标有「暂无本地数据」的条件需先在列表页点击「从本地刮削补齐」后才会有可选项。
+            提示：标有「暂无本地数据」的条件需先补齐 TMDB 扩展元数据（可点击上方「立即补齐扩展信息」或在任务中心执行）。
           </p>
 
           <div class="max-h-60 overflow-y-auto space-y-3 pr-1">
@@ -258,7 +265,14 @@ function addGroup() {
               删除这组
             </button>
           </div>
-          <SmartRuleEditor v-model="rule.any[index]" :options="options" :depth="depth + 1" />
+          <SmartRuleEditor
+            v-model="rule.any[index]"
+            :options="options"
+            :depth="depth + 1"
+            :backfilling="backfilling"
+            @backfill="emit('backfill')"
+            @open-tasks="emit('openTasks')"
+          />
         </div>
         <button
           type="button"

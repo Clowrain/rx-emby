@@ -525,7 +525,7 @@ pub(super) fn compute_cover_image_tag(cover_image: Option<&str>, revision: i64) 
         Some(c) => format!(
             "v{}_{:016x}",
             revision.max(1),
-            xxhash_rust::xxh3::xxh3_64(format!("{c}|banner_v1").as_bytes())
+            xxhash_rust::xxh3::xxh3_64(format!("{c}|banner_v2").as_bytes())
         ),
         None => format!("v{}", revision.max(1)),
     }
@@ -557,7 +557,7 @@ async fn try_serve_dynamic_cover(
     banner: crate::image_cache::collage::CoverBanner<'_>,
 ) -> Option<Response> {
     if custom_cover == Some("auto") {
-        let banner_sig = format!("{}|{}|banner_v1", banner.title, banner.is_smart_view);
+        let banner_sig = format!("{}|{}|banner_v2", banner.title, banner.is_smart_view);
         let banner_hash = xxhash_rust::xxh3::xxh3_64(banner_sig.as_bytes());
         let cache_key = format!("auto:{}:{:016x}", view_id, banner_hash);
         let state2 = state.clone();
@@ -637,7 +637,7 @@ async fn serve_library_cover(
     banner: crate::image_cache::collage::CoverBanner<'_>,
 ) -> Result<Response, (StatusCode, String)> {
     let key = custom_cover.unwrap_or(item_id);
-    let etag_seed = format!("{key}|{}|{}|banner_v1", banner.title, banner.is_smart_view);
+    let etag_seed = format!("{key}|{}|{}|banner_v2", banner.title, banner.is_smart_view);
     let etag = format!(
         "\"cover-{:016x}\"",
         xxhash_rust::xxh3::xxh3_64(etag_seed.as_bytes())
@@ -768,7 +768,7 @@ async fn fetch_or_build_virtual_library_collage(
     style: crate::image_cache::collage::CollageStyle,
     banner: crate::image_cache::collage::CoverBanner<'_>,
 ) -> Option<Bytes> {
-    let banner_sig = format!("|banner_v1|{}|{}", banner.title, banner.is_smart_view);
+    let banner_sig = format!("|banner_v2|{}|{}", banner.title, banner.is_smart_view);
     let banner_hash = xxhash_rust::xxh3::xxh3_64(banner_sig.as_bytes());
     let inflight_key = format!("collage:{}:{}:{:016x}", view_id, style.as_str(), banner_hash);
     let state2 = state.clone();

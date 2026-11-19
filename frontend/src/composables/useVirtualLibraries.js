@@ -14,6 +14,7 @@ export function useVirtualLibraries(deps = {}) {
   const saving = ref(false)
   const seeding = ref(false)
   const backfilling = ref(false)
+  const refreshingCovers = ref(false)
   const previewing = ref(false)
   const togglingId = ref(null)
   const deletingId = ref(null)
@@ -21,6 +22,7 @@ export function useVirtualLibraries(deps = {}) {
   const listQuery = ref('')
   const previewCount = ref(null)
   const formError = ref('')
+  const optionsLoaded = ref(false)
   const ruleOptions = ref({ networks: [], companies: [], collections: [], metadata: {} })
   const libraries = ref([])
   const coverBust = ref(Date.now())
@@ -65,8 +67,18 @@ export function useVirtualLibraries(deps = {}) {
   const metadataPercent = computed(() => {
     const total = Number(ruleOptions.value?.metadata?.total || 0)
     const enriched = Number(ruleOptions.value?.metadata?.enriched || 0)
-    if (total <= 0) return 0
+    if (total <= 0) return 100
     return Math.min(100, Math.round((enriched / total) * 100))
+  })
+
+  const needsMetadataBackfill = computed(() => {
+    if (!optionsLoaded.value) return false
+    const total = Number(ruleOptions.value?.metadata?.total || 0)
+    const enriched = Number(ruleOptions.value?.metadata?.enriched || 0)
+    const queued = Number(ruleOptions.value?.metadata?.queued || 0)
+    const failed = Number(ruleOptions.value?.metadata?.failed || 0)
+    if (total <= 0) return false
+    return enriched < total || queued > 0 || failed > 0
   })
 
   watch(() => modal.rules, () => {
@@ -88,8 +100,23 @@ export function useVirtualLibraries(deps = {}) {
   async function loadRuleOptions() {
     try {
       ruleOptions.value = await api.smartViewOptions()
+      optionsLoaded.value = true
     } catch (err) {
       toast.error('加载筛选选项失败：' + err.message)
+    }
+  }
+
+  async function handleRefreshDynamicCovers() {
+    if (refreshingCovers.value) return
+    refreshingCovers.value = true
+    try {
+      const res = await api.refreshDynamicCovers()
+      coverBust.value = Date.now()
+      toast.success(res.message)
+    } catch (err) {
+      toast.error('刷新失败：' + err.message)
+    } finally {
+      refreshingCovers.value = false
     }
   }
 
@@ -203,7 +230,9 @@ export function useVirtualLibraries(deps = {}) {
     try {
       const res = await api.backfillSmartViewMetadata()
       toast.success(res.message)
-      window.dispatchEvent(new CustomEvent('rx-scrape-task-started'))
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(new CustomEvent('rx-scrape-task-started'))
+      }
       await loadRuleOptions()
     } catch (err) {
       toast.error('补齐失败：' + err.message)
@@ -275,6 +304,7 @@ export function useVirtualLibraries(deps = {}) {
     saving,
     seeding,
     backfilling,
+    refreshingCovers,
     previewing,
     togglingId,
     deletingId,
@@ -282,6 +312,7 @@ export function useVirtualLibraries(deps = {}) {
     listQuery,
     previewCount,
     formError,
+    optionsLoaded,
     ruleOptions,
     libraries,
     coverBust,
@@ -289,8 +320,10 @@ export function useVirtualLibraries(deps = {}) {
     filterTabs,
     filteredLibraries,
     metadataPercent,
+    needsMetadataBackfill,
     loadLibraries,
     loadRuleOptions,
+    handleRefreshDynamicCovers,
     openModal,
     openInfoModal,
     openRulesModal,
