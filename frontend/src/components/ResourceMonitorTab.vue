@@ -44,6 +44,7 @@ async function handleSampleNow() {
 }
 
 const current = computed(() => data.value?.current || null)
+const liveScenario = computed(() => data.value?.live_scenario || current.value?.scenario || '')
 const recentSamples = computed(() => data.value?.recent_samples || [])
 const dailyStats = computed(() => data.value?.daily_stats || [])
 const todayRow = computed(() => dailyStats.value[0] || null)
@@ -59,9 +60,11 @@ const uptimeText = computed(() => {
 })
 
 const scenarioBadgeClass = computed(() => {
-  const sc = current.value?.scenario || ''
+  const sc = liveScenario.value
   if (sc.includes('同步')) return 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+  if (sc.includes('刮削')) return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
   if (sc.includes('播放')) return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+  if (sc.includes('回源')) return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
   return 'bg-slate-800/90 text-slate-300 border-slate-700/80'
 })
 
@@ -185,7 +188,7 @@ onUnmounted(() => {
       <div class="flex flex-wrap items-center gap-3 text-xs">
         <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border font-medium" :class="scenarioBadgeClass">
           <Activity class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-          <span>当前场景：{{ current?.scenario || '采样初始化…' }}</span>
+          <span>当前场景：{{ liveScenario || '采样初始化…' }}</span>
         </span>
         <span class="inline-flex items-center gap-1.5 text-slate-400 font-mono tabular-nums">
           <Clock class="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
@@ -490,7 +493,7 @@ onUnmounted(() => {
                       <span>CPU: {{ row.peak_cpu_scenario }} ({{ fmtTime(row.peak_cpu_at) }})</span>
                     </span>
                     <span
-                      v-if="row.peak_mem_scenario && row.peak_mem_scenario !== row.peak_cpu_scenario"
+                      v-if="row.peak_mem_scenario"
                       class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/90 border border-slate-700/80 text-[11px]"
                       :title="`内存峰值发生于 ${fmtTime(row.peak_mem_at)}`"
                     >

@@ -111,9 +111,15 @@ pub fn spawn_resource_monitor(state: Arc<AppState>) -> tokio::task::JoinHandle<(
     })
 }
 
+const RECENT_BURST_ATTRIBUTION_SECS: i64 = 45;
+
 pub fn detect_current_scenario(state: &AppState) -> String {
+    let mut parts: Vec<String> = Vec::new();
     if state.sync_ctrl.is_syncing.load(Ordering::Relaxed) {
-        return "媒体库同步中".to_string();
+        parts.push("媒体库同步中".to_string());
+    }
+    if state.scraper.runtime.snapshot().running {
+        parts.push("TMDB 刮削中".to_string());
     }
     let sessions = state
         .sessions
@@ -121,14 +127,45 @@ pub fn detect_current_scenario(state: &AppState) -> String {
         .filter(|entry| entry.is_active())
         .count();
     if sessions > 0 {
-        return format!("并发播放 ({}路)", sessions);
+        parts.push(format!("并发播放 ({}路)", sessions));
     }
-    "日常待机".to_string()
+    if state.caches.image_download_permits.available_permits() < 8 {
+        parts.push("图片回源中".to_string());
+    }
+    if parts.is_empty() {
+        "日常待机".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// 采样归档专用的场景识别：若采样瞬间重任务刚结束（落在 30 秒采样间隔内），
+/// 仍在最近 45 秒余波窗口内的同步/刮削可准确归因，避免残留高 RSS 被误记为“日常待机”。
+pub fn detect_sample_scenario(state: &AppState) -> String {
+    let live = detect_current_scenario(state);
+    if live != "日常待机" {
+        return live;
+    }
+
+    let now = Utc::now();
+    if let Ok(guard) = state.sync_ctrl.last_sync_time.try_read() {
+        if let Some(last_sync) = *guard {
+            if (now - last_sync).num_seconds() <= RECENT_BURST_ATTRIBUTION_SECS {
+                return "媒体库同步".to_string();
+            }
+        }
+    }
+    if let Some(last_scrape) = state.scraper.runtime.snapshot().last_execution_finished {
+        if (now - last_scrape).num_seconds() <= RECENT_BURST_ATTRIBUTION_SECS {
+            return "TMDB 刮削".to_string();
+        }
+    }
+    live
 }
 
 pub async fn collect_and_record(state: &AppState) -> anyhow::Result<ResourceSample> {
     let cfg = state.config.load();
-    let scenario = detect_current_scenario(state);
+    let scenario = detect_sample_scenario(state);
     let pid = std::process::id();
 
     // 1. 当前服务进程 CPU 与 RSS 内存 (Linux 优先直读 /proc，不依赖 procps；macOS 回退 ps)
@@ -249,10 +286,10 @@ pub async fn collect_and_record(state: &AppState) -> anyhow::Result<ResourceSamp
             db_conn_max = GREATEST(resource_daily_stats.db_conn_max, EXCLUDED.db_conn_max),
             disk_used_max_gb = GREATEST(resource_daily_stats.disk_used_max_gb, EXCLUDED.disk_used_max_gb),
             disk_usage_max_pct = GREATEST(resource_daily_stats.disk_usage_max_pct, EXCLUDED.disk_usage_max_pct),
-            peak_cpu_at = CASE WHEN EXCLUDED.app_cpu_max >= resource_daily_stats.app_cpu_max THEN NOW() ELSE resource_daily_stats.peak_cpu_at END,
-            peak_cpu_scenario = CASE WHEN EXCLUDED.app_cpu_max >= resource_daily_stats.app_cpu_max THEN EXCLUDED.peak_cpu_scenario ELSE resource_daily_stats.peak_cpu_scenario END,
-            peak_mem_at = CASE WHEN EXCLUDED.app_mem_max_mb >= resource_daily_stats.app_mem_max_mb THEN NOW() ELSE resource_daily_stats.peak_mem_at END,
-            peak_mem_scenario = CASE WHEN EXCLUDED.app_mem_max_mb >= resource_daily_stats.app_mem_max_mb THEN EXCLUDED.peak_mem_scenario ELSE resource_daily_stats.peak_mem_scenario END,
+            peak_cpu_at = CASE WHEN EXCLUDED.app_cpu_max > resource_daily_stats.app_cpu_max THEN NOW() ELSE resource_daily_stats.peak_cpu_at END,
+            peak_cpu_scenario = CASE WHEN EXCLUDED.app_cpu_max > resource_daily_stats.app_cpu_max THEN EXCLUDED.peak_cpu_scenario ELSE resource_daily_stats.peak_cpu_scenario END,
+            peak_mem_at = CASE WHEN EXCLUDED.app_mem_max_mb > resource_daily_stats.app_mem_max_mb THEN NOW() ELSE resource_daily_stats.peak_mem_at END,
+            peak_mem_scenario = CASE WHEN EXCLUDED.app_mem_max_mb > resource_daily_stats.app_mem_max_mb THEN EXCLUDED.peak_mem_scenario ELSE resource_daily_stats.peak_mem_scenario END,
             sample_count = resource_daily_stats.sample_count + 1,
             updated_at = NOW()
         "#,
@@ -541,4 +578,62 @@ async fn sample_disk_df(path: &std::path::Path) -> Option<(f64, f64, f64, f64)> 
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_current_scenario, detect_sample_scenario};
+    use crate::state::{AppState, PlaybackSession};
+    use chrono::Utc;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn scenario_detection_reports_active_composite_and_burst_attribution() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/test")
+            .unwrap();
+        let (tx, _) = mpsc::channel(1);
+        let state = AppState::new(
+            crate::config::BootstrapFileConfig::default().into_dynamic(),
+            db,
+            tx,
+        )
+        .unwrap();
+
+        assert_eq!(detect_current_scenario(&state), "日常待机");
+        assert_eq!(detect_sample_scenario(&state), "日常待机");
+
+        state.sync_ctrl.is_syncing.store(true, Ordering::Relaxed);
+        state.sessions.insert(
+            "s1".into(),
+            PlaybackSession {
+                session_id: "s1".into(),
+                user_id: "u1".into(),
+                device_id: "d1".into(),
+                device_name: "d1".into(),
+                client_name: "Infuse".into(),
+                current_episode_id: None,
+                position_ticks: 10,
+                duration_ticks: 100,
+                next_ep_prewarmed: false,
+                completed_in_session: false,
+                last_activity: Instant::now(),
+            },
+        );
+        let _permit = state.caches.image_download_permits.acquire().await.unwrap();
+        assert_eq!(
+            detect_current_scenario(&state),
+            "媒体库同步中 · 并发播放 (1路) · 图片回源中"
+        );
+
+        drop(_permit);
+        state.sessions.clear();
+        state.sync_ctrl.is_syncing.store(false, Ordering::Relaxed);
+        *state.sync_ctrl.last_sync_time.write().await = Some(Utc::now());
+
+        assert_eq!(detect_current_scenario(&state), "日常待机");
+        assert_eq!(detect_sample_scenario(&state), "媒体库同步");
+    }
 }

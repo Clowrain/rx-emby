@@ -433,10 +433,12 @@ pub(super) async fn get_resource_metrics(
     let uptime_sec = (chrono::Utc::now() - state.monitor.started_at)
         .num_seconds()
         .max(0);
+    let live_scenario = crate::monitor::detect_current_scenario(&state);
 
     Ok(Json(json!({
         "started_at": state.monitor.started_at,
         "uptime_sec": uptime_sec,
+        "live_scenario": live_scenario,
         "current": current,
         "recent_samples": recent,
         "daily_stats": daily_stats
