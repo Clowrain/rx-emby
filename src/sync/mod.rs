@@ -413,7 +413,11 @@ async fn fetch_source_bytes(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let mut resp = resp;
-        let mut data = Vec::new();
+        let initial_cap = resp
+            .content_length()
+            .map(|len| (len as usize).min(MAX_SYNC_DOWNLOAD_BYTES))
+            .unwrap_or(0);
+        let mut data = Vec::with_capacity(initial_cap);
         while let Some(chunk) = resp.chunk().await? {
             if data.len().saturating_add(chunk.len()) > MAX_SYNC_DOWNLOAD_BYTES {
                 return Err(anyhow!("远程索引超过 {} 字节上限", MAX_SYNC_DOWNLOAD_BYTES));
@@ -449,7 +453,7 @@ async fn fetch_source_bytes(
         let file = fs::File::open(source)
             .await
             .with_context(|| format!("读取本地索引文件失败: {}", source))?;
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity((meta2.len() as usize).min(MAX_SYNC_DOWNLOAD_BYTES));
         file.take(MAX_SYNC_DOWNLOAD_BYTES as u64 + 1)
             .read_to_end(&mut data)
             .await
@@ -495,7 +499,7 @@ async fn extract_txt_from_zip(raw_bytes: Vec<u8>) -> Result<Vec<u8>> {
         if entry.size() > MAX_ZIP_TXT_BYTES as u64 {
             return Err(anyhow!("zip 内 .txt 超过 {} 字节上限", MAX_ZIP_TXT_BYTES));
         }
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity((entry.size() as usize).min(MAX_ZIP_TXT_BYTES));
         entry
             .take(MAX_ZIP_TXT_BYTES as u64 + 1)
             .read_to_end(&mut out)
@@ -508,18 +512,11 @@ async fn extract_txt_from_zip(raw_bytes: Vec<u8>) -> Result<Vec<u8>> {
     .await?
 }
 
-fn trim_process_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
-}
-
 struct SyncMemoryTrimGuard;
 
 impl Drop for SyncMemoryTrimGuard {
     fn drop(&mut self) {
-        trim_process_memory();
+        crate::state::trim_process_memory();
     }
 }
 
@@ -684,7 +681,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
         let mut lines = tokio::io::BufReader::new(txt_bytes.as_slice()).lines();
         let mut total_lines = 0_i32;
-        let mut parsed_records = Vec::with_capacity(100_000);
+        let mut parsed_records = Vec::with_capacity(8_192);
         let mut subtitle_index = scanner::SubtitleIndex::default();
 
         while let Some(line) = lines.next_line().await? {
@@ -733,7 +730,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
         drop(lines);
         drop(txt_bytes);
-        trim_process_memory();
+        crate::state::trim_process_memory();
 
         info!(
             "索引解析完成：读取行数 {}，命中有效视频行 {}，开始择优去重...",

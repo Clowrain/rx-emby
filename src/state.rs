@@ -267,6 +267,43 @@ pub struct CacheLayer {
     pub metadata_tag_map_cache: Cache<String, Arc<std::collections::HashMap<String, String>>>,
 }
 
+impl CacheLayer {
+    /// Moka 0.12 不启用后台淘汰线程；定时执行 pending tasks 才能在无请求时释放过期/失效条目。
+    pub async fn run_pending_tasks(&self) {
+        self.alist_direct_urls.run_pending_tasks().await;
+        self.alist_dir_prewarmed.run_pending_tasks().await;
+        self.image_hot_bytes.run_pending_tasks().await;
+        self.collage_cache.run_pending_tasks().await;
+        self.image_meta_cache.run_pending_tasks().await;
+        self.image_lru_touch_debounce.run_pending_tasks().await;
+        self.token_user_cache.run_pending_tasks().await;
+        self.admin_token_user_cache.run_pending_tasks().await;
+        self.failed_login_attempts.run_pending_tasks().await;
+        self.token_touch_debounce.run_pending_tasks().await;
+        self.admin_stats_cache.run_pending_tasks().await;
+        self.user_categories_cache.run_pending_tasks().await;
+        self.enabled_vlibs_cache.run_pending_tasks().await;
+        self.metadata_tag_map_cache.run_pending_tasks().await;
+    }
+}
+
+/// 提示 Linux glibc 分配器立即归还空闲堆页给操作系统，缓解同步/缓存峰值后的 RSS 驻留。
+pub fn trim_process_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// 锁定 Linux glibc 动态 MMAP/TRIM 阈值（128 KB），避免大块缓存或同步缓冲区把阈值抬升至 32 MB 后长期碎片化驻留堆内。
+pub fn configure_process_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 128 * 1024);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PlaybackSession {
     pub session_id: String,
@@ -319,16 +356,21 @@ impl AppState {
             .build();
 
         let inflight = Cache::builder()
-            .max_capacity(128 * 1024 * 1024)
+            .max_capacity(24 * 1024 * 1024)
             .weigher(|_key: &String, value: &bytes::Bytes| {
                 value.len().min(u32::MAX as usize) as u32
             })
             .time_to_live(Duration::from_secs(600))
+            .time_to_idle(Duration::from_secs(180))
             .build();
 
         let collage_cache = Cache::builder()
-            .max_capacity(128)
+            .max_capacity(8 * 1024 * 1024)
+            .weigher(|_key: &String, value: &bytes::Bytes| {
+                value.len().min(u32::MAX as usize) as u32
+            })
             .time_to_live(Duration::from_secs(86400))
+            .time_to_idle(Duration::from_secs(1800))
             .build();
 
         let image_meta_cache = Cache::builder()
@@ -462,9 +504,18 @@ impl AppState {
         self.sessions.retain(|_, s| s.is_active());
     }
 
+    /// 主动触发全部 Moka 缓存的延迟淘汰与失效回收，并归还 glibc 空闲堆页，
+    /// 避免夜间低峰/待机期间已过期的图片与元数据缓存长期驻留 RSS。
+    pub async fn run_cache_maintenance(&self) {
+        self.caches.run_pending_tasks().await;
+        self.client_capabilities.run_pending_tasks();
+        trim_process_memory();
+    }
+
     pub async fn run_session_cleanup(self: Arc<Self>, interval: Duration) {
         let mut timer = tokio::time::interval(interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_cache_maint = Instant::now();
         let mut last_token_prune = Instant::now();
         loop {
             tokio::select! {
@@ -472,6 +523,10 @@ impl AppState {
                 _ = self.shutdown_token.cancelled() => break,
                 _ = timer.tick() => {
                     self.prune_stale_sessions();
+                    if last_cache_maint.elapsed() >= Duration::from_secs(60) {
+                        last_cache_maint = Instant::now();
+                        self.run_cache_maintenance().await;
+                    }
                     if last_token_prune.elapsed() >= Duration::from_secs(3600) {
                         last_token_prune = Instant::now();
                         let _ = sqlx::query(
@@ -749,5 +804,47 @@ mod session_hub_tests {
         assert!(second.is_cancelled());
         assert!(!bob_cancelled.is_cancelled());
         hub.unregister(&id);
+    }
+
+    #[tokio::test]
+    async fn cache_maintenance_reclaims_invalidated_entries_and_weights_collages() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/test")
+            .unwrap();
+        let (tx, _) = mpsc::channel(1);
+        let state = AppState::new(
+            crate::config::BootstrapFileConfig::default().into_dynamic(),
+            db,
+            tx,
+        )
+        .unwrap();
+
+        state
+            .caches
+            .image_hot_bytes
+            .insert("w500/a.jpg".into(), bytes::Bytes::from(vec![1u8; 4096]))
+            .await;
+        state
+            .caches
+            .collage_cache
+            .insert("collage:lib_tv:cards".into(), bytes::Bytes::from(vec![2u8; 8192]))
+            .await;
+        state
+            .client_capabilities
+            .insert("tok".into(), serde_json::json!({"SupportsMediaControl": true}));
+
+        state.run_cache_maintenance().await;
+        assert_eq!(state.caches.image_hot_bytes.weighted_size(), 4096);
+        assert_eq!(state.caches.collage_cache.weighted_size(), 8192);
+        assert_eq!(state.client_capabilities.entry_count(), 1);
+
+        state.caches.image_hot_bytes.invalidate_all();
+        state.caches.collage_cache.invalidate_all();
+        state.client_capabilities.invalidate_all();
+        state.run_cache_maintenance().await;
+
+        assert_eq!(state.caches.image_hot_bytes.weighted_size(), 0);
+        assert_eq!(state.caches.collage_cache.weighted_size(), 0);
+        assert_eq!(state.client_capabilities.entry_count(), 0);
     }
 }

@@ -62,6 +62,31 @@
           <span>高水位触发线: {{ (cacheStats.high_watermark * 100).toFixed(0) }}%</span>
           <span>低水位安全线: {{ (cacheStats.low_watermark * 100).toFixed(0) }}%</span>
         </div>
+
+        <div
+          v-if="cacheStats.disk_cache_enabled === false"
+          role="alert"
+          class="mt-3 rounded-xl bg-amber-500/10 border border-amber-500/35 px-3.5 py-3 flex items-start gap-2.5 text-xs text-amber-200 leading-relaxed"
+        >
+          <AlertTriangle class="w-4 h-4 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+          <div class="space-y-1">
+            <p class="font-semibold text-amber-300">已关闭本地磁盘缓存（当前为直通模式）</p>
+            <p class="text-amber-100/90">
+              系统当前仅保留 <span class="font-mono text-amber-200">24 MB</span> 海报内存热缓存（空闲 3 分钟回收）与
+              <span class="font-mono text-amber-200">8 MB</span> 封面缓存。超出容量或过期后，客户端每次请求都将实时回源 TMDB，可能拖慢海报墙加载并受代理网络波动影响。建议在下方重新开启本地磁盘缓存，以兼顾低内存与秒开体验。
+            </p>
+          </div>
+        </div>
+
+        <div
+          v-else
+          class="mt-3 rounded-xl bg-slate-950/60 border border-slate-800/80 px-3.5 py-2.5 flex items-start gap-2 text-[11px] text-slate-400 leading-relaxed"
+        >
+          <Info class="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" aria-hidden="true" />
+          <span>
+            低内存策略已生效：海报内存热缓存上限 <strong class="text-slate-200 font-mono">24 MB</strong>（空闲 3 分钟自动释放），封面缓存上限 <strong class="text-slate-200 font-mono">8 MB</strong>（空闲 30 分钟释放）；未命中内存时直接读取本地磁盘缓存，无需重复回源 TMDB。
+          </span>
+        </div>
       </div>
     </div>
 
@@ -78,7 +103,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { HardDrive, Eraser, RefreshCw, SlidersHorizontal } from 'lucide-vue-next'
+import { HardDrive, Eraser, RefreshCw, SlidersHorizontal, AlertTriangle, Info } from 'lucide-vue-next'
 import { adminApi } from '../api/admin'
 import { useToast } from '../composables/useToast'
 import ConfigGroupPanel from './ConfigGroupPanel.vue'

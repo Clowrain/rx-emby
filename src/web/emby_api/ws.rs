@@ -251,6 +251,9 @@ async fn process_reports_in_order<F>(
     }
 }
 
+const WS_PING_INTERVAL: Duration = Duration::from_secs(60);
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
 async fn send_ws_message(socket: &mut WebSocket, message: Message) -> bool {
     matches!(
         tokio::time::timeout(std::time::Duration::from_secs(10), socket.send(message)).await,
@@ -315,8 +318,20 @@ async fn handle_ws_connection(
             return;
         }
         let mut sessions_subscribed = false;
+        let mut last_seen = tokio::time::Instant::now();
+        let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ping_interval.tick().await;
         loop {
             tokio::select! {
+                _ = ping_interval.tick() => {
+                    if last_seen.elapsed() >= WS_IDLE_TIMEOUT {
+                        break;
+                    }
+                    if !send_ws_message(&mut socket, Message::Ping(Vec::new())).await {
+                        break;
+                    }
+                }
                 outgoing = outbound.recv() => {
                     let Some(outgoing) = outgoing else { break; };
                     if !sessions_subscribed && outgoing.kind == crate::state::HubEventKind::Sessions { continue; }
@@ -324,6 +339,7 @@ async fn handle_ws_connection(
                 }
                 incoming = socket.recv() => {
                     let Some(Ok(message)) = incoming else { break; };
+                    last_seen = tokio::time::Instant::now();
                     match message {
                         Message::Text(text) => {
                             let Ok(message) = serde_json::from_str::<Value>(&text) else { continue; };
@@ -348,6 +364,7 @@ async fn handle_ws_connection(
                             }
                         }
                         Message::Ping(bytes) => { if !send_ws_message(&mut socket, Message::Pong(bytes)).await { break; } }
+                        Message::Pong(_) => {}
                         Message::Close(_) => break,
                         _ => {}
                     }

@@ -77,7 +77,9 @@ COPY deploy/config.example.toml /app/config.example.toml
 RUN mkdir -p /app/cache/images
 
 ENV RUST_LOG=rx_emby=info \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_MMAP_THRESHOLD_=131072
 
 EXPOSE 8096
 

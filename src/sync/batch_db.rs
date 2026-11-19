@@ -38,13 +38,35 @@ fn record_rank(r: &ParsedStrmRecord) -> (bool, bool, i32) {
     (r.tmdb_id.is_some(), !r.has_noise_prefix, r.priority_score)
 }
 
+fn same_file_hash(rec: &ParsedStrmRecord) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(rec.root_dir.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&rec.season_number.to_le_bytes());
+    hasher.update(&rec.episode_number.to_le_bytes());
+    hasher.update(&[0]);
+    hasher.update(rec.file_name.as_bytes());
+    hasher.digest()
+}
+
+fn is_same_logical_file(a: &ParsedStrmRecord, b: &ParsedStrmRecord) -> bool {
+    a.season_number == b.season_number
+        && a.episode_number == b.episode_number
+        && a.root_dir == b.root_dir
+        && a.file_name == b.file_name
+}
+
+enum DedupSlot {
+    One(usize),
+    Many(Vec<usize>),
+}
+
 /// 内存级去重与同源重复目录收敛：
 /// 1. 相同物理 path_hash 择优保留（优先带 tmdb_id、非 刮削失败/ 前缀、评分更高）
 /// 2. 同逻辑目录同集数下末级文件名一致时保留高权重版本
 pub fn deduplicate_records(records: Vec<ParsedStrmRecord>) -> Vec<ParsedStrmRecord> {
     let mut seen_hashes: HashMap<i64, usize> = HashMap::with_capacity(records.len());
-    let mut seen_same_file: HashMap<(String, i32, i32, String), usize> =
-        HashMap::with_capacity(records.len());
+    let mut seen_same_file: HashMap<u64, DedupSlot> = HashMap::with_capacity(records.len());
     let mut result: Vec<ParsedStrmRecord> = Vec::with_capacity(records.len());
 
     for rec in records {
@@ -55,14 +77,16 @@ pub fn deduplicate_records(records: Vec<ParsedStrmRecord>) -> Vec<ParsedStrmReco
             continue;
         }
 
-        let ep_file_key = (
-            rec.root_dir.clone(),
-            rec.season_number,
-            rec.episode_number,
-            rec.file_name.clone(),
-        );
+        let fp = same_file_hash(&rec);
+        let existing_same = seen_same_file.get(&fp).and_then(|slot| match slot {
+            DedupSlot::One(idx) => is_same_logical_file(&result[*idx], &rec).then_some(*idx),
+            DedupSlot::Many(indices) => indices
+                .iter()
+                .copied()
+                .find(|&idx| is_same_logical_file(&result[idx], &rec)),
+        });
 
-        if let Some(&existing_idx) = seen_same_file.get(&ep_file_key) {
+        if let Some(existing_idx) = existing_same {
             if record_rank(&rec) > record_rank(&result[existing_idx]) {
                 let old_hash = result[existing_idx].path_hash;
                 seen_hashes.remove(&old_hash);
@@ -74,7 +98,18 @@ pub fn deduplicate_records(records: Vec<ParsedStrmRecord>) -> Vec<ParsedStrmReco
 
         let idx = result.len();
         seen_hashes.insert(rec.path_hash, idx);
-        seen_same_file.insert(ep_file_key, idx);
+        match seen_same_file.entry(fp) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(DedupSlot::One(idx));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                DedupSlot::One(prev) => {
+                    let prev_idx = *prev;
+                    *entry.get_mut() = DedupSlot::Many(vec![prev_idx, idx]);
+                }
+                DedupSlot::Many(indices) => indices.push(idx),
+            },
+        }
         result.push(rec);
     }
 
@@ -427,7 +462,51 @@ pub async fn apply_sync_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{subtitle_digest_changed, subtitles_digest};
+    use super::{deduplicate_records, subtitle_digest_changed, subtitles_digest};
+    use crate::sync::parser::ParsedStrmRecord;
+
+    fn sample_record(
+        path_hash: i64,
+        root_dir: &str,
+        file_name: &str,
+        priority_score: i32,
+        tmdb_id: Option<i32>,
+    ) -> ParsedStrmRecord {
+        ParsedStrmRecord {
+            alist_path: format!("/{root_dir}/{file_name}"),
+            path_hash,
+            root_dir: root_dir.to_string(),
+            raw_folder_name: root_dir.to_string(),
+            clean_title: "Test".to_string(),
+            year: Some(2024),
+            tmdb_id,
+            inferred_media_type: "tv".to_string(),
+            inferred_category: "电视剧".to_string(),
+            season_number: 1,
+            episode_number: 1,
+            file_name: file_name.to_string(),
+            container: "mkv".to_string(),
+            version_tag: "1080P".to_string(),
+            priority_score,
+            has_noise_prefix: false,
+            subtitles: vec![],
+        }
+    }
+
+    #[test]
+    fn deduplicate_records_keeps_highest_ranked_by_hash_and_logical_file() {
+        let low = sample_record(1, "剧集/A", "E01.mkv", 10, None);
+        let high_same_file = sample_record(2, "剧集/A", "E01.mkv", 50, Some(999));
+        let low_same_hash = sample_record(2, "剧集/A", "E01.mkv", 5, None);
+        let distinct = sample_record(3, "剧集/B", "E01.mkv", 20, None);
+
+        let deduped = deduplicate_records(vec![low, high_same_file, low_same_hash, distinct]);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].path_hash, 2);
+        assert_eq!(deduped[0].tmdb_id, Some(999));
+        assert_eq!(deduped[0].priority_score, 50);
+        assert_eq!(deduped[1].path_hash, 3);
+    }
 
     #[test]
     fn subtitle_updates_include_only_actual_deltas() {

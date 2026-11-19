@@ -407,6 +407,9 @@ onUnmounted(() => {
               采样点累积中（超过 2 个点后自动绘制曲线）
             </div>
           </div>
+          <p class="text-[11px] text-slate-400 leading-relaxed">
+            低内存策略：海报热缓存 ≤ <span class="font-mono text-slate-300">24 MB</span>（空闲 3 分钟回收）、封面缓存 ≤ <span class="font-mono text-slate-300">8 MB</span>（空闲 30 分钟回收），每 60 秒自动回收过期缓存并归还空闲堆页。全量同步 <span class="font-mono text-slate-300">strm.txt</span> 期间内存会短暂冲高，完成后自动回落。
+          </p>
         </div>
       </div>
 

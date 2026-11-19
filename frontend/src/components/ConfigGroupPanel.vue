@@ -39,22 +39,32 @@
           </p>
         </div>
 
-        <div v-if="isBooleanConfig(c)" class="flex items-center justify-between pt-1">
-          <span class="text-xs font-mono" :class="c.config_value === 'true' ? 'text-emerald-400' : 'text-slate-500'">
-            {{ c.config_value === 'true' ? '已启用' : '已关闭' }}
-          </span>
-          <button
-            :id="`cfg-${c.config_key}`"
-            type="button"
-            role="switch"
-            :aria-checked="c.config_value === 'true'"
-            :aria-describedby="`desc-${c.config_key}`"
-            @click="c.config_value = c.config_value === 'true' ? 'false' : 'true'"
-            class="cursor-pointer w-12 h-6 rounded-full p-0.5 transition-colors duration-200 flex items-center"
-            :class="c.config_value === 'true' ? 'bg-emerald-600 justify-end' : 'bg-slate-800 justify-start'"
+        <div v-if="isBooleanConfig(c)" class="space-y-2 pt-1">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-mono" :class="c.config_value === 'true' ? 'text-emerald-400' : 'text-slate-500'">
+              {{ c.config_value === 'true' ? '已启用' : '已关闭' }}
+            </span>
+            <button
+              :id="`cfg-${c.config_key}`"
+              type="button"
+              role="switch"
+              :aria-checked="c.config_value === 'true'"
+              :aria-describedby="`desc-${c.config_key}`"
+              @click="c.config_value = c.config_value === 'true' ? 'false' : 'true'"
+              class="cursor-pointer w-12 h-6 rounded-full p-0.5 transition-colors duration-200 flex items-center"
+              :class="c.config_value === 'true' ? 'bg-emerald-600 justify-end' : 'bg-slate-800 justify-start'"
+            >
+              <span class="w-5 h-5 rounded-full bg-white shadow"></span>
+            </button>
+          </div>
+          <p
+            v-if="c.config_key === 'image_cache.disk_cache_enabled' && c.config_value !== 'true'"
+            role="alert"
+            class="rounded-lg bg-amber-500/10 border border-amber-500/30 px-2.5 py-2 text-[11px] text-amber-200 leading-relaxed flex items-start gap-1.5"
           >
-            <span class="w-5 h-5 rounded-full bg-white shadow"></span>
-          </button>
+            <AlertTriangle class="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+            <span>关闭后内存热缓存仅保留 24 MB（空闲 3 分钟自动释放），未命中时需实时回源 TMDB，海报加载速度将受网络与代理延迟影响。</span>
+          </p>
         </div>
 
         <div v-else-if="c.value_type === 'secret'" class="relative">
@@ -93,7 +103,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
-import { Check, Eye, EyeOff } from 'lucide-vue-next'
+import { Check, Eye, EyeOff, AlertTriangle } from 'lucide-vue-next'
 import { adminApi } from '../api/admin'
 import { useToast } from '../composables/useToast'
 
@@ -158,7 +168,7 @@ const descMap = {
   'sync.include_prefixes': '仅同步匹配指定前缀的目录（多个用逗号分隔），留空则同步全部目录',
   'sync.exclude_keywords': '路径中包含这些关键词的条目将被自动跳过（多个用逗号分隔）',
   'sync.max_lines_limit': '设为 0 表示全量读取；调试时可设为较小数值（如 5000）以加快测试速度',
-  'image_cache.disk_cache_enabled': '开启后将拉取的 TMDB 图片落盘缓存并启用 LRU 淘汰；关闭后不写入本地磁盘，由后台实时网络代理直接返回图片流',
+  'image_cache.disk_cache_enabled': '开启后将拉取的 TMDB 海报与剧照落盘保存，配合 24 MB 轻量内存热缓存实现秒开与低内存常驻；关闭后不写磁盘，内存淘汰后需实时回源 TMDB',
   'image_cache.cache_dir': '海报与剧照在本地磁盘上的存储目录路径',
   'image_cache.max_size_mb': '本地图片缓存允许占用的最大磁盘空间（MB）',
   'image_cache.evict_high_watermark': '当缓存占用超过该比例（如 0.90 即 90%）时，自动触发过期清理',
