@@ -6,12 +6,12 @@
       @click.self="emit('close')"
     >
       <aside
-        class="w-full max-w-xl bg-slate-900 border-l border-slate-800 h-full flex flex-col shadow-2xl"
+        class="w-full max-w-xl bg-slate-900 sm:border-l border-slate-800 h-full flex flex-col shadow-2xl overscroll-contain"
         role="dialog"
         aria-modal="true"
         aria-label="目录刮削与校验排查"
       >
-        <div class="px-5 py-4 border-b border-slate-800 flex items-start justify-between gap-3">
+        <div class="px-4 sm:px-5 pt-[max(1rem,env(safe-area-inset-top))] pb-3.5 sm:py-4 border-b border-slate-800 flex items-start justify-between gap-3">
           <div class="min-w-0">
             <div class="flex flex-wrap items-center gap-2">
               <h3 class="text-base font-bold text-white truncate">
@@ -38,14 +38,14 @@
           <button
             type="button"
             @click="emit('close')"
-            class="cursor-pointer p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 shrink-0"
+            class="cursor-pointer w-10 h-10 sm:w-8 sm:h-8 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 flex items-center justify-center shrink-0"
             aria-label="关闭排查抽屉"
           >
             <X class="w-4 h-4" />
           </button>
         </div>
 
-        <div class="flex-1 overflow-y-auto p-5 space-y-5">
+        <div class="flex-1 overflow-y-auto overscroll-contain p-4 sm:p-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] space-y-5">
           <!-- 诊断原因 -->
           <div
             role="alert"

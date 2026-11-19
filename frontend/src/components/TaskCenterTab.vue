@@ -230,7 +230,10 @@
 
       <!-- 刮削任务记录表 -->
       <div v-if="recordTab === 'scrape'" tabindex="0" role="region" aria-label="TMDB 刮削任务记录" class="table-wrapper">
-        <table class="w-full text-sm text-left">
+        <table
+          class="w-full text-sm text-left"
+          style="--label-2: '任务名称'; --label-3: '开始时间'; --label-4: '结束时间'; --label-5: '进度'; --label-6: '成功'; --label-7: '失败/存疑'; --label-8: '状态'"
+        >
           <thead class="bg-[#090d16] text-xs text-slate-400 border-b border-slate-800">
             <tr>
               <th scope="col" class="px-5 py-3.5 font-semibold whitespace-nowrap">任务序号</th>

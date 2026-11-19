@@ -1,7 +1,7 @@
 <template>
   <div
     v-if="visible"
-    class="border-b border-slate-800/80 bg-[#0a101d]/95 backdrop-blur-md px-8 py-2.5 transition-colors"
+    class="border-b border-slate-800/80 bg-[#0a101d]/95 backdrop-blur-md px-4 sm:px-6 lg:px-8 py-2.5 transition-colors"
     role="region"
     aria-label="后台刮削任务进度"
   >

@@ -28,7 +28,7 @@ const emit = defineEmits(['close', 'submit'])
           type="button"
           aria-label="关闭绑定弹窗"
           @click="emit('close')"
-          class="cursor-pointer text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
+          class="cursor-pointer text-slate-400 hover:text-white w-10 h-10 sm:w-8 sm:h-8 rounded-xl hover:bg-slate-800 flex items-center justify-center transition-colors"
         >
           <X class="w-4 h-4" aria-hidden="true" />
         </button>

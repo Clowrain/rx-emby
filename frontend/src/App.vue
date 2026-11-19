@@ -15,7 +15,8 @@ import {
   Radio,
   Server,
   Cpu,
-  ListTodo
+  ListTodo,
+  Menu
 } from 'lucide-vue-next'
 import {
   adminApi,
@@ -26,6 +27,7 @@ import {
 import { confirmState, resolveConfirm } from './composables/useToast'
 import LoginView from './components/LoginView.vue'
 import AdminSidebar from './components/layout/AdminSidebar.vue'
+import MobileBottomNav from './components/layout/MobileBottomNav.vue'
 import BuildVersionBadge from './components/layout/BuildVersionBadge.vue'
 import ScrapeTaskBanner from './components/layout/ScrapeTaskBanner.vue'
 import ToastContainer from './components/layout/ToastContainer.vue'
@@ -46,6 +48,7 @@ const authChecking = ref(true)
 const currentUser = ref(null)
 const authNotice = ref('')
 const activeTab = ref('overview')
+const mobileMenuOpen = ref(false)
 const drawerMediaId = ref(null)
 const overview = ref(null)
 const refreshingOverview = ref(false)
@@ -183,6 +186,8 @@ function handleGlobalKeydown(e) {
       resolveConfirm(false)
     } else if (drawerMediaId.value) {
       drawerMediaId.value = null
+    } else if (mobileMenuOpen.value) {
+      mobileMenuOpen.value = false
     }
   }
 }
@@ -233,15 +238,24 @@ async function handleLogout() {
     currentUser.value = null
     overview.value = null
     drawerMediaId.value = null
+    mobileMenuOpen.value = false
     authNotice.value = ''
   }
 }
+
+watch(
+  [mobileMenuOpen, drawerMediaId],
+  ([menuOpen, mediaId]) => {
+    document.body.style.overflow = menuOpen || mediaId !== null ? 'hidden' : ''
+  }
+)
 
 onMounted(() => {
   setUnauthorizedHandler(msg => {
     currentUser.value = null
     overview.value = null
     drawerMediaId.value = null
+    mobileMenuOpen.value = false
     authNotice.value = msg || '登录已失效，请重新登录'
   })
   verifySession()
@@ -249,6 +263,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  document.body.style.overflow = ''
   window.removeEventListener('keydown', handleGlobalKeydown)
 })
 </script>
@@ -276,24 +291,39 @@ onUnmounted(() => {
     <AdminSidebar
       :nav-groups="navGroups"
       :active-tab="activeTab"
+      :mobile-open="mobileMenuOpen"
+      :current-user="currentUser"
+      :overview="overview"
       @switch-tab="switchTab"
+      @close="mobileMenuOpen = false"
+      @logout="handleLogout"
     />
 
     <!-- 右侧主工作区 -->
     <div class="flex-1 flex flex-col min-w-0">
-      <header class="bg-[#080c16]/80 backdrop-blur-md border-b border-slate-800/80 px-8 py-4 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-20">
-        <div>
-          <h1 id="main-workspace" tabindex="-1" class="text-lg font-bold text-white tracking-tight outline-none">
-            {{ currentTabMeta.title }}
-          </h1>
-          <p class="text-xs text-slate-400 mt-0.5">{{ currentTabMeta.subtitle }}</p>
+      <header class="bg-[#080c16]/85 backdrop-blur-md border-b border-slate-800/80 px-4 sm:px-6 lg:px-8 pt-[max(0.75rem,env(safe-area-inset-top))] pb-3 lg:py-4 flex items-center justify-between gap-3 lg:gap-4 sticky top-0 z-20">
+        <div class="flex items-center gap-3 min-w-0">
+          <button
+            type="button"
+            @click="mobileMenuOpen = true"
+            class="lg:hidden cursor-pointer w-11 h-11 -ml-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-800 text-slate-200 flex items-center justify-center shrink-0 active:scale-95 transition-transform"
+            aria-label="打开导航菜单"
+          >
+            <Menu class="w-5 h-5" aria-hidden="true" />
+          </button>
+          <div class="min-w-0">
+            <h1 id="main-workspace" tabindex="-1" class="text-base sm:text-lg font-bold text-white tracking-tight outline-none truncate">
+              {{ currentTabMeta.title }}
+            </h1>
+            <p class="hidden lg:block text-xs text-slate-400 mt-0.5">{{ currentTabMeta.subtitle }}</p>
+          </div>
         </div>
 
-        <div class="flex items-center gap-2.5">
+        <div class="flex items-center gap-2 lg:gap-2.5 shrink-0">
           <button
             type="button"
             @click="switchTab('sessions')"
-            class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-emerald-500/40 transition-colors tabular-nums"
+            class="hidden lg:flex cursor-pointer items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-emerald-500/40 transition-colors tabular-nums"
           >
             <Activity
               class="w-3.5 h-3.5"
@@ -307,7 +337,7 @@ onUnmounted(() => {
           <button
             type="button"
             @click="switchTab('cache')"
-            class="cursor-pointer flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-cyan-500/40 transition-colors tabular-nums"
+            class="hidden lg:flex cursor-pointer items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs hover:border-cyan-500/40 transition-colors tabular-nums"
           >
             <HardDrive class="w-3.5 h-3.5 text-cyan-400" aria-hidden="true" />
             <span class="text-slate-400">图片缓存</span>
@@ -319,13 +349,14 @@ onUnmounted(() => {
           <button
             type="button"
             @click="fetchOverview"
-            class="cursor-pointer px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-200 transition-colors flex items-center gap-1.5"
+            class="cursor-pointer min-h-[44px] min-w-[44px] lg:min-h-0 lg:min-w-0 px-2.5 lg:px-3 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 border border-slate-700/70 text-xs font-medium text-slate-200 transition-colors flex items-center justify-center gap-1.5 active:scale-95"
+            aria-label="刷新数据"
           >
-            <RefreshCw class="w-3.5 h-3.5 text-slate-300" :class="{ 'animate-spin': refreshingOverview }" aria-hidden="true" />
-            <span>刷新数据</span>
+            <RefreshCw class="w-4 h-4 lg:w-3.5 lg:h-3.5 text-slate-300" :class="{ 'animate-spin': refreshingOverview }" aria-hidden="true" />
+            <span class="hidden lg:inline">刷新数据</span>
           </button>
 
-          <div class="flex items-center gap-2 pl-2 border-l border-slate-800/80">
+          <div class="hidden lg:flex items-center gap-2 pl-2 border-l border-slate-800/80">
             <span class="px-2.5 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-xs text-emerald-300 font-medium flex items-center gap-1.5">
               <ShieldCheck class="w-3.5 h-3.5 text-emerald-400" aria-hidden="true" />
               <span>{{ currentUser.username }}</span>
@@ -345,7 +376,7 @@ onUnmounted(() => {
 
       <ScrapeTaskBanner @completed="fetchOverview" @open-tasks="switchTab('tasks')" />
 
-      <main class="flex-1 p-8 max-w-[1600px] w-full mx-auto">
+      <main class="flex-1 p-4 sm:p-6 lg:p-8 pb-[calc(5.25rem+env(safe-area-inset-bottom))] lg:pb-8 max-w-[1600px] w-full mx-auto min-w-0">
         <OverviewDashboard
           v-if="activeTab === 'overview'"
           :overview="overview"
@@ -368,7 +399,7 @@ onUnmounted(() => {
         <HotConfigTab v-else-if="activeTab === 'config'" @saved="fetchOverview" />
       </main>
 
-      <footer class="border-t border-slate-800/70 bg-[#080c16]/60 backdrop-blur-sm">
+      <footer class="hidden lg:block border-t border-slate-800/70 bg-[#080c16]/60 backdrop-blur-sm">
         <div class="max-w-[1600px] w-full mx-auto px-8 py-3.5 flex flex-wrap items-center justify-between gap-x-6 gap-y-2.5">
           <!-- 左侧：302 直链转发引擎运行态 -->
           <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs font-mono tabular-nums text-slate-400 min-w-0">
@@ -409,6 +440,12 @@ onUnmounted(() => {
       </footer>
     </div>
 
+    <MobileBottomNav
+      :active-tab="activeTab"
+      :menu-open="mobileMenuOpen"
+      @switch-tab="switchTab"
+      @open-menu="mobileMenuOpen = true"
+    />
     <MediaDetailDrawer :media-id="drawerMediaId" @close="drawerMediaId = null" />
     <ToastContainer />
     <ConfirmModal />

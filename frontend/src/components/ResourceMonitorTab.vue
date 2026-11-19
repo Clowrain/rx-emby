@@ -430,7 +430,83 @@ onUnmounted(() => {
           暂无每日审计数据，点击右上角「立即采样」即可生成首条记录
         </div>
 
-        <div v-else class="overflow-x-auto">
+        <template v-else>
+          <!-- 移动端卡片列表 -->
+          <div class="md:hidden space-y-2.5 text-xs tabular-nums">
+            <div
+              v-for="(row, idx) in dailyStats"
+              :key="`m-${row.stat_date}`"
+              class="rounded-xl bg-slate-950/70 border border-slate-800/80 p-3.5 space-y-2.5"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex items-center gap-1.5 font-mono text-slate-200 font-semibold">
+                  <span>{{ row.stat_date }}</span>
+                  <span
+                    v-if="idx === 0"
+                    class="px-1.5 py-0.5 text-[10px] rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25"
+                  >
+                    今日
+                  </span>
+                </div>
+                <span class="text-[11px] font-mono text-slate-400">{{ row.sample_count }} 次采样</span>
+              </div>
+
+              <div class="grid grid-cols-2 gap-2 font-mono text-[11px]">
+                <div class="bg-slate-900/70 rounded-lg px-2.5 py-1.5">
+                  <div class="text-slate-400 font-sans text-[10px]">CPU 均值 / 峰值</div>
+                  <div class="mt-0.5">
+                    <span class="text-slate-300">{{ fmtNum(row.app_cpu_avg, 1) }}%</span>
+                    <span class="text-slate-600 mx-1">/</span>
+                    <span :class="row.app_cpu_max >= 80 ? 'text-rose-400 font-semibold' : 'text-emerald-400'">
+                      {{ fmtNum(row.app_cpu_max, 1) }}%
+                    </span>
+                  </div>
+                </div>
+                <div class="bg-slate-900/70 rounded-lg px-2.5 py-1.5">
+                  <div class="text-slate-400 font-sans text-[10px]">内存 均值 / 峰值</div>
+                  <div class="mt-0.5">
+                    <span class="text-slate-300">{{ fmtNum(row.app_mem_avg_mb, 1) }}</span>
+                    <span class="text-slate-600 mx-1">/</span>
+                    <span class="text-cyan-400">{{ fmtNum(row.app_mem_max_mb, 1) }} MB</span>
+                  </div>
+                </div>
+                <div class="bg-slate-900/70 rounded-lg px-2.5 py-1.5">
+                  <div class="text-slate-400 font-sans text-[10px]">DB 体积 · 连接</div>
+                  <div class="mt-0.5 text-slate-300">
+                    {{ fmtNum(row.db_size_max_mb, 1) }} MB · {{ row.db_conn_max }}
+                  </div>
+                </div>
+                <div class="bg-slate-900/70 rounded-lg px-2.5 py-1.5">
+                  <div class="text-slate-400 font-sans text-[10px]">磁盘峰值</div>
+                  <div class="mt-0.5">
+                    <span :class="row.disk_usage_max_pct >= 85 ? 'text-amber-400 font-semibold' : 'text-slate-300'">
+                      {{ fmtNum(row.disk_usage_max_pct, 1) }}%
+                    </span>
+                    <span class="text-slate-500 ml-1">({{ fmtNum(row.disk_used_max_gb, 1) }}G)</span>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="row.peak_cpu_scenario || row.peak_mem_scenario" class="flex flex-wrap gap-1.5 text-[11px] text-slate-300">
+                <span
+                  v-if="row.peak_cpu_scenario"
+                  class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/90 border border-slate-700/80"
+                >
+                  <AlertTriangle v-if="row.app_cpu_max >= 80" class="w-3 h-3 text-rose-400" aria-hidden="true" />
+                  <span>CPU: {{ row.peak_cpu_scenario }} ({{ fmtTime(row.peak_cpu_at) }})</span>
+                </span>
+                <span
+                  v-if="row.peak_mem_scenario"
+                  class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/90 border border-slate-700/80"
+                >
+                  <span>内存: {{ row.peak_mem_scenario }} ({{ fmtTime(row.peak_mem_at) }})</span>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 桌面端表格 -->
+          <div class="hidden md:block overflow-x-auto">
           <table class="w-full text-left border-collapse text-xs tabular-nums">
             <thead>
               <tr class="border-b border-slate-800 text-slate-400 font-medium">
@@ -504,7 +580,8 @@ onUnmounted(() => {
               </tr>
             </tbody>
           </table>
-        </div>
+          </div>
+        </template>
       </div>
     </template>
   </section>

@@ -7,31 +7,41 @@
     class="fixed inset-0 bg-black/75 backdrop-blur-xs z-50 flex justify-end"
   >
     <div @click="$emit('close')" class="flex-1"></div>
-    <div class="w-full max-w-3xl bg-[#0b101b] border-l border-slate-800 h-full flex flex-col shadow-2xl">
-      <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-[#080c16]/90">
-        <div class="flex items-center gap-3 min-w-0">
-          <h2 id="drawer-media-title" class="text-lg font-bold text-white truncate">
-            {{ media ? `${media.title} ${media.year ? `(${media.year})` : ''}` : '影视详情与多版本源明细' }}
-          </h2>
-          <span
-            v-if="media"
-            class="shrink-0 text-xs px-2.5 py-0.5 rounded-md bg-emerald-950 text-emerald-300 border border-emerald-500/30"
+    <div class="w-full max-w-3xl bg-[#0b101b] sm:border-l border-slate-800 h-full flex flex-col shadow-2xl overscroll-contain">
+      <div class="px-4 sm:px-6 pt-[max(0.875rem,env(safe-area-inset-top))] pb-3.5 sm:py-4 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#080c16]/90 shrink-0">
+        <div class="flex items-center justify-between gap-2 min-w-0">
+          <div class="flex flex-wrap items-center gap-2 min-w-0">
+            <h2 id="drawer-media-title" class="text-base sm:text-lg font-bold text-white truncate">
+              {{ media ? `${media.title} ${media.year ? `(${media.year})` : ''}` : '影视详情与多版本源明细' }}
+            </h2>
+            <span
+              v-if="media"
+              class="shrink-0 text-[11px] sm:text-xs px-2 sm:px-2.5 py-0.5 rounded-md bg-emerald-950 text-emerald-300 border border-emerald-500/30"
+            >
+              {{ media.category }} · {{ media.media_type === 'movie' ? '电影' : '剧集' }}
+            </span>
+            <span
+              v-if="media && (media.is_locked || !media.tmdb_id)"
+              class="shrink-0 text-[11px] sm:text-xs px-2 py-0.5 rounded-md bg-amber-950/80 text-amber-300 border border-amber-500/35"
+            >
+              {{ media.tmdb_id ? '已锁定' : '手动维护' }}
+            </span>
+          </div>
+          <button
+            type="button"
+            aria-label="关闭详情抽屉"
+            @click="$emit('close')"
+            class="sm:hidden cursor-pointer bg-slate-800 hover:bg-slate-700 w-10 h-10 rounded-xl text-xs text-slate-300 flex items-center justify-center shrink-0"
           >
-            {{ media.category }} · {{ media.media_type === 'movie' ? '电影' : '剧集' }}
-          </span>
-          <span
-            v-if="media && (media.is_locked || !media.tmdb_id)"
-            class="shrink-0 text-xs px-2 py-0.5 rounded-md bg-amber-950/80 text-amber-300 border border-amber-500/35"
-          >
-            {{ media.tmdb_id ? '已锁定' : '手动维护' }}
-          </span>
+            <X class="w-4 h-4" aria-hidden="true" />
+          </button>
         </div>
-        <div class="flex items-center gap-2 shrink-0">
+        <div class="flex flex-wrap items-center gap-2 shrink-0">
           <button
             v-if="media"
             type="button"
             @click="toggleEditMetadata"
-            class="cursor-pointer bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 px-3 py-1.5 rounded-xl text-xs font-medium text-indigo-200 transition-colors flex items-center gap-1.5"
+            class="cursor-pointer min-h-[38px] sm:min-h-0 bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 px-3 py-1.5 rounded-xl text-xs font-medium text-indigo-200 transition-colors flex items-center gap-1.5"
           >
             <Pencil class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
             <span>{{ editingMetadata ? '收起编辑' : '编辑信息' }}</span>
@@ -41,7 +51,7 @@
             type="button"
             @click="handleUnbindTmdb(false)"
             :disabled="savingMetadata"
-            class="cursor-pointer bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 disabled:opacity-50 px-3 py-1.5 rounded-xl text-xs font-medium text-amber-200 transition-colors flex items-center gap-1.5"
+            class="cursor-pointer min-h-[38px] sm:min-h-0 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 disabled:opacity-50 px-3 py-1.5 rounded-xl text-xs font-medium text-amber-200 transition-colors flex items-center gap-1.5"
             title="取消 TMDB 关联并转为手动维护（仍保留在海报墙）"
           >
             <Unlink class="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
@@ -51,16 +61,16 @@
             type="button"
             @click="handlePrewarmDirs"
             :disabled="prewarming"
-            class="cursor-pointer bg-sky-600/25 hover:bg-sky-600/40 border border-sky-500/40 disabled:opacity-50 px-3.5 py-1.5 rounded-xl text-xs font-medium text-sky-200 transition-colors flex items-center gap-1.5"
+            class="cursor-pointer min-h-[38px] sm:min-h-0 bg-sky-600/25 hover:bg-sky-600/40 border border-sky-500/40 disabled:opacity-50 px-3 py-1.5 rounded-xl text-xs font-medium text-sky-200 transition-colors flex items-center gap-1.5"
           >
             <Zap class="w-3.5 h-3.5 text-sky-300 shrink-0" aria-hidden="true" />
-            <span>{{ prewarming ? '正在获取目录与文件大小…' : '预热目录并获取文件大小' }}</span>
+            <span>{{ prewarming ? '正在预热…' : '预热目录并获取大小' }}</span>
           </button>
           <button
             type="button"
             aria-label="关闭详情抽屉"
             @click="$emit('close')"
-            class="cursor-pointer bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300 flex items-center gap-1 transition-colors"
+            class="hidden sm:flex cursor-pointer bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-xl text-xs text-slate-300 items-center gap-1 transition-colors"
           >
             <X class="w-3.5 h-3.5" aria-hidden="true" />
             <span>关闭</span>
@@ -68,7 +78,7 @@
         </div>
       </div>
 
-      <div class="flex-1 overflow-y-auto p-6 space-y-6">
+      <div class="flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] space-y-5 sm:space-y-6">
         <div v-if="loading" class="text-center py-12 text-slate-400 text-xs">
           正在加载分集与多版本源明细…
         </div>

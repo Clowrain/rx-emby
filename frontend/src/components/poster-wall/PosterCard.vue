@@ -108,24 +108,24 @@ function statusBadgeClass(item) {
     </button>
 
     <!-- 卡片底部工具栏 -->
-    <div class="px-2.5 py-2 border-t border-slate-800/60 bg-slate-950/40 flex items-center justify-between gap-1.5">
+    <div class="px-2 sm:px-2.5 py-2 border-t border-slate-800/60 bg-slate-950/40 flex flex-wrap sm:flex-nowrap items-center justify-between gap-1.5">
       <button
         type="button"
         @click="emit('open-bind', item)"
         :aria-label="item.tmdb_id ? `修改 ${displayTitle(item)} 的 TMDB ID (当前 #${item.tmdb_id})` : `为 ${displayTitle(item)} 手动绑定 TMDB ID`"
-        class="cursor-pointer min-w-0 flex-1 h-7 px-2 rounded-lg bg-slate-900/90 hover:bg-slate-800 border border-slate-800/90 hover:border-slate-700 text-[11px] text-slate-300 hover:text-white font-mono transition-colors flex items-center gap-1.5 tabular-nums whitespace-nowrap overflow-hidden"
+        class="cursor-pointer min-w-0 flex-1 min-h-[38px] lg:min-h-0 lg:h-7 px-2 rounded-lg bg-slate-900/90 hover:bg-slate-800 border border-slate-800/90 hover:border-slate-700 text-[11px] text-slate-300 hover:text-white font-mono transition-colors flex items-center gap-1.5 tabular-nums whitespace-nowrap overflow-hidden active:scale-[0.98]"
       >
         <Link2 class="w-3 h-3 text-emerald-400 shrink-0" aria-hidden="true" />
         <span class="truncate">{{ item.tmdb_id ? `#${item.tmdb_id}` : '绑定 TMDB' }}</span>
       </button>
 
-      <div class="flex items-center gap-1 shrink-0">
+      <div class="flex items-center gap-1.5 sm:gap-1 shrink-0">
         <button
           type="button"
           @click="emit('scrape', item)"
           :disabled="scraping"
           :aria-label="`重新刮削 ${displayTitle(item)}`"
-          class="cursor-pointer h-7 px-2.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/30 text-emerald-300 text-[11px] font-medium transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap shrink-0"
+          class="cursor-pointer min-h-[38px] lg:min-h-0 lg:h-7 px-2.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/35 border border-emerald-500/30 text-emerald-300 text-[11px] font-medium transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap shrink-0 active:scale-[0.98]"
         >
           <Sparkles class="w-3 h-3 shrink-0" :class="{ 'animate-spin': scraping }" aria-hidden="true" />
           <span>{{ scraping ? '刮削中' : '刮削' }}</span>
@@ -135,7 +135,7 @@ function statusBadgeClass(item) {
           type="button"
           @click="emit('toggle-ignore', item)"
           :aria-label="`${item.is_ignored ? '恢复' : '屏蔽'} ${displayTitle(item)}`"
-          class="cursor-pointer h-7 w-7 rounded-lg transition-colors flex items-center justify-center shrink-0"
+          class="cursor-pointer min-h-[38px] min-w-[38px] lg:min-h-0 lg:min-w-0 lg:h-7 lg:w-7 rounded-lg transition-colors flex items-center justify-center shrink-0 active:scale-[0.98]"
           :class="
             item.is_ignored
               ? 'bg-sky-600/25 hover:bg-sky-600/40 text-sky-300 border border-sky-500/30'

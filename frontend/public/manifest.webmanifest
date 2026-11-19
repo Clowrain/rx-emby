@@ -1,0 +1,18 @@
+{
+  "name": "RX-Emby 管理后台",
+  "short_name": "RX-Emby",
+  "description": "RX-Emby 零落盘直链流媒体管理后台",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#060911",
+  "theme_color": "#060911",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "64x64 32x32 24x24 16x16",
+      "type": "image/x-icon"
+    }
+  ]
+}

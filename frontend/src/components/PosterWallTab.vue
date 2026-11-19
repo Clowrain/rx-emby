@@ -444,38 +444,38 @@ onMounted(() => {
   <section class="space-y-5">
     <!-- 顶部主视图切换：正式作品库 vs 中间表工作台 -->
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <div class="inline-flex items-center gap-1.5 bg-slate-950/90 p-1.5 rounded-2xl border border-slate-800">
+      <div class="w-full sm:w-auto grid grid-cols-2 sm:inline-flex items-center gap-1.5 bg-slate-950/90 p-1.5 rounded-2xl border border-slate-800">
         <button
           type="button"
           @click="switchViewMode('works')"
-          class="cursor-pointer px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2"
+          class="cursor-pointer min-h-[40px] lg:min-h-0 px-3 sm:px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-2"
           :class="
             filters.viewMode === 'works'
               ? 'bg-emerald-600 text-white shadow-sm'
               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
           "
         >
-          <CheckCircle2 class="w-4 h-4" aria-hidden="true" />
-          <span>正式作品库 (海报墙)</span>
+          <CheckCircle2 class="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span class="truncate">正式作品库</span>
         </button>
         <button
           type="button"
           @click="switchViewMode('staging')"
-          class="cursor-pointer px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-2"
+          class="cursor-pointer min-h-[40px] lg:min-h-0 px-3 sm:px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-2"
           :class="
             filters.viewMode === 'staging'
               ? 'bg-indigo-600 text-white shadow-sm'
               : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
           "
         >
-          <FolderGit2 class="w-4 h-4" aria-hidden="true" />
-          <span>待处理中间表 (人工刮削 / 校验工作台)</span>
+          <FolderGit2 class="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span class="truncate">待处理中间表</span>
         </button>
       </div>
     </div>
 
     <!-- 过滤控制台 -->
-    <div class="card p-5 rounded-2xl space-y-4">
+    <div class="card p-3.5 sm:p-5 rounded-2xl space-y-3.5 sm:space-y-4">
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div role="group" aria-label="媒体分类过滤" class="flex flex-wrap items-center gap-1.5 bg-slate-950/80 p-1.5 rounded-xl border border-slate-800/80">
           <button
@@ -744,11 +744,11 @@ onMounted(() => {
 
     <!-- 内容区：正式作品库海报墙 -->
     <template v-if="filters.viewMode === 'works'">
-      <div v-if="loading" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-6 gap-4">
+      <div v-if="loading" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-6 gap-3 sm:gap-4">
         <div
           v-for="n in 12"
           :key="n"
-          class="card rounded-2xl overflow-hidden animate-pulse h-80 bg-slate-900/50"
+          class="card rounded-2xl overflow-hidden animate-pulse h-72 sm:h-80 bg-slate-900/50"
         ></div>
       </div>
       <div v-else-if="items.length === 0" class="card rounded-2xl text-center py-16 space-y-2.5">
@@ -758,7 +758,7 @@ onMounted(() => {
         <div class="text-sm font-medium text-slate-200">未找到已入库的正式作品</div>
         <div class="text-xs text-slate-400">可切换到「待处理中间表」查看待刮削、校验存疑或未匹配的目录</div>
       </div>
-      <div v-else class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-6 gap-4">
+      <div v-else class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-6 gap-3 sm:gap-4">
         <PosterCard
           v-for="item in items"
           :key="item.id"

@@ -1,6 +1,6 @@
 <template>
   <section class="space-y-6">
-    <div class="card p-6 rounded-2xl">
+    <div class="card p-4 sm:p-6 rounded-2xl">
       <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
         <div>
           <h2 class="text-base font-bold text-white flex items-center gap-2">
@@ -15,7 +15,7 @@
           type="button"
           @click="loadSessions(false)"
           :disabled="loading"
-          class="cursor-pointer bg-slate-800 hover:bg-slate-700 disabled:opacity-50 px-3.5 py-1.5 rounded-xl text-xs font-medium transition-colors flex items-center gap-1.5"
+          class="cursor-pointer min-h-[38px] lg:min-h-0 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 px-3.5 py-1.5 rounded-xl text-xs font-medium transition-colors flex items-center gap-1.5"
         >
           <RefreshCw class="w-3.5 h-3.5 text-slate-300" :class="{ 'animate-spin': loading }" aria-hidden="true" />
           <span>刷新状态</span>

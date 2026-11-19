@@ -52,11 +52,11 @@ const showRulesSection = computed(() =>
     role="dialog"
     aria-modal="true"
     aria-labelledby="vlib-modal-title"
-    class="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-50 p-4"
+    class="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-50 p-3 sm:p-4"
     @click.self="!saving && emit('close')"
   >
     <div
-      class="card p-6 rounded-2xl w-full space-y-4 max-h-[92vh] overflow-y-auto"
+      class="card p-4 sm:p-6 rounded-2xl w-full space-y-4 max-h-[92dvh] overflow-y-auto overscroll-contain"
       :class="showRulesSection ? 'max-w-3xl' : 'max-w-2xl'"
     >
       <div class="flex items-center justify-between gap-3 border-b border-slate-800 pb-3">

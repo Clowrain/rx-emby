@@ -1,6 +1,6 @@
 <template>
   <section class="space-y-6">
-    <div class="card p-6 rounded-2xl flex flex-wrap gap-4 items-center justify-between">
+    <div class="card p-4 sm:p-6 rounded-2xl flex flex-wrap gap-3 sm:gap-4 items-center justify-between">
       <div>
         <h2 class="text-base font-bold text-white flex items-center gap-2">
           <ImageIcon class="w-4 h-4 text-emerald-400" aria-hidden="true" />
@@ -10,13 +10,13 @@
           自定义电影、电视剧、动漫、纪录片与综艺的 16:9 客户端首页封面，支持动态剧照拼贴或内置精选图。
         </p>
       </div>
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-2.5 sm:gap-3">
         <span class="text-xs text-slate-400">动态封面默认缓存 24 小时，按最新发布时间更新</span>
         <button
           type="button"
           :disabled="refreshingCovers"
           @click="handleRefreshDynamicCovers"
-          class="cursor-pointer disabled:opacity-50 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors"
+          class="cursor-pointer min-h-[38px] lg:min-h-0 disabled:opacity-50 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-colors"
         >
           <RefreshCw class="w-3.5 h-3.5 text-emerald-400" :class="refreshingCovers ? 'animate-spin' : ''" aria-hidden="true" />
           <span>{{ refreshingCovers ? '刷新中…' : '刷新动态封面' }}</span>
@@ -59,7 +59,7 @@
           <button
             type="button"
             @click="openBaseCoverModal(lib)"
-            class="cursor-pointer shrink-0 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-emerald-300 transition-colors inline-flex items-center gap-1.5"
+            class="cursor-pointer shrink-0 min-h-[38px] lg:min-h-0 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-emerald-300 transition-colors inline-flex items-center gap-1.5"
           >
             <Pencil class="w-3.5 h-3.5" aria-hidden="true" />
             <span>更换封面</span>
@@ -74,10 +74,10 @@
       role="dialog"
       aria-modal="true"
       aria-labelledby="base-cover-modal-title"
-      class="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-50 p-4"
+      class="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-50 p-3 sm:p-4"
       @click.self="!baseSaving && (baseModal.visible = false)"
     >
-      <div class="card p-6 rounded-2xl max-w-2xl w-full space-y-4 max-h-[90vh] overflow-y-auto">
+      <div class="card p-4 sm:p-6 rounded-2xl max-w-2xl w-full space-y-4 max-h-[90dvh] overflow-y-auto overscroll-contain">
         <div class="flex items-center justify-between border-b border-slate-800 pb-3">
           <h3 id="base-cover-modal-title" class="text-base font-bold text-white flex items-center gap-2">
             <ImageIcon class="w-4 h-4 text-emerald-400" aria-hidden="true" />
@@ -87,7 +87,7 @@
             type="button"
             aria-label="关闭封面设置弹窗"
             @click="baseModal.visible = false"
-            class="cursor-pointer text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors"
+            class="cursor-pointer text-slate-400 hover:text-white w-10 h-10 sm:w-8 sm:h-8 rounded-xl hover:bg-slate-800 flex items-center justify-center transition-colors shrink-0"
           >
             <X class="w-4 h-4" aria-hidden="true" />
           </button>
