@@ -1,8 +1,9 @@
 use super::auth::resolve_valid_user_id_with_query;
 use super::ids::{parse_episode_id, parse_season_id, parse_work_id};
+use super::query::EmbyQuery as Query;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
     Json,
 };

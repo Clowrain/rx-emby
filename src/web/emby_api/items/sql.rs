@@ -8,12 +8,13 @@ pub(super) use crate::web::emby_api::playback::{
     build_media_sources_for_episode, build_media_sources_for_movie, build_media_sources_for_movies,
     PlaybackQuery,
 };
+pub(super) use crate::web::emby_api::query::EmbyQuery as Query;
 pub(super) use crate::web::emby_api::sessions::{is_media_favorited, load_user_favorite_keys};
 pub(super) use crate::web::emby_api::views::{
     get_user_allowed_categories, user_access_scope, UserAccessScope,
 };
 pub(super) use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };

@@ -1,12 +1,13 @@
 use super::{
     auth::resolve_auth_context,
+    query::EmbyQuery as Query,
     sessions::{self, SessionReportPayload},
 };
 use crate::state::AppState;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        State,
     },
     http::{HeaderMap, HeaderValue, StatusCode},
     response::Response,

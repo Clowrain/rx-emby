@@ -1,6 +1,7 @@
+use super::query::EmbyQuery as Query;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, HeaderMap, StatusCode},
     Json,
 };

@@ -1,9 +1,10 @@
 use super::auth::{extract_emby_token, resolve_valid_user_id_with_query};
 use super::ids::parse_episode_id;
 use super::items::ensure_media_accessible;
+use super::query::EmbyQuery as Query;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::Response,
     Json,

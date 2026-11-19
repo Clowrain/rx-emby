@@ -292,3 +292,52 @@ async fn batch2_closed_loop_routes_require_auth_on_both_prefixes() {
         }
     }
 }
+
+#[tokio::test]
+async fn emby_query_accepts_coexisting_tokens_and_case_variants_across_playback_loop() {
+    let app = crate::web::build_router(lazy_test_state());
+
+    // 1. 复现线上 SenPlayer 播放视频流请求：同时携带 api_key 与 X-Emby-Token，且含 Static/PlaySessionId
+    let (stream_status, _) = send(
+        &app,
+        Method::GET,
+        "/emby/Videos/ep_9725_1_2/stream?MediaSourceId=src_435094&Static=true&PlaySessionId=3d4c18908505467fa28ff95e70cbbf5a&api_key=&X-Emby-Token=",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        stream_status,
+        StatusCode::UNAUTHORIZED,
+        "stream route must pass EmbyQuery extraction and reach auth layer"
+    );
+
+    // 2. 共用结构体 PlaybackQuery：Query 双 token + PascalCase JSON Body 同时存在
+    let (playback_info_status, _) = send(
+        &app,
+        Method::POST,
+        "/emby/Items/ep_9725_1_2/PlaybackInfo?AutoOpenLiveStream=true&IsPlayback=true&api_key=&X-Emby-Token=",
+        Body::from(r#"{"MediaSourceId":"src_435094","IsPlayback":true,"UserId":"u1"}"#),
+    )
+    .await;
+    assert_eq!(playback_info_status, StatusCode::UNAUTHORIZED);
+
+    // 3. 共用结构体 SessionReportPayload：Query 双 token + PascalCase JSON Body 同时存在
+    let (playing_status, _) = send(
+        &app,
+        Method::POST,
+        "/emby/Sessions/Playing?api_key=&X-Emby-Token=",
+        Body::from(r#"{"ItemId":"work_1","PositionTicks":12345,"RunTimeTicks":99999}"#),
+    )
+    .await;
+    assert_eq!(playing_status, StatusCode::UNAUTHORIZED);
+
+    // 4. 大小写混用 + 重复业务参数
+    let (items_status, _) = send(
+        &app,
+        Method::GET,
+        "/emby/Items?IncludeItemTypes=Movie&includeitemtypes=Series&LIMIT=10&api_key=&X-Emby-Token=",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(items_status, StatusCode::UNAUTHORIZED);
+}

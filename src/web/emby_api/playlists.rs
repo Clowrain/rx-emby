@@ -1,9 +1,10 @@
 use super::auth::{resolve_valid_user_and_admin_with_query, resolve_valid_user_id_with_query};
 use super::ids::{escape_like, parse_episode_id, parse_season_id, parse_work_id};
 use super::images::image_path_tag;
+use super::query::EmbyQuery as Query;
 use crate::{smart_views::VirtualLibraryRule, state::AppState};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };

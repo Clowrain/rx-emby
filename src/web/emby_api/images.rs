@@ -1,3 +1,4 @@
+use super::query::EmbyQuery as Query;
 use super::views::base_library_category;
 use super::{
     auth::resolve_auth_context,
@@ -6,7 +7,7 @@ use super::{
 use crate::smart_views::VirtualLibraryRule;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::Response,
 };

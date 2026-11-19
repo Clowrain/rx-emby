@@ -16,10 +16,12 @@ pub use views::count_virtual_library_matches;
 
 #[cfg(test)]
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+#[cfg(test)]
+use query::EmbyQuery as Query;
 #[cfg(test)]
 use images::fetch_virtual_library_top_media_images;
 #[cfg(test)]
@@ -37,6 +39,7 @@ mod items;
 mod metadata_lists;
 mod playback;
 mod playlists;
+mod query;
 mod search;
 mod sessions;
 mod subtitles;

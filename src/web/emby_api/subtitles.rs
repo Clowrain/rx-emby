@@ -1,8 +1,9 @@
 use super::auth::resolve_valid_user_id_with_query;
 use super::items::ensure_media_accessible;
+use super::query::EmbyQuery as Query;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::Response,
 };

@@ -4,10 +4,11 @@
 use super::auth::resolve_valid_user_id_with_query;
 use super::ids::{build_search_pattern, numeric_tmdb_id};
 use super::items::DynSql;
+use super::query::EmbyQuery as Query;
 use super::views::user_access_scope;
 use crate::state::AppState;
 use axum::{
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     Json,
 };

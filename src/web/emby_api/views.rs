@@ -1,10 +1,11 @@
 use super::auth::resolve_valid_user_id_with_query;
 use super::images::compute_cover_image_tag;
 use super::playback::PlaybackQuery;
+use super::query::EmbyQuery as Query;
 use crate::smart_views::{can_access_view, VirtualLibraryRule};
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::HeaderMap,
     Json,
 };
