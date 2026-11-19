@@ -1,13 +1,29 @@
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use image::{
     codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, GenericImageView, Rgba,
     RgbaImage,
 };
-use std::io::Cursor;
+use std::{io::Cursor, sync::OnceLock};
 
 pub const COVER_W: u32 = 960;
 pub const COVER_H: u32 = 540;
+
+static TITLE_FONT_BYTES: &[u8] = include_bytes!("fonts/SourceHanSansSC-Bold.otf");
+static TITLE_FONT: OnceLock<Option<FontArc>> = OnceLock::new();
+
+fn title_font() -> Option<&'static FontArc> {
+    TITLE_FONT
+        .get_or_init(|| FontArc::try_from_slice(TITLE_FONT_BYTES).ok())
+        .as_ref()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CoverBanner<'a> {
+    pub title: &'a str,
+    pub is_smart_view: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollageStyle {
@@ -43,6 +59,7 @@ pub fn render_collage(
     style: CollageStyle,
     posters: &[Bytes],
     backdrop: Option<&[u8]>,
+    banner: Option<CoverBanner<'_>>,
 ) -> Result<Vec<u8>> {
     let decoded_posters: Vec<DynamicImage> = posters
         .iter()
@@ -61,9 +78,32 @@ pub fn render_collage(
         CollageStyle::Blended => render_blended(&decoded_posters, decoded_backdrop.as_ref()),
     };
 
-    apply_vignette_and_scrim(&mut canvas);
+    finalize_cover_canvas(&mut canvas, banner)?;
+    encode_canvas_jpeg(&canvas)
+}
 
-    let rgb = DynamicImage::ImageRgba8(canvas).to_rgb8();
+/// 将单张自动封面原图规范裁切为 960x540，并叠加暗角与视图名称腰封（JPEG）
+pub fn render_auto_cover(raw_image: &[u8], banner: Option<CoverBanner<'_>>) -> Result<Vec<u8>> {
+    let img = image::load_from_memory(raw_image)
+        .map_err(|e| anyhow!("解码自动封面图片失败: {e}"))?;
+    let mut canvas = fit_cover(&img, COVER_W, COVER_H);
+    finalize_cover_canvas(&mut canvas, banner)?;
+    encode_canvas_jpeg(&canvas)
+}
+
+fn finalize_cover_canvas(
+    canvas: &mut RgbaImage,
+    banner: Option<CoverBanner<'_>>,
+) -> Result<()> {
+    apply_vignette_and_scrim(canvas);
+    if let Some(b) = banner {
+        apply_title_banner(canvas, b);
+    }
+    Ok(())
+}
+
+fn encode_canvas_jpeg(canvas: &RgbaImage) -> Result<Vec<u8>> {
+    let rgb = DynamicImage::ImageRgba8(canvas.clone()).to_rgb8();
     let mut out = Cursor::new(Vec::with_capacity(96 * 1024));
     let mut encoder = JpegEncoder::new_with_quality(&mut out, 88);
     encoder.encode_image(&rgb)?;
@@ -428,4 +468,217 @@ fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
         .round()
         .clamp(0.0, 255.0) as u8;
     dst[3] = 255;
+}
+
+/// 方案 A：底部全宽渐变腰封 + 左侧竖线色条 + 视图名称（自适应字号与尾部省略号截断）
+fn apply_title_banner(canvas: &mut RgbaImage, banner: CoverBanner<'_>) {
+    let title = banner.title.trim();
+    if title.is_empty() {
+        return;
+    }
+
+    // 1. 底部全宽平滑渐变暗色腰封（y: COVER_H-116 .. COVER_H）
+    let banner_h = 116u32;
+    let banner_top = COVER_H.saturating_sub(banner_h);
+    for y in banner_top..COVER_H {
+        let t = (y - banner_top) as f32 / banner_h as f32;
+        let smooth = t * t * (3.0 - 2.0 * t);
+        let alpha = (smooth * 0.86 * 255.0).round().clamp(0.0, 255.0) as u8;
+        let scrim_px = Rgba([10, 14, 23, alpha]);
+        for x in 0..COVER_W {
+            blend_pixel(canvas.get_pixel_mut(x, y), scrim_px);
+        }
+    }
+
+    // 2. 顶部极细微光分割线（左右渐隐）
+    let line_y = COVER_H.saturating_sub(88);
+    let margin_x = 40u32;
+    let line_span = (COVER_W - margin_x * 2) as f32;
+    for x in margin_x..(COVER_W - margin_x) {
+        let u = (x - margin_x) as f32 / line_span;
+        let edge_fade = (u * 4.0).min(1.0).min(((1.0 - u) * 4.0).min(1.0));
+        let alpha = (edge_fade * 0.14 * 255.0).round().clamp(0.0, 255.0) as u8;
+        blend_pixel(canvas.get_pixel_mut(x, line_y), Rgba([255, 255, 255, alpha]));
+    }
+
+    let Some(font) = title_font() else {
+        return;
+    };
+
+    // 3. 计算单行自适应字号与省略号截断（安全区：x 58..920）
+    let text_x = 58.0f32;
+    let max_text_w = (COVER_W - 40) as f32 - text_x;
+    let (scale_px, fitted_title) = fit_banner_title(font, title, max_text_w);
+    let scale = PxScale::from(scale_px);
+
+    // 4. 绘制左侧圆角 Accent Bar（基础库天青蓝 / 智能视图琥珀金）
+    let accent_color = if banner.is_smart_view {
+        [245u8, 158, 11]
+    } else {
+        [56u8, 189, 248]
+    };
+    let baseline_y = (COVER_H - 30) as f32;
+    let bar_cx = 42.5f32;
+    let bar_cy = baseline_y - scale_px * 0.34;
+    let bar_hw = 2.5f32;
+    let bar_hh = scale_px * 0.44;
+    let y0 = (bar_cy - bar_hh - 2.0).max(0.0) as u32;
+    let y1 = (bar_cy + bar_hh + 2.0).min((COVER_H - 1) as f32) as u32;
+    let x0 = (bar_cx - bar_hw - 2.0).max(0.0) as u32;
+    let x1 = (bar_cx + bar_hw + 2.0).min((COVER_W - 1) as f32) as u32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let sdf = rounded_rect_sdf(x as f32 - bar_cx, y as f32 - bar_cy, bar_hw, bar_hh, 2.5);
+            let cov = (0.5 - sdf).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                let a = (cov * 240.0).round().clamp(0.0, 255.0) as u8;
+                blend_pixel(
+                    canvas.get_pixel_mut(x, y),
+                    Rgba([accent_color[0], accent_color[1], accent_color[2], a]),
+                );
+            }
+        }
+    }
+
+    // 5. 先绘制柔和暗色投影，再绘制高对比度微暖白文字
+    draw_text_line(
+        canvas,
+        font,
+        scale,
+        text_x + 1.5,
+        baseline_y + 2.0,
+        &fitted_title,
+        [0, 0, 0, 155],
+    );
+    draw_text_line(
+        canvas,
+        font,
+        scale,
+        text_x,
+        baseline_y,
+        &fitted_title,
+        [248, 250, 252, 255],
+    );
+}
+
+fn fit_banner_title(font: &FontArc, title: &str, max_width: f32) -> (f32, String) {
+    let mut size = 42.0f32;
+    while size >= 28.0 {
+        let scale = PxScale::from(size);
+        if measure_text_width(font, scale, title) <= max_width {
+            return (size, title.to_string());
+        }
+        size -= 2.0;
+    }
+
+    let min_scale = PxScale::from(28.0);
+    let mut truncated: String = title.chars().collect();
+    while !truncated.is_empty() {
+        truncated.pop();
+        let candidate = format!("{truncated}...");
+        if measure_text_width(font, min_scale, &candidate) <= max_width {
+            return (28.0, candidate);
+        }
+    }
+    (28.0, "...".to_string())
+}
+
+fn measure_text_width(font: &FontArc, scale: PxScale, text: &str) -> f32 {
+    let scaled = font.as_scaled(scale);
+    let mut width = 0.0f32;
+    let mut prev = None;
+    for ch in text.chars() {
+        let id = scaled.glyph_id(ch);
+        if let Some(p) = prev {
+            width += scaled.kern(p, id);
+        }
+        width += scaled.h_advance(id);
+        prev = Some(id);
+    }
+    width
+}
+
+fn draw_text_line(
+    canvas: &mut RgbaImage,
+    font: &FontArc,
+    scale: PxScale,
+    start_x: f32,
+    baseline_y: f32,
+    text: &str,
+    rgba: [u8; 4],
+) {
+    let scaled = font.as_scaled(scale);
+    let mut cursor_x = start_x;
+    let mut prev = None;
+    let base_alpha = rgba[3] as f32 / 255.0;
+
+    for ch in text.chars() {
+        let id = scaled.glyph_id(ch);
+        if let Some(p) = prev {
+            cursor_x += scaled.kern(p, id);
+        }
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(cursor_x, baseline_y));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, cov| {
+                let px = bounds.min.x as i32 + gx as i32;
+                let py = bounds.min.y as i32 + gy as i32;
+                if px >= 0 && py >= 0 && (px as u32) < COVER_W && (py as u32) < COVER_H {
+                    let a = (cov * base_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+                    if a > 0 {
+                        blend_pixel(
+                            canvas.get_pixel_mut(px as u32, py as u32),
+                            Rgba([rgba[0], rgba[1], rgba[2], a]),
+                        );
+                    }
+                }
+            });
+        }
+        cursor_x += scaled.h_advance(id);
+        prev = Some(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_png_bytes(r: u8, g: u8, b: u8) -> Bytes {
+        let img = RgbaImage::from_pixel(32, 32, Rgba([r, g, b, 255]));
+        let mut out = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        Bytes::from(out.into_inner())
+    }
+
+    #[test]
+    fn embedded_font_loads_and_renders_collage_and_auto_banners() {
+        assert!(title_font().is_some(), "embedded font must parse cleanly");
+
+        let sample = tiny_png_bytes(230, 230, 230);
+        let collage_jpg = render_collage(
+            CollageStyle::Cards,
+            std::slice::from_ref(&sample),
+            None,
+            Some(CoverBanner {
+                title: "豆瓣高分电影",
+                is_smart_view: true,
+            }),
+        )
+        .unwrap();
+        let decoded_collage = image::load_from_memory(&collage_jpg).unwrap();
+        assert_eq!(decoded_collage.dimensions(), (COVER_W, COVER_H));
+
+        let auto_jpg = render_auto_cover(
+            &sample,
+            Some(CoverBanner {
+                title: "这是一个非常非常长用于验证自动缩字号和省略号截断逻辑的智能视图名称示例",
+                is_smart_view: false,
+            }),
+        )
+        .unwrap();
+        let decoded_auto = image::load_from_memory(&auto_jpg).unwrap();
+        assert_eq!(decoded_auto.dimensions(), (COVER_W, COVER_H));
+    }
 }

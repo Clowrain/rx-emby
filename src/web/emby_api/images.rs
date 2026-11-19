@@ -210,6 +210,10 @@ async fn get_item_image_inner(
         let cover_key = clean_custom
             .filter(|k| is_builtin_cover_key(k))
             .unwrap_or(&item_id);
+        let banner = crate::image_cache::collage::CoverBanner {
+            title: base_cat,
+            is_smart_view: false,
+        };
         return serve_library_cover(
             &state,
             &headers,
@@ -218,6 +222,7 @@ async fn get_item_image_inner(
             clean_custom,
             &rule,
             cover_key,
+            banner,
         )
         .await;
     }
@@ -264,6 +269,10 @@ async fn get_item_image_inner(
             )
         })?;
         let cover_key = resolve_virtual_library_cover_key(custom_cover, &vname, &icon_type);
+        let banner = crate::image_cache::collage::CoverBanner {
+            title: &vname,
+            is_smart_view: true,
+        };
         return serve_library_cover(
             &state,
             &headers,
@@ -272,6 +281,7 @@ async fn get_item_image_inner(
             custom_cover,
             &rule,
             cover_key,
+            banner,
         )
         .await;
     }
@@ -515,7 +525,7 @@ pub(super) fn compute_cover_image_tag(cover_image: Option<&str>, revision: i64) 
         Some(c) => format!(
             "v{}_{:016x}",
             revision.max(1),
-            xxhash_rust::xxh3::xxh3_64(c.as_bytes())
+            xxhash_rust::xxh3::xxh3_64(format!("{c}|banner_v1").as_bytes())
         ),
         None => format!("v{}", revision.max(1)),
     }
@@ -544,11 +554,16 @@ async fn try_serve_dynamic_cover(
     view_id: &str,
     custom_cover: Option<&str>,
     rule: &VirtualLibraryRule,
+    banner: crate::image_cache::collage::CoverBanner<'_>,
 ) -> Option<Response> {
     if custom_cover == Some("auto") {
-        let cache_key = format!("auto:{}", view_id);
+        let banner_sig = format!("{}|{}|banner_v1", banner.title, banner.is_smart_view);
+        let banner_hash = xxhash_rust::xxh3::xxh3_64(banner_sig.as_bytes());
+        let cache_key = format!("auto:{}:{:016x}", view_id, banner_hash);
         let state2 = state.clone();
         let rule2 = rule.clone();
+        let title2 = banner.title.to_string();
+        let is_smart_view = banner.is_smart_view;
         let rendered = state
             .caches
             .collage_cache
@@ -557,10 +572,23 @@ async fn try_serve_dynamic_cover(
                     .await
                     .ok_or_else(|| "无匹配媒体".to_string())?;
                 let clean_name = file_path.trim_start_matches('/');
-                state2
+                let raw_bytes = state2
                     .get_or_fetch_tmdb_image("w1280", clean_name)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                let jpg = tokio::task::spawn_blocking(move || {
+                    crate::image_cache::collage::render_auto_cover(
+                        &raw_bytes,
+                        Some(crate::image_cache::collage::CoverBanner {
+                            title: &title2,
+                            is_smart_view,
+                        }),
+                    )
+                })
+                .await
+                .map_err(|e| format!("自动封面腰封渲染任务异常: {e}"))?
+                .map_err(|e| e.to_string())?;
+                Ok::<Bytes, String>(Bytes::from(jpg))
             })
             .await
             .ok();
@@ -580,7 +608,7 @@ async fn try_serve_dynamic_cover(
         custom_cover.and_then(crate::image_cache::collage::CollageStyle::from_key)
     {
         if let Some(bytes) =
-            fetch_or_build_virtual_library_collage(state, view_id, rule, style).await
+            fetch_or_build_virtual_library_collage(state, view_id, rule, style, banner).await
         {
             return Response::builder()
                 .status(StatusCode::OK)
@@ -597,6 +625,7 @@ async fn try_serve_dynamic_cover(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_library_cover(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -605,11 +634,13 @@ async fn serve_library_cover(
     custom_cover: Option<&str>,
     rule: &VirtualLibraryRule,
     fallback_cover_key: &str,
+    banner: crate::image_cache::collage::CoverBanner<'_>,
 ) -> Result<Response, (StatusCode, String)> {
     let key = custom_cover.unwrap_or(item_id);
+    let etag_seed = format!("{key}|{}|{}|banner_v1", banner.title, banner.is_smart_view);
     let etag = format!(
         "\"cover-{:016x}\"",
-        xxhash_rust::xxh3::xxh3_64(key.as_bytes())
+        xxhash_rust::xxh3::xxh3_64(etag_seed.as_bytes())
     );
     if let Some(response) = not_modified_response(headers, &etag)? {
         return Ok(response);
@@ -617,12 +648,13 @@ async fn serve_library_cover(
     if method == Method::HEAD && custom_cover != Some("auto") {
         return head_image_response(headers, &etag, "image/jpeg");
     }
-    let mut response =
-        if let Some(resp) = try_serve_dynamic_cover(state, item_id, custom_cover, rule).await {
-            resp
-        } else {
-            serve_embedded_cover(fallback_cover_key)?
-        };
+    let mut response = if let Some(resp) =
+        try_serve_dynamic_cover(state, item_id, custom_cover, rule, banner).await
+    {
+        resp
+    } else {
+        serve_embedded_cover(fallback_cover_key)?
+    };
     if let Ok(etag_val) = axum::http::HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, etag_val);
     }
@@ -734,11 +766,16 @@ async fn fetch_or_build_virtual_library_collage(
     view_id: &str,
     rule: &VirtualLibraryRule,
     style: crate::image_cache::collage::CollageStyle,
+    banner: crate::image_cache::collage::CoverBanner<'_>,
 ) -> Option<Bytes> {
-    let inflight_key = format!("collage:{}:{}", view_id, style.as_str());
+    let banner_sig = format!("|banner_v1|{}|{}", banner.title, banner.is_smart_view);
+    let banner_hash = xxhash_rust::xxh3::xxh3_64(banner_sig.as_bytes());
+    let inflight_key = format!("collage:{}:{}:{:016x}", view_id, style.as_str(), banner_hash);
     let state2 = state.clone();
     let rule2 = rule.clone();
     let view_id2 = view_id.to_string();
+    let title2 = banner.title.to_string();
+    let is_smart_view = banner.is_smart_view;
 
     let rendered = state
         .caches
@@ -750,6 +787,7 @@ async fn fetch_or_build_virtual_library_collage(
             }
 
             let mut sig = String::from(style.as_str());
+            sig.push_str(&banner_sig);
             for (b, p) in &rows {
                 sig.push('|');
                 if let Some(s) = b {
@@ -832,6 +870,10 @@ async fn fetch_or_build_virtual_library_collage(
                     style,
                     &poster_bytes,
                     primary_backdrop.as_ref().map(|v| &v[..]),
+                    Some(crate::image_cache::collage::CoverBanner {
+                        title: &title2,
+                        is_smart_view,
+                    }),
                 )
             })
             .await
