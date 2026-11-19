@@ -250,8 +250,39 @@ export const adminApi = {
       body: JSON.stringify(payload)
     })
   },
-  seedPresetVirtualLibraries() {
-    return requestJson('/api/admin/virtual_libraries/presets', { method: 'POST' })
+  async exportVirtualLibrariesBundle() {
+    const token = getAdminToken()
+    const headers = new Headers()
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`)
+    }
+    const res = await fetch('/api/admin/virtual_libraries/export', { headers })
+    if (!res.ok) {
+      const errText = await res.text()
+      if (res.status === 401 || res.status === 403) {
+        clearAdminToken()
+        if (unauthorizedHandler) {
+          unauthorizedHandler(errText || '登录已失效，请重新登录')
+        }
+      }
+      throw new Error(errText || `HTTP ${res.status}`)
+    }
+    return res.blob()
+  },
+  previewImportVirtualLibraries(bytes) {
+    return requestJson('/api/admin/virtual_libraries/import/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: bytes
+    })
+  },
+  applyImportVirtualLibraries(bytes, pruneMissing = false) {
+    const qs = pruneMissing ? '?prune_missing=true' : '?prune_missing=false'
+    return requestJson(`/api/admin/virtual_libraries/import/apply${qs}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: bytes
+    })
   },
   deleteVirtualLibrary(id) {
     return requestJson(`/api/admin/virtual_libraries/${id}`, { method: 'DELETE' })

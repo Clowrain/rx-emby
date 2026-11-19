@@ -531,7 +531,7 @@ pub(super) fn compute_cover_image_tag(cover_image: Option<&str>, revision: i64) 
     }
 }
 
-fn is_builtin_cover_key(key: &str) -> bool {
+pub(crate) fn is_builtin_cover_key(key: &str) -> bool {
     matches!(
         key,
         "lib_movie"
@@ -652,6 +652,8 @@ async fn serve_library_cover(
         try_serve_dynamic_cover(state, item_id, custom_cover, rule, banner).await
     {
         resp
+    } else if let Some(resp) = try_serve_custom_static_cover(state, custom_cover).await {
+        resp
     } else {
         serve_embedded_cover(fallback_cover_key)?
     };
@@ -663,6 +665,29 @@ async fn serve_library_cover(
         return Ok(Response::from_parts(parts, axum::body::Body::empty()));
     }
     Ok(response)
+}
+
+async fn try_serve_custom_static_cover(
+    state: &Arc<AppState>,
+    custom_cover: Option<&str>,
+) -> Option<Response> {
+    let key = custom_cover?;
+    if !crate::web::admin_api::smart_view_bundle::is_custom_cover_key(key) {
+        return None;
+    }
+    let disk_path = state
+        .config
+        .load()
+        .image_cache_dir
+        .join("custom_covers")
+        .join(format!("{}.jpg", key));
+    let bytes = tokio::fs::read(&disk_path).await.ok()?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(axum::body::Body::from(bytes))
+        .ok()
 }
 
 fn serve_embedded_cover(cover_key: &str) -> Result<Response, (StatusCode, String)> {

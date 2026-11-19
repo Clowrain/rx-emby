@@ -4,7 +4,7 @@ mod password;
 
 use crate::state::AppState;
 use axum::{
-    extract::{Path, Request},
+    extract::{Path, Request, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -67,8 +67,32 @@ async fn serve_assets(Path(path): Path<String>) -> Response {
     serve_embedded_file(&asset_path).await
 }
 
-async fn serve_covers(Path(path): Path<String>) -> Response {
-    let cover_path = format!("covers/{}", path.trim_start_matches('/'));
+async fn serve_covers(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Response {
+    let clean = path.trim_start_matches('/');
+    if let Some(stem) = clean.strip_suffix(".jpg") {
+        if admin_api::smart_view_bundle::is_custom_cover_key(stem) {
+            let disk_path = state
+                .config
+                .load()
+                .image_cache_dir
+                .join("custom_covers")
+                .join(clean);
+            if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/jpeg")
+                    .header(header::CACHE_CONTROL, "public, max-age=86400")
+                    .body(axum::body::Body::from(bytes))
+                    .unwrap_or_else(|_| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "读取自定义封面失败").into_response()
+                    });
+            }
+        }
+    }
+    let cover_path = format!("covers/{}", clean);
     serve_embedded_file(&cover_path).await
 }
 

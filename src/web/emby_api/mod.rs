@@ -11,6 +11,7 @@ use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 
 pub use crate::smart_views::VirtualLibraryRule;
+pub(crate) use images::is_builtin_cover_key;
 pub use images::resolve_virtual_library_cover_key;
 pub use views::count_virtual_library_matches;
 

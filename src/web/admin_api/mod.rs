@@ -10,6 +10,7 @@ use tower_http::cors::CorsLayer;
 
 mod auth;
 mod media;
+pub(crate) mod smart_view_bundle;
 mod system;
 mod users;
 mod virtual_libraries;
@@ -160,8 +161,18 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(virtual_libraries::queue_metadata_backfill),
         )
         .route(
-            "/api/admin/virtual_libraries/presets",
-            post(virtual_libraries::seed_preset_virtual_libraries),
+            "/api/admin/virtual_libraries/export",
+            get(virtual_libraries::export_virtual_libraries),
+        )
+        .route(
+            "/api/admin/virtual_libraries/import/preview",
+            post(virtual_libraries::preview_import_virtual_libraries)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/api/admin/virtual_libraries/import/apply",
+            post(virtual_libraries::apply_import_virtual_libraries)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route(
             "/api/admin/virtual_libraries/:id",

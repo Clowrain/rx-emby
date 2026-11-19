@@ -7,7 +7,7 @@ import { parse } from '@vue/compiler-sfc'
 import { ref, reactive, computed, watch } from 'vue'
 import { validateSmartRule } from '../src/api/smartViewRules.js'
 import { useVirtualLibraries } from '../src/composables/useVirtualLibraries.js'
-import { coverImageUrl, dynamicCoverLabel, isDynamicCover, ruleBadges } from '../src/utils/smartViewLabels.js'
+import { coverImageUrl, dynamicCoverLabel, isCustomCover, isDynamicCover, ruleBadges } from '../src/utils/smartViewLabels.js'
 
 function editor(api = {}) {
   const source = fs.readFileSync(new URL('../src/components/VirtualLibrariesTab.vue', import.meta.url),'utf8')
@@ -18,7 +18,7 @@ function editor(api = {}) {
   const stubApi = {listVirtualLibraries:async()=>({libraries:[]}),...api}
   const ctx = vm.createContext({
     ref, reactive, computed, watch, onMounted:()=>{}, onUnmounted:()=>{}, defineEmits:()=>()=>{},
-    coverImageUrl, dynamicCoverLabel, isDynamicCover, ruleBadges,
+    coverImageUrl, dynamicCoverLabel, isCustomCover, isDynamicCover, ruleBadges,
     useVirtualLibraries: (deps = {}) => useVirtualLibraries({
       api: stubApi,
       toast: stubToast,
@@ -27,7 +27,7 @@ function editor(api = {}) {
       ...deps
     })
   })
-  vm.runInContext(transformSync(script,{loader:'ts'}).code + '\nglobalThis.editor = {modal,openModal,submitModal,formError,saving,previewRules,previewCount,ruleOptions,optionsLoaded,needsMetadataBackfill,loadRuleOptions,backfillMetadata};',ctx)
+  vm.runInContext(transformSync(script,{loader:'ts'}).code + '\nglobalThis.editor = {modal,openModal,submitModal,formError,saving,previewRules,previewCount,ruleOptions,optionsLoaded,needsMetadataBackfill,loadRuleOptions,backfillMetadata,importModal,openImportModal,handleImportBytes,confirmImportApply,handleDownloadBundle};',ctx)
   return ctx.editor
 }
 
@@ -102,4 +102,69 @@ test('预览响应过期时不展示旧数量',async()=>{
 })
 test('合法组合通过校验',()=>{
   assert.doesNotThrow(()=>validateSmartRule({min_rating:8,max_rating:10,min_votes:1000,any:[{runtime_max:90},{statuses:['Ended'],episodes_max:12}]}))
+})
+
+test('移除补充 9 个预设视图按钮，改用固定文案「下载配置与 AI 模板」和「导入视图配置」', () => {
+  const source = fs.readFileSync(new URL('../src/components/VirtualLibrariesTab.vue', import.meta.url), 'utf8')
+  assert.equal(source.includes('补充 9 个预设视图'), false)
+  assert.equal(source.includes('handleSeedPresets'), false)
+  assert.equal(source.includes('下载配置与 AI 模板'), true)
+  assert.equal(source.includes('导入视图配置'), true)
+})
+
+test('自定义静态封面标识识别与 URL 解析', () => {
+  assert.equal(isCustomCover('custom_0123456789abcdef'), true)
+  assert.equal(isCustomCover('vlib_top_rated'), false)
+  assert.equal(isCustomCover('collage_cards'), false)
+  assert.equal(
+    coverImageUrl('lib_vlib_1', 'custom_0123456789abcdef', 'vlib_default_tv', 123),
+    '/covers/custom_0123456789abcdef.jpg?_t=123'
+  )
+})
+
+test('导入视图配置两步预览与确认应用流程（含移除旧视图开关）', async () => {
+  let previewReceivedBytes = null
+  let appliedArgs = null
+  let reloadCount = 0
+  const e = editor({
+    listVirtualLibraries: async () => {
+      reloadCount++
+      return { libraries: [] }
+    },
+    previewImportVirtualLibraries: async (bytes) => {
+      previewReceivedBytes = bytes
+      return {
+        total_count: 2,
+        create_count: 1,
+        update_count: 1,
+        custom_cover_count: 1,
+        unmatched_existing_count: 3,
+        items: [
+          { name: '万人高分电影榜', action: 'update', icon_type: 'movies', sort_order: 10, is_enabled: true, cover_type: 'dynamic', cover_label: '立体叠放卡片', filter_rules: { media_type: 'movie', min_rating: 8 } },
+          { name: '已完结全集爽看', action: 'create', icon_type: 'tvshows', sort_order: 20, is_enabled: true, cover_type: 'custom', cover_label: '自定义封面', filter_rules: { media_type: 'tv', local_complete: 'all' } }
+        ]
+      }
+    },
+    applyImportVirtualLibraries: async (bytes, pruneMissing) => {
+      appliedArgs = { bytes, pruneMissing }
+      return { status: 'ok', created: 1, updated: 1, deleted: 3, message: '已应用视图配置' }
+    }
+  })
+
+  e.openImportModal()
+  assert.equal(e.importModal.visible, true)
+  assert.equal(e.importModal.pruneMissing, false)
+
+  const sampleBytes = new Uint8Array([123, 125])
+  await e.handleImportBytes('views.zip', sampleBytes)
+  assert.equal(e.importModal.fileName, 'views.zip')
+  assert.deepEqual(previewReceivedBytes, sampleBytes)
+  assert.equal(e.importModal.preview.total_count, 2)
+  assert.equal(e.importModal.preview.unmatched_existing_count, 3)
+
+  e.importModal.pruneMissing = true
+  await e.confirmImportApply()
+  assert.deepEqual(appliedArgs, { bytes: sampleBytes, pruneMissing: true })
+  assert.equal(e.importModal.visible, false)
+  assert.equal(reloadCount, 1)
 })

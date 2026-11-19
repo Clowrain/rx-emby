@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { Sparkles, X } from 'lucide-vue-next'
 import SmartRuleEditor from '../SmartRuleEditor.vue'
-import { collageOptions, coverOptions } from '../../utils/smartViewLabels.js'
+import { collageOptions, coverOptions, isCustomCover } from '../../utils/smartViewLabels.js'
 
 export interface VirtualLibraryModalState {
   visible: boolean
@@ -133,6 +133,13 @@ const showRulesSection = computed(() =>
           <div class="flex items-center justify-between">
             <label class="block text-slate-300">客户端封面</label>
             <span class="text-[11px] text-slate-500">16:9 横版，可选动态拼贴或内置图</span>
+          </div>
+          <div v-if="isCustomCover(modal.coverImage)" class="rounded-xl border border-indigo-400 bg-indigo-950/40 p-2.5 flex items-center justify-between gap-3">
+            <div>
+              <div class="text-[11px] font-semibold text-indigo-200">当前使用：自定义封面（由 .zip 配置包导入）</div>
+              <div class="text-[10px] text-slate-400 mt-0.5">点击下方任意封面选项可切换为内置封面或动态拼贴</div>
+            </div>
+            <img :src="`/covers/${modal.coverImage}.jpg`" alt="自定义封面预览" class="w-20 aspect-video object-cover rounded-lg border border-indigo-400/50 shrink-0" />
           </div>
           <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
             <button

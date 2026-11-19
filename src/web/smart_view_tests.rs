@@ -317,27 +317,33 @@ async fn run_smart_view_end_to_end(db: sqlx::PgPool) {
     .await;
     assert_eq!(options["companies"][0]["id"], 42);
     assert_eq!(options["metadata"]["enriched"], 3);
-    // 两个同时到来的预设请求仅创建一份。
-    let (a, b) = tokio::join!(
-        request(
-            state.clone(),
-            "POST",
-            "/api/admin/virtual_libraries/presets",
-            Value::Null
-        ),
-        request(
-            state.clone(),
-            "POST",
-            "/api/admin/virtual_libraries/presets",
-            Value::Null
-        )
-    );
-    assert_eq!(a.0, StatusCode::OK);
-    assert_eq!(b.0, StatusCode::OK);
-    assert_eq!(
-        a.1["inserted"].as_i64().unwrap() + b.1["inserted"].as_i64().unwrap(),
-        9
-    );
+    // 导入预览、执行与导出闭环测试
+    let import_json = json!([
+        {"name": "仅剧集", "icon_type": "tvshows", "cover_image": "auto", "filter_rules": {"media_type": "tv", "min_rating": 8.0}},
+        {"name": "高分口碑电影", "icon_type": "movies", "cover_image": "collage_cards", "filter_rules": {"media_type": "movie", "min_rating": 8.0, "min_votes": 1000}}
+    ]);
+    let (p_status, p_res) = request(
+        state.clone(),
+        "POST",
+        "/api/admin/virtual_libraries/import/preview",
+        import_json.clone(),
+    )
+    .await;
+    assert_eq!(p_status, StatusCode::OK);
+    assert_eq!(p_res["total_count"], 2);
+    assert_eq!(p_res["create_count"], 1);
+    assert_eq!(p_res["update_count"], 1);
+
+    let (a_status, a_res) = request(
+        state.clone(),
+        "POST",
+        "/api/admin/virtual_libraries/import/apply?prune_missing=false",
+        import_json,
+    )
+    .await;
+    assert_eq!(a_status, StatusCode::OK);
+    assert_eq!(a_res["created"], 1);
+    assert_eq!(a_res["updated"], 1);
     verify_metadata_refresh(&db).await;
     // 接近当前库规模的回归数据，检查参数化条件仍走普通 SQL 过滤。
     let mut transaction = db.begin().await.unwrap();

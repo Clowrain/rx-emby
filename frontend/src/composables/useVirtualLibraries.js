@@ -12,7 +12,7 @@ export function useVirtualLibraries(deps = {}) {
 
   const loading = ref(false)
   const saving = ref(false)
-  const seeding = ref(false)
+  const downloadingBundle = ref(false)
   const backfilling = ref(false)
   const refreshingCovers = ref(false)
   const previewing = ref(false)
@@ -38,6 +38,17 @@ export function useVirtualLibraries(deps = {}) {
     sortOrder: 10,
     isEnabled: true,
     rules: {}
+  })
+
+  const importModal = reactive({
+    visible: false,
+    fileName: '',
+    rawBytes: null,
+    loadingPreview: false,
+    applying: false,
+    pruneMissing: false,
+    error: '',
+    preview: null
   })
 
   const filterTabs = computed(() => {
@@ -241,17 +252,88 @@ export function useVirtualLibraries(deps = {}) {
     }
   }
 
-  async function handleSeedPresets() {
-    if (seeding.value) return
-    seeding.value = true
+  async function handleDownloadBundle() {
+    if (downloadingBundle.value) return
+    downloadingBundle.value = true
     try {
-      const data = await api.seedPresetVirtualLibraries()
-      toast.success(data.message)
+      const blob = await api.exportVirtualLibrariesBundle()
+      if (typeof window !== 'undefined' && typeof document !== 'undefined' && window.URL?.createObjectURL) {
+        const url = window.URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = 'rx-emby-smart-views.zip'
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        window.URL.revokeObjectURL(url)
+      }
+      toast.success('已下载视图配置与 AI 编写模板 (.zip)')
+    } catch (err) {
+      toast.error('下载失败：' + err.message)
+    } finally {
+      downloadingBundle.value = false
+    }
+  }
+
+  function openImportModal() {
+    importModal.visible = true
+    importModal.fileName = ''
+    importModal.rawBytes = null
+    importModal.loadingPreview = false
+    importModal.applying = false
+    importModal.pruneMissing = false
+    importModal.error = ''
+    importModal.preview = null
+  }
+
+  async function handleImportBytes(fileName, bytes) {
+    importModal.fileName = fileName
+    importModal.rawBytes = bytes
+    importModal.error = ''
+    importModal.preview = null
+    importModal.pruneMissing = false
+    if (String(fileName || '').toLowerCase().endsWith('.rar')) {
+      importModal.error = '暂不支持 .rar 格式，请上传 .zip 压缩包或 .json 配置文件'
+      return
+    }
+    importModal.loadingPreview = true
+    try {
+      const preview = await api.previewImportVirtualLibraries(bytes)
+      importModal.preview = preview
+    } catch (err) {
+      importModal.error = err.message
+    } finally {
+      importModal.loadingPreview = false
+    }
+  }
+
+  async function handleImportFileSelected(file) {
+    if (!file) return
+    try {
+      const buf = await file.arrayBuffer()
+      await handleImportBytes(file.name, new Uint8Array(buf))
+    } catch (err) {
+      importModal.error = '读取文件失败：' + err.message
+    }
+  }
+
+  async function confirmImportApply() {
+    if (importModal.applying || !importModal.rawBytes || !importModal.preview) return
+    importModal.applying = true
+    importModal.error = ''
+    try {
+      const res = await api.applyImportVirtualLibraries(
+        importModal.rawBytes,
+        importModal.pruneMissing
+      )
+      toast.success(res.message)
+      importModal.visible = false
+      coverBust.value = Date.now()
       await loadLibraries()
     } catch (err) {
-      toast.error('生成预设失败：' + err.message)
+      importModal.error = '导入失败：' + err.message
     } finally {
-      seeding.value = false
+      importModal.applying = false
     }
   }
 
@@ -302,7 +384,7 @@ export function useVirtualLibraries(deps = {}) {
   return {
     loading,
     saving,
-    seeding,
+    downloadingBundle,
     backfilling,
     refreshingCovers,
     previewing,
@@ -317,6 +399,7 @@ export function useVirtualLibraries(deps = {}) {
     libraries,
     coverBust,
     modal,
+    importModal,
     filterTabs,
     filteredLibraries,
     metadataPercent,
@@ -332,7 +415,11 @@ export function useVirtualLibraries(deps = {}) {
     previewRules,
     submitModal,
     backfillMetadata,
-    handleSeedPresets,
+    handleDownloadBundle,
+    openImportModal,
+    handleImportBytes,
+    handleImportFileSelected,
+    confirmImportApply,
     toggleEnabled,
     handleDelete
   }

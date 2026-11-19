@@ -32,6 +32,10 @@ export function isDynamicCover(val) {
   return val === 'auto' || (typeof val === 'string' && val.startsWith('collage_'))
 }
 
+export function isCustomCover(val) {
+  return typeof val === 'string' && /^custom_[0-9a-f]{16}$/.test(val)
+}
+
 export function dynamicCoverLabel(val) {
   if (val === 'auto') return '动态首图'
   const found = collageOptions.find(o => o.key === val)

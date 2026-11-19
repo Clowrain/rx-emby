@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue'
-import { Sparkles, Plus, Film, Tv, SlidersHorizontal, Trash2, Pencil, Power, RefreshCw } from 'lucide-vue-next'
+import { Sparkles, Plus, Film, Tv, SlidersHorizontal, Trash2, Pencil, Power, RefreshCw, Download, Upload } from 'lucide-vue-next'
 import VirtualLibraryFormModal from './virtual-libraries/VirtualLibraryFormModal.vue'
+import VirtualLibraryImportModal from './virtual-libraries/VirtualLibraryImportModal.vue'
 import { useVirtualLibraries } from '../composables/useVirtualLibraries.js'
 import {
   coverImageUrl,
   dynamicCoverLabel,
+  isCustomCover,
   isDynamicCover,
   ruleBadges
 } from '../utils/smartViewLabels.js'
@@ -17,7 +19,7 @@ const emit = defineEmits<{
 const {
   loading,
   saving,
-  seeding,
+  downloadingBundle,
   backfilling,
   refreshingCovers,
   previewing,
@@ -32,6 +34,7 @@ const {
   libraries,
   coverBust,
   modal,
+  importModal,
   filterTabs,
   filteredLibraries,
   metadataPercent,
@@ -47,7 +50,11 @@ const {
   previewRules,
   submitModal,
   backfillMetadata,
-  handleSeedPresets,
+  handleDownloadBundle,
+  openImportModal,
+  handleImportBytes,
+  handleImportFileSelected,
+  confirmImportApply,
   toggleEnabled,
   handleDelete
 } = useVirtualLibraries()
@@ -84,15 +91,26 @@ onUnmounted(() => {
           按地区、平台、流派和评分组合筛选规则，在 VidHub / Infuse 客户端首页生成专属分类栏目。
         </p>
       </div>
-      <div class="flex gap-2.5">
+      <div class="flex flex-wrap gap-2.5">
         <button
           type="button"
-          @click="handleSeedPresets"
-          :disabled="seeding"
-          class="cursor-pointer bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 px-4 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5"
+          @click="handleDownloadBundle"
+          :disabled="downloadingBundle"
+          title="打包下载当前视图规则、自定义封面及 AI 编写模板 (.zip)，可直接发给 AI 生成新配置"
+          class="cursor-pointer bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5 disabled:opacity-50"
         >
-          <Sparkles class="w-3.5 h-3.5 text-indigo-300" aria-hidden="true" />
-          <span>{{ seeding ? '正在生成…' : '补充 9 个预设视图' }}</span>
+          <Download class="w-3.5 h-3.5 text-indigo-300" aria-hidden="true" />
+          <span>{{ downloadingBundle ? '正在打包…' : '下载配置与 AI 模板' }}</span>
+        </button>
+        <button
+          type="button"
+          @click="openImportModal"
+          :disabled="saving"
+          title="上传由 AI 生成或备份的视图配置（支持 .zip 或 .json）"
+          class="cursor-pointer bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5"
+        >
+          <Upload class="w-3.5 h-3.5 text-indigo-300" aria-hidden="true" />
+          <span>导入视图配置</span>
         </button>
         <button
           type="button"
@@ -116,7 +134,7 @@ onUnmounted(() => {
       </div>
       <div class="text-sm font-medium text-slate-200">尚未配置智能视图</div>
       <div class="text-xs text-slate-400">
-        点击右上角补充预设，快速创建高分佳作、已完结短剧和 4K 杜比视界等栏目
+        点击右上角「下载配置与 AI 模板」发给 AI 批量生成视图，再通过「导入视图配置」一键生效；也可以直接点击「新建智能视图」手动创建。
       </div>
     </div>
     <div v-else class="space-y-4">
@@ -220,6 +238,12 @@ onUnmounted(() => {
               >
                 {{ dynamicCoverLabel(v.cover_image) }}
               </div>
+              <div
+                v-else-if="isCustomCover(v.cover_image)"
+                class="pointer-events-none absolute bottom-2 left-2 px-2 py-0.5 rounded-md bg-slate-950/85 backdrop-blur-xs border border-white/10 text-[11px] font-medium text-indigo-300"
+              >
+                自定义封面
+              </div>
             </div>
 
             <div class="px-3.5 py-3">
@@ -306,6 +330,16 @@ onUnmounted(() => {
       @preview="previewRules"
       @backfill="backfillMetadata"
       @open-tasks="modal.visible = false; emit('openTasks')"
+    />
+
+    <VirtualLibraryImportModal
+      :modal="importModal"
+      :rule-options="ruleOptions"
+      :downloading-bundle="downloadingBundle"
+      @close="importModal.visible = false"
+      @select-file="handleImportFileSelected"
+      @confirm="confirmImportApply"
+      @download-bundle="handleDownloadBundle"
     />
   </section>
 </template>
