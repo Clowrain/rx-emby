@@ -334,6 +334,13 @@
                       {{ l.status === 'running' && activeProgress ? `同步中 · ${activeProgress.percent}%` : syncStatusText(l.status) }}
                     </span>
                     <span
+                      v-if="l.status === 'failed' && Number(l.repeat_count) > 1"
+                      class="shrink-0 whitespace-nowrap px-2 py-0.5 rounded-md font-medium font-mono bg-rose-500/20 text-rose-200 border border-rose-500/40"
+                      :title="`连续相同错误已合并 ${l.repeat_count} 次`"
+                    >
+                      ×{{ l.repeat_count }}
+                    </span>
+                    <span
                       v-if="l.status === 'running' && activeProgress"
                       class="text-[11px] text-sky-300 truncate"
                       :title="activeProgress.message"
@@ -432,7 +439,8 @@ const displayedLogs = computed(() => {
       deleted_episodes: 0,
       new_media_items: 0,
       status: 'running',
-      error_message: ''
+      error_message: '',
+      repeat_count: 1
     },
     ...logs.value
   ]

@@ -191,7 +191,7 @@
                     : 'bg-rose-950 text-rose-300 border border-rose-700/40'
                 "
               >
-                {{ syncStatusText(overview.last_sync.status) }}
+                {{ syncStatusText(overview.last_sync.status) }}{{ overview.last_sync.status === 'failed' && Number(overview.last_sync.repeat_count) > 1 ? ` ×${overview.last_sync.repeat_count}` : '' }}
               </span>
             </div>
             <div class="text-slate-300 flex items-center gap-1.5">

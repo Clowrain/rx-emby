@@ -25,7 +25,8 @@ use xxhash_rust::xxh3::xxh3_64;
 const MIN_SYNC_INTERVAL_SEC: u64 = 60;
 const STARTUP_OVERDUE_GRACE: Duration = Duration::from_secs(15);
 const CONFIG_RELOAD_GRACE: Duration = Duration::from_secs(1);
-const SYNC_ERROR_RETRY_SEC: u64 = 300;
+// 连续失败指数退避阶梯：5 分钟 -> 15 分钟 -> 30 分钟 -> 1 小时 -> 恢复正常 sync_interval_sec
+const SYNC_ERROR_BACKOFF_SECS: &[u64] = &[300, 900, 1800, 3600];
 const SYNC_LAST_CHECK_KEY: &str = "sync.last_check_at";
 const MAX_SYNC_DOWNLOAD_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ZIP_TXT_BYTES: usize = 256 * 1024 * 1024;
@@ -71,19 +72,110 @@ fn remaining_wait_secs(next_run_at: tokio::time::Instant) -> u64 {
         .as_secs()
 }
 
+fn compute_retry_backoff_sec(consecutive_failures: u32, interval_sec: u64) -> u64 {
+    let idx = consecutive_failures.saturating_sub(1) as usize;
+    match SYNC_ERROR_BACKOFF_SECS.get(idx) {
+        Some(&step_sec) => interval_sec.min(step_sec),
+        None => interval_sec,
+    }
+}
+
 fn schedule_after_sync(
     succeeded: bool,
     interval_sec: u64,
+    consecutive_failures: &mut u32,
     cycle_anchor_utc: &mut chrono::DateTime<Utc>,
 ) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     if succeeded {
-        // 仅在同步/检查成功时推进周期锚点；失败时保持原锚点并按短退避重试
+        // 仅在同步/检查成功时重置连续失败计数并推进周期锚点；失败时保持原锚点并按指数退避重试
+        *consecutive_failures = 0;
         *cycle_anchor_utc = Utc::now();
         now + Duration::from_secs(interval_sec)
     } else {
-        now + Duration::from_secs(interval_sec.min(SYNC_ERROR_RETRY_SEC))
+        *consecutive_failures = consecutive_failures.saturating_add(1);
+        let wait_sec = compute_retry_backoff_sec(*consecutive_failures, interval_sec);
+        now + Duration::from_secs(wait_sec)
     }
+}
+
+fn should_fold_consecutive_failure(
+    prev_status: Option<&str>,
+    prev_error: Option<&str>,
+    current_error: &str,
+) -> bool {
+    prev_status == Some("failed")
+        && prev_error
+            .map(str::trim)
+            .is_some_and(|prev| !prev.is_empty() && prev == current_error.trim())
+}
+
+async fn record_sync_failure(
+    db: &sqlx::PgPool,
+    log_id: i64,
+    started_at: chrono::DateTime<Utc>,
+    finished_at: chrono::DateTime<Utc>,
+    duration_ms: i64,
+    err_msg: &str,
+) -> Result<()> {
+    let mut tx = db.begin().await?;
+    let prev: Option<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, status, error_message FROM sync_logs WHERE id < $1 ORDER BY id DESC LIMIT 1 FOR UPDATE",
+    )
+    .bind(log_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((prev_id, prev_status, prev_err)) = prev {
+        if should_fold_consecutive_failure(
+            Some(prev_status.as_str()),
+            prev_err.as_deref(),
+            err_msg,
+        ) {
+            let repeat_count: i32 = sqlx::query_scalar(
+                r#"
+                UPDATE sync_logs
+                SET started_at = $1,
+                    finished_at = $2,
+                    duration_ms = $3,
+                    repeat_count = repeat_count + 1
+                WHERE id = $4
+                RETURNING repeat_count
+                "#,
+            )
+            .bind(started_at)
+            .bind(finished_at)
+            .bind(duration_ms)
+            .bind(prev_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            sqlx::query("DELETE FROM sync_logs WHERE id = $1")
+                .bind(log_id)
+                .execute(&mut *tx)
+                .await?;
+
+            tx.commit().await?;
+            info!(
+                "连续相同同步错误已合并至批次 #{}（累计 {} 次）",
+                prev_id, repeat_count
+            );
+            return Ok(());
+        }
+    }
+
+    sqlx::query(
+        "UPDATE sync_logs SET finished_at = $1, duration_ms = $2, status = 'failed', error_message = $3, repeat_count = 1 WHERE id = $4",
+    )
+    .bind(finished_at)
+    .bind(duration_ms)
+    .bind(err_msg)
+    .bind(log_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn load_last_sync_utc(state: &AppState) -> Option<chrono::DateTime<Utc>> {
@@ -116,13 +208,15 @@ async fn load_last_sync_utc(state: &AppState) -> Option<chrono::DateTime<Utc>> {
 pub fn spawn_sync_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut config_rx = state.config_tx.subscribe();
-        let (mut current_interval_sec, mut current_source) = {
+        let (mut current_interval_sec, mut current_source, mut current_proxy) = {
             let cfg = state.config.load();
             (
                 cfg.sync_interval_sec.max(MIN_SYNC_INTERVAL_SEC),
                 cfg.strm_txt_source.clone(),
+                cfg.tmdb_proxy_url.clone(),
             )
         };
+        let mut consecutive_failures: u32 = 0;
 
         let last_sync_utc = load_last_sync_utc(&state).await;
         // 即使历史从未同步，也以启动时刻作为当前周期锚点，保证调整周期时保留已等待时长
@@ -164,7 +258,19 @@ pub fn spawn_sync_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                             false
                         }
                     };
-                    next_run_at = schedule_after_sync(ok, current_interval_sec, &mut cycle_anchor_utc);
+                    next_run_at = schedule_after_sync(
+                        ok,
+                        current_interval_sec,
+                        &mut consecutive_failures,
+                        &mut cycle_anchor_utc,
+                    );
+                    if !ok {
+                        warn!(
+                            "索引同步连续失败 {} 次，将在 {} 秒后重试",
+                            consecutive_failures,
+                            remaining_wait_secs(next_run_at)
+                        );
+                    }
                 }
                 _ = state.sync_ctrl.manual_trigger.notified() => {
                     info!("收到手动触发指令，立即执行全量对账同步");
@@ -182,23 +288,39 @@ pub fn spawn_sync_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                             false
                         }
                     };
-                    next_run_at = schedule_after_sync(ok, current_interval_sec, &mut cycle_anchor_utc);
+                    next_run_at = schedule_after_sync(
+                        ok,
+                        current_interval_sec,
+                        &mut consecutive_failures,
+                        &mut cycle_anchor_utc,
+                    );
+                    if !ok {
+                        warn!(
+                            "索引同步连续失败 {} 次，将在 {} 秒后重试",
+                            consecutive_failures,
+                            remaining_wait_secs(next_run_at)
+                        );
+                    }
                 }
                 changed = config_rx.changed() => {
                     if changed.is_err() {
                         break;
                     }
-                    let (new_interval, new_source) = {
+                    let (new_interval, new_source, new_proxy) = {
                         let cfg = config_rx.borrow_and_update();
                         (
                             cfg.sync_interval_sec.max(MIN_SYNC_INTERVAL_SEC),
                             cfg.strm_txt_source.clone(),
+                            cfg.tmdb_proxy_url.clone(),
                         )
                     };
+                    let proxy_changed = new_proxy != current_proxy;
+                    current_proxy = new_proxy;
 
                     if new_source != current_source {
                         current_source = new_source;
                         current_interval_sec = new_interval;
+                        consecutive_failures = 0;
                         // 索引源地址变更时清理旧 ETag/哈希游标，避免新源命中旧缓存并立即触发同步
                         *state.sync_ctrl.last_file_hash.write().await = None;
                         if let Err(err) = sqlx::query(
@@ -215,13 +337,29 @@ pub fn spawn_sync_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                             current_source,
                             remaining_wait_secs(next_run_at)
                         );
+                    } else if proxy_changed && consecutive_failures > 0 {
+                        current_interval_sec = new_interval;
+                        consecutive_failures = 0;
+                        next_run_at = tokio::time::Instant::now() + CONFIG_RELOAD_GRACE;
+                        info!(
+                            "检测到代理地址变更且此前同步失败，已重置退避计数并将在 {} 秒后重试",
+                            remaining_wait_secs(next_run_at)
+                        );
                     } else if new_interval != current_interval_sec {
                         current_interval_sec = new_interval;
-                        next_run_at = compute_next_run_at(
-                            Some(cycle_anchor_utc),
-                            Duration::from_secs(current_interval_sec),
-                            CONFIG_RELOAD_GRACE,
-                        );
+                        if consecutive_failures > 0 {
+                            let wait_sec = compute_retry_backoff_sec(
+                                consecutive_failures,
+                                current_interval_sec,
+                            );
+                            next_run_at = tokio::time::Instant::now() + Duration::from_secs(wait_sec);
+                        } else {
+                            next_run_at = compute_next_run_at(
+                                Some(cycle_anchor_utc),
+                                Duration::from_secs(current_interval_sec),
+                                CONFIG_RELOAD_GRACE,
+                            );
+                        }
                         info!(
                             "检测到同步周期热更新为 {} 秒，距下次定时检查: {} 秒",
                             current_interval_sec,
@@ -600,14 +738,14 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         Ok(FetchedSource::Bytes { data, etag }) => (data, etag),
         Err(e) => {
             let err_msg = format!("{:#}", e);
-            if let Err(log_err) = sqlx::query(
-                "UPDATE sync_logs SET finished_at = $1, duration_ms = $2, status = 'failed', error_message = $3 WHERE id = $4",
+            if let Err(log_err) = record_sync_failure(
+                &state.db,
+                log_id,
+                started_at,
+                Utc::now(),
+                start_instant.elapsed().as_millis() as i64,
+                &err_msg,
             )
-            .bind(Utc::now())
-            .bind(start_instant.elapsed().as_millis() as i64)
-            .bind(&err_msg)
-            .bind(log_id)
-            .execute(&state.db)
             .await
             {
                 error!("记录同步下载失败状态失败 log_id={}: {:#}", log_id, log_err);
@@ -878,14 +1016,14 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
         }
         Err(e) => {
             let err_msg = format!("{:#}", e);
-            if let Err(log_err) = sqlx::query(
-                "UPDATE sync_logs SET finished_at = $1, duration_ms = $2, status = 'failed', error_message = $3 WHERE id = $4",
+            if let Err(log_err) = record_sync_failure(
+                &state.db,
+                log_id,
+                started_at,
+                finished_at,
+                duration_ms,
+                &err_msg,
             )
-            .bind(finished_at)
-            .bind(duration_ms)
-            .bind(&err_msg)
-            .bind(log_id)
-            .execute(&state.db)
             .await
             {
                 error!("记录同步失败状态失败 log_id={}: {:#}", log_id, log_err);
@@ -898,7 +1036,8 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_next_run_at, remaining_wait_secs, schedule_after_sync, SYNC_ERROR_RETRY_SEC,
+        compute_next_run_at, compute_retry_backoff_sec, remaining_wait_secs,
+        schedule_after_sync, should_fold_consecutive_failure, SYNC_ERROR_BACKOFF_SECS,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
@@ -935,22 +1074,85 @@ mod tests {
     }
 
     #[test]
-    fn schedule_after_sync_uses_short_backoff_on_failure_and_keeps_anchor() {
-        let original_anchor = Utc::now() - ChronoDuration::seconds(5000);
-        let mut anchor = original_anchor;
-        let next = schedule_after_sync(false, 21600, &mut anchor);
-        let wait = remaining_wait_secs(next);
-        assert_eq!(anchor, original_anchor);
-        assert!((SYNC_ERROR_RETRY_SEC - 2..=SYNC_ERROR_RETRY_SEC).contains(&wait));
+    fn compute_retry_backoff_steps_and_caps_to_interval() {
+        assert_eq!(compute_retry_backoff_sec(1, 21600), 300);
+        assert_eq!(compute_retry_backoff_sec(2, 21600), 900);
+        assert_eq!(compute_retry_backoff_sec(3, 21600), 1800);
+        assert_eq!(compute_retry_backoff_sec(4, 21600), 3600);
+        assert_eq!(compute_retry_backoff_sec(5, 21600), 21600);
+        assert_eq!(compute_retry_backoff_sec(10, 21600), 21600);
+
+        // Configured interval smaller than later backoff steps caps cleanly
+        assert_eq!(compute_retry_backoff_sec(1, 1200), 300);
+        assert_eq!(compute_retry_backoff_sec(2, 1200), 900);
+        assert_eq!(compute_retry_backoff_sec(3, 1200), 1200);
+        assert_eq!(compute_retry_backoff_sec(5, 1200), 1200);
     }
 
     #[test]
-    fn schedule_after_sync_advances_anchor_on_success() {
+    fn schedule_after_sync_applies_exponential_backoff_and_keeps_anchor() {
         let original_anchor = Utc::now() - ChronoDuration::seconds(5000);
         let mut anchor = original_anchor;
-        let next = schedule_after_sync(true, 3600, &mut anchor);
+        let mut failures = 0;
+
+        for (idx, expected_sec) in SYNC_ERROR_BACKOFF_SECS
+            .iter()
+            .copied()
+            .chain(std::iter::once(21600))
+            .enumerate()
+        {
+            let next = schedule_after_sync(false, 21600, &mut failures, &mut anchor);
+            let wait = remaining_wait_secs(next);
+            assert_eq!(failures, (idx + 1) as u32);
+            assert_eq!(anchor, original_anchor);
+            assert!((expected_sec - 2..=expected_sec).contains(&wait));
+        }
+    }
+
+    #[test]
+    fn schedule_after_sync_resets_failures_and_advances_anchor_on_success() {
+        let original_anchor = Utc::now() - ChronoDuration::seconds(5000);
+        let mut anchor = original_anchor;
+        let mut failures = 4;
+        let next = schedule_after_sync(true, 3600, &mut failures, &mut anchor);
         let wait = remaining_wait_secs(next);
+        assert_eq!(failures, 0);
         assert!(anchor > original_anchor);
         assert!((3598..=3600).contains(&wait));
+    }
+
+    #[test]
+    fn consecutive_failure_folding_matches_only_identical_failed_rows() {
+        assert!(!should_fold_consecutive_failure(None, None, "tls eof"));
+        assert!(!should_fold_consecutive_failure(
+            Some("success"),
+            None,
+            "tls eof"
+        ));
+        assert!(!should_fold_consecutive_failure(
+            Some("failed"),
+            None,
+            "tls eof"
+        ));
+        assert!(!should_fold_consecutive_failure(
+            Some("failed"),
+            Some("other error"),
+            "tls eof"
+        ));
+        assert!(!should_fold_consecutive_failure(
+            Some("failed"),
+            Some("   "),
+            "   "
+        ));
+        assert!(should_fold_consecutive_failure(
+            Some("failed"),
+            Some("下载索引源失败: tls handshake eof"),
+            "下载索引源失败: tls handshake eof"
+        ));
+        assert!(should_fold_consecutive_failure(
+            Some("failed"),
+            Some("下载索引源失败: tls handshake eof\n"),
+            "下载索引源失败: tls handshake eof"
+        ));
     }
 }

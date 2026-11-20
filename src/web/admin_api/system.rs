@@ -176,13 +176,14 @@ struct SyncLogRow {
     new_media_items: i32,
     status: String,
     error_message: Option<String>,
+    repeat_count: i32,
 }
 
 pub(super) async fn list_sync_logs(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let logs: Vec<SyncLogRow> = sqlx::query_as(
-        "SELECT id, started_at, finished_at, duration_ms, total_lines, added_episodes, deleted_episodes, new_media_items, status, error_message FROM sync_logs ORDER BY id DESC LIMIT 30",
+        "SELECT id, started_at, finished_at, duration_ms, total_lines, added_episodes, deleted_episodes, new_media_items, status, error_message, repeat_count FROM sync_logs ORDER BY id DESC LIMIT 30",
     )
     .fetch_all(&state.db)
     .await
@@ -354,7 +355,7 @@ async fn build_admin_overview_payload(state: &AppState) -> Result<Value, sqlx::E
     .fetch_one(&state.db)
     .await?;
     let last_sync: Option<SyncLogRow> = sqlx::query_as(
-        "SELECT id, started_at, finished_at, duration_ms, total_lines, added_episodes, deleted_episodes, new_media_items, status, error_message FROM sync_logs ORDER BY id DESC LIMIT 1",
+        "SELECT id, started_at, finished_at, duration_ms, total_lines, added_episodes, deleted_episodes, new_media_items, status, error_message, repeat_count FROM sync_logs ORDER BY id DESC LIMIT 1",
     )
     .fetch_optional(&state.db)
     .await?;

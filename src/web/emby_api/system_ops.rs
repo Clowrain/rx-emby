@@ -143,10 +143,11 @@ pub(super) async fn get_activity_log_entries(
         new_media_items: i32,
         status: String,
         error_message: Option<String>,
+        repeat_count: i32,
     }
     let rows: Vec<ActivityRow> = sqlx::query_as(
         r#"
-        SELECT id, started_at, total_lines, added_episodes, deleted_episodes, new_media_items, status, error_message
+        SELECT id, started_at, total_lines, added_episodes, deleted_episodes, new_media_items, status, error_message, repeat_count
         FROM sync_logs
         ORDER BY id DESC
         LIMIT $1 OFFSET $2
@@ -170,10 +171,17 @@ pub(super) async fn get_activity_log_entries(
                  new_media_items: new_items,
                  status,
                  error_message: err,
+                 repeat_count,
              }| {
                 let severity = if status == "failed" { "Error" } else { "Info" };
                 let overview = match err {
-                    Some(ref msg) if !msg.is_empty() => msg.clone(),
+                    Some(ref msg) if !msg.is_empty() => {
+                        if repeat_count > 1 {
+                            format!("[连续 {} 次] {}", repeat_count, msg)
+                        } else {
+                            msg.clone()
+                        }
+                    }
                     _ => format!(
                         "扫描 {} 行，新增剧集 {}，删除 {}，新作品 {}",
                         lines, added, deleted, new_items
