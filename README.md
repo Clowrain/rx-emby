@@ -39,33 +39,37 @@ curl -fsSL https://raw.githubusercontent.com/Clowrain/rx-emby/main/deploy/.env.e
 
 | 环境变量 | 说明 |
 | :--- | :--- |
+| `HTTP_PORT` | 服务监听端口（默认 `23486`，自动避开原版 Emby 的 `8096`） |
+| `POSTGRES_PORT` | PostgreSQL 映射至宿主机 `127.0.0.1` 的端口（默认 `15432`，避开 NAS 系统自带的 `5432`） |
 | `POSTGRES_PASSWORD` | **必填**。PostgreSQL 数据库密码，Compose 会自动将其拼装为 `DATABASE_URL` |
 | `XIAOYA_DIR` | 宿主机小雅数据目录（只读挂载到容器 `/xiaoya-db`），用于直接读取本地 `strm.txt` |
 | `STRM_TXT_SOURCE` | `strm.txt` 路径或远程 URL（配合 `XIAOYA_DIR` 挂载时默认 `/xiaoya-db/strm.txt`） |
-| `ALIST_BASE_URL` / `ALIST_USERNAME` / `ALIST_PASSWORD` | 小雅或 AList 服务地址及登录凭据（如有两步验证可填写 `ALIST_OTP_SECRET`） |
+| `ALIST_BASE_URL` / `ALIST_USERNAME` / `ALIST_PASSWORD` | 小雅或 AList 服务地址（如 `http://<NAS内网IP>:5678`，**勿填 Docker 容器名**）及登录凭据 |
 | `ALIST_PATH_PREFIX` | 若小雅挂载在 AList 子目录下（如 `/xiaoya`），填写该前缀；根目录留空 |
 | `TMDB_API_KEY` | TMDB v3 API Key（用于获取海报、简介、评分与分集信息） |
-| `TMDB_PROXY_URL` | 访问 TMDB 所需的 HTTP / SOCKS5 代理地址（直连可留空） |
+| `TMDB_PROXY_URL` | 访问 TMDB 所需的 HTTP / SOCKS5 代理地址（如 `http://127.0.0.1:7890` 或代理容器静态 IP，**勿填容器名**；直连留空） |
 | `SCRAPER_AUTO_BACKGROUND` | 默认 `false`（打开详情或手动触发时按需刮削）；设为 `true` 则在后台持续刮削全库 |
 
 > **配置优先级说明**：服务首次启动时会将环境变量中的运行参数写入数据库；之后在 Web 后台「系统设置」修改的内容会持久化在数据库中，优先于 `.env` 生效。
 
-### 3. 确认外部网络并启动服务
-
-`deploy/docker-compose.yml` 默认附加了外部网络 `proxy_net`（用于与宿主机上的代理容器互通）：
-
-- 如果你已有 `proxy_net` 网络，直接启动即可；
-- 如果不需要外部代理网络，请注释掉 `docker-compose.yml` 中的 `proxy_net` 相关行（或先执行 `docker network create proxy_net`）。
+### 3. 启动服务
 
 ```bash
 docker compose up -d
 ```
 
+#### 网络说明（对接小雅必读）
+
+- **为何默认使用 `network_mode: host`**：小雅容器在响应 `/d/...` 时，内部 Nginx 会返回 `302` 跳转到其默认 `bridge` 网卡的私有端口（例如 `http://172.17.0.2:45678/d/...`）。若 `rx-emby` 运行在独立的 Compose 自定义网桥中，会被 Docker 防火墙隔离导致建连超时。使用 `host` 网络（与小雅生态内的官方 Emby 容器一致）可直接毫秒级打通该链路，也无需额外配置外部代理网络。
+- **端口防冲突**：`rx-emby` 默认监听 `HTTP_PORT=23486`（避免与原版 Emby `8096` 冲突），PostgreSQL 默认仅绑定 `127.0.0.1:15432`（不对外暴露，同时避免与飞牛等 NAS 系统自带的 `5432` 冲突）。
+- **地址填写原则**：在 `host` 模式下无法使用 Docker 容器名 DNS，因此 `ALIST_BASE_URL` 请填写 NAS 静态局域网 IP（如 `http://192.168.1.10:5678`），`TMDB_PROXY_URL` 请填写宿主机代理端口（如 `http://127.0.0.1:7890`）或代理容器的固定 IP（如 `http://172.30.81.2:7899`）。
+- **非 Linux / 无法使用 `host` 网络的环境**（如 macOS / Windows Docker Desktop）：可将 `rx-emby` 改回普通端口映射模式并将 `DATABASE_URL` 主机改为 `postgres`；若遇到跨网桥不可达的小雅内网跳转，服务端已内置 3 秒建连超时与 5 分钟自动熔断，会快速回退 `/api/fs/get`。
+
 ### 4. 访问后台与连接客户端
 
-- **Web 管理后台**：浏览器访问 `http://<你的IP>:8096`，可使用「数据总览」「媒体库海报墙」「智能视图」「用户与活跃会话」「媒体同步与图片缓存」「系统设置」全部功能。
+- **Web 管理后台**：浏览器访问 `http://<你的IP>:23486`（或你自定义的 `HTTP_PORT`），可使用「数据总览」「媒体库海报墙」「智能视图」「用户与活跃会话」「媒体同步与图片缓存」「系统设置」全部功能。
 - **Emby 客户端连接**：在 **Infuse**、**VidHub**、**SenPlayer** 等客户端中添加 Emby 服务器：
-  - 服务器地址：`http://<你的IP>:8096`
+  - 服务器地址：`http://<你的IP>:23486`
   - 默认管理员账号：`admin`（初始密码为空，留空即可登录；建议随后在 Web 后台「用户与活跃会话」中设置密码或创建家庭成员账号）
 
 ---

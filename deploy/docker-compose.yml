@@ -3,6 +3,9 @@ services:
     image: postgres:16-alpine
     container_name: rx-emby-pg
     restart: unless-stopped
+    # 仅绑定宿主机回环地址，默认使用 15432 避开飞牛/NAS 系统自带 PostgreSQL 的 5432 端口
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-media_admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}
@@ -44,18 +47,18 @@ services:
     #   dockerfile: Dockerfile
     container_name: rx-emby
     restart: unless-stopped
+    # 推荐使用 host 网络（与小雅生态里的 Emby 容器一致），避免跨 Docker 网桥隔离导致小雅 302 内网跳（如 172.17.x.x:45678）超时
+    network_mode: host
     depends_on:
       postgres:
         condition: service_healthy
-    ports:
-      - "${HTTP_PORT:-8096}:8096"
     environment:
       RUST_LOG: ${RUST_LOG:-rx_emby=info}
       TZ: ${TZ:-Asia/Shanghai}
-      BIND_ADDR: ${BIND_ADDR:-0.0.0.0:8096}
+      BIND_ADDR: 0.0.0.0:${HTTP_PORT:-23486}
       SERVER_ID: ${SERVER_ID:-rx-emby-nas-01}
       SERVER_NAME: ${SERVER_NAME:-RX-Emby Media Server}
-      DATABASE_URL: postgres://${POSTGRES_USER:-media_admin}:${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-xiaoya_media}
+      DATABASE_URL: postgres://${POSTGRES_USER:-media_admin}:${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT:-15432}/${POSTGRES_DB:-xiaoya_media}
       STRM_TXT_SOURCE: ${STRM_TXT_SOURCE:-/xiaoya-db/strm.txt}
       SYNC_INTERVAL_SEC: ${SYNC_INTERVAL_SEC:-600}
       PARSE_CONCURRENCY: ${PARSE_CONCURRENCY:-16}
@@ -83,12 +86,6 @@ services:
       - ${CACHE_DIR:-./cache}:/app/cache
       # 挂载小雅目录（只读），用于直接读取 strm.txt
       - ${XIAOYA_DIR:-./xiaoya}:/xiaoya-db:ro
-    networks:
-      - default
-      # 如不使用外部代理容器网络，请注释掉下面这行及底部的 proxy_net 定义
-      - proxy_net
 
 networks:
   default:
-  proxy_net:
-    external: true

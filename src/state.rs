@@ -243,6 +243,8 @@ pub struct CacheLayer {
     pub alist_path_locks: Cache<i64, Arc<Mutex<()>>>,
     /// Key = AList 父目录路径，记录已通过 fs/list 预热过寻址的目录（避免短时间重复 list）
     pub alist_dir_prewarmed: Cache<String, ()>,
+    /// Key = "host:port"，短时熔断不可达的 AList 内网跳转目标（例如跨 Docker 网桥隔离的 172.17.0.2:45678），避免重复建连超时
+    pub alist_unreachable_hosts: Cache<String, ()>,
     /// Key = "{size}/{file_name}", Value = 图片字节流。
     /// `try_get_with` 兼做真正的 singleflight：并发同图请求只放行一次回源/渲染并共享结果。
     pub image_hot_bytes: Cache<String, bytes::Bytes>,
@@ -279,6 +281,7 @@ impl CacheLayer {
         self.alist_ua_agnostic_urls.run_pending_tasks().await;
         self.alist_path_locks.run_pending_tasks().await;
         self.alist_dir_prewarmed.run_pending_tasks().await;
+        self.alist_unreachable_hosts.run_pending_tasks().await;
         self.image_hot_bytes.run_pending_tasks().await;
         self.collage_cache.run_pending_tasks().await;
         self.image_meta_cache.run_pending_tasks().await;
@@ -372,6 +375,11 @@ impl AppState {
             .time_to_live(Duration::from_secs(600))
             .build();
 
+        let unreachable_hosts = Cache::builder()
+            .max_capacity(128)
+            .time_to_live(Duration::from_secs(300))
+            .build();
+
         let inflight = Cache::builder()
             .max_capacity(24 * 1024 * 1024)
             .weigher(|_key: &String, value: &bytes::Bytes| {
@@ -461,6 +469,7 @@ impl AppState {
                 alist_ua_agnostic_urls: ua_agnostic_urls,
                 alist_path_locks: path_locks,
                 alist_dir_prewarmed: dir_prewarmed,
+                alist_unreachable_hosts: unreachable_hosts,
                 image_hot_bytes: inflight,
                 collage_cache,
                 image_download_permits: Arc::new(Semaphore::new(8)),
@@ -596,6 +605,7 @@ impl AppState {
             self.caches.alist_direct_urls.invalidate_all();
             self.caches.alist_ua_agnostic_urls.invalidate_all();
             self.caches.alist_dir_prewarmed.invalidate_all();
+            self.caches.alist_unreachable_hosts.invalidate_all();
             info!("AList 配置已变更，旧 Token、直链及目录预热缓存已清空");
         }
 
@@ -673,6 +683,7 @@ pub fn build_alist_client() -> Result<Client> {
     Client::builder()
         .no_proxy() // 内网 AList 强制直连，绕过系统环境变量代理
         .redirect(reqwest::redirect::Policy::none()) // 禁用自动重定向以便捕获 Location
+        .connect_timeout(Duration::from_secs(3)) // 跨网桥/不可达内网目标 3s 快速失败，避免拖满整条播放链路
         .timeout(Duration::from_secs(35))
         .tcp_keepalive(Duration::from_secs(60))
         .pool_idle_timeout(Duration::from_secs(90))

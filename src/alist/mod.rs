@@ -119,6 +119,34 @@ mod tests {
             "https://pds-bj29.alicloudccp.com/test.mkv"
         ));
     }
+
+    #[test]
+    fn host_port_key_extracts_explicit_and_default_ports() {
+        assert_eq!(
+            super::host_port_key("http://172.17.0.2:45678/d/test.mkv").as_deref(),
+            Some("172.17.0.2:45678")
+        );
+        assert_eq!(
+            super::host_port_key("http://xiaoya.host/d/test.mkv").as_deref(),
+            Some("xiaoya.host:80")
+        );
+        assert_eq!(
+            super::host_port_key("https://cdn.example.com/a.mp4").as_deref(),
+            Some("cdn.example.com:443")
+        );
+        assert_eq!(super::host_port_key("not-a-url"), None);
+    }
+}
+
+fn host_port_key(target_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(target_url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default()?;
+    Some(format!("{host}:{port}"))
+}
+
+fn should_retry_cold_start_timeout(err: &reqwest::Error) -> bool {
+    err.is_timeout() && !err.is_connect()
 }
 
 /// 判断网盘 CDN 直链是否强绑定客户端 User-Agent（仅 115 与百度网盘 CDN 强校验 UA，阿里云盘/天翼/夸克/UC/移动等不校验 UA）
@@ -443,19 +471,24 @@ impl AppState {
                     }
 
                     // 优先使用单跳网盘 CDN raw_url；若为空（强制中转网盘）则降级走 AList /d/ 签名直链
-                    let fallback_url = match fs_data.raw_url.filter(|u| !u.trim().is_empty()) {
-                        Some(raw_url) => raw_url,
+                    match fs_data.raw_url.filter(|u| !u.trim().is_empty()) {
+                        Some(raw_url) => (raw_url, "fs_get_raw_url"),
                         None => {
                             let token = self.get_alist_token(false).await?;
-                            self.build_signed_d_url(&full_path, &token, 14400)?
+                            let signed_url = self.build_signed_d_url(&full_path, &token, 14400)?;
+                            (signed_url, "fs_get_signed_d")
                         }
-                    };
-                    (fallback_url, "fs_get")
+                    }
                 };
 
+                let target_host = reqwest::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| "-".to_string());
                 info!(
-                    "🔗 [DirectURL FETCH] source={} | path={} | 换链总耗时={}ms",
+                    "🔗 [DirectURL FETCH] source={} | target_host={} | path={} | 换链总耗时={}ms",
                     source,
+                    target_host,
                     full_path,
                     total_start.elapsed().as_millis()
                 );
@@ -464,7 +497,18 @@ impl AppState {
             .await
             .map_err(|e| anyhow!("{}", e))?;
 
-        if !is_ua_bound_cdn_url(&final_url) {
+        let cfg = self.config.load();
+        let is_internal = is_internal_alist_redirect(&cfg.alist_base_url, &final_url);
+        if is_internal {
+            let target_host = reqwest::Url::parse(&final_url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "-".to_string());
+            warn!(
+                "⚠️ [DirectURL Internal] 最终直链仍指向内网地址 (target_host={})，公网客户端可能无法直接播放 | path={}",
+                target_host, full_path
+            );
+        } else if !is_ua_bound_cdn_url(&final_url) {
             self.caches
                 .alist_ua_agnostic_urls
                 .insert(path_hash, final_url.clone())
@@ -651,6 +695,24 @@ impl AppState {
         let mut tried_signed = false;
 
         for hop in 0..MAX_INTERNAL_HOPS {
+            if hop > 0 {
+                if let Some(hp_key) = host_port_key(&current_url) {
+                    if self
+                        .caches
+                        .alist_unreachable_hosts
+                        .get(&hp_key)
+                        .await
+                        .is_some()
+                    {
+                        warn!(
+                            "⏭️ [AList /d/ 熔断跳过] target={} 近期建连不可达，直接回退 /api/fs/get | path={}",
+                            hp_key, full_path
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+
             let send_hop = |url: &str, timeout: std::time::Duration| {
                 client
                     .get(url)
@@ -662,7 +724,23 @@ impl AppState {
 
             let mut resp = match send_hop(&current_url, FIRST_ATTEMPT_TIMEOUT).await {
                 Ok(resp) => resp,
-                Err(first_err) if first_err.is_timeout() => {
+                Err(first_err) if first_err.is_connect() => {
+                    if hop > 0 {
+                        if let Some(hp_key) = host_port_key(&current_url) {
+                            self.caches
+                                .alist_unreachable_hosts
+                                .insert(hp_key.clone(), ())
+                                .await;
+                            warn!(
+                                "⚠️ [AList /d/ 内网跳建连失败] target={} 不可达（疑似跨 Docker 网桥隔离，建议为 rx-emby 启用 network_mode: host），已熔断 5 分钟并回退 /api/fs/get | path={} | err={}",
+                                hp_key, full_path, first_err
+                            );
+                            return Ok(None);
+                        }
+                    }
+                    return Err(first_err).context("调用 AList /d/ 建连失败");
+                }
+                Err(first_err) if should_retry_cold_start_timeout(&first_err) => {
                     warn!(
                         "⏳ [AList /d/ 冷启动首次 10s 超时] path={} | hop={}，服务端自动发起二次重连捕获已转存直链",
                         full_path,
@@ -681,7 +759,7 @@ impl AppState {
                 current_url = self.build_signed_d_url(full_path, &token, 14400)?;
                 resp = match send_hop(&current_url, FIRST_ATTEMPT_TIMEOUT).await {
                     Ok(resp) => resp,
-                    Err(first_err) if first_err.is_timeout() => {
+                    Err(first_err) if should_retry_cold_start_timeout(&first_err) => {
                         warn!(
                             "⏳ [AList 签名 /d/ 冷启动首次 10s 超时] path={}，服务端自动发起二次重连",
                             full_path
