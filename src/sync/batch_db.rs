@@ -34,6 +34,19 @@ fn subtitle_digest_changed(existing_digest: Option<i64>, current: &[String]) -> 
     existing_digest.is_some_and(|old| old != subtitles_digest(current))
 }
 
+fn select_folders_with_inserted_files(
+    touched_folder_ids: &HashSet<i64>,
+    inserted_file_folder_ids: &HashSet<i64>,
+) -> Vec<i64> {
+    let mut ids: Vec<i64> = touched_folder_ids
+        .iter()
+        .copied()
+        .filter(|fid| inserted_file_folder_ids.contains(fid))
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
 fn record_rank(r: &ParsedStrmRecord) -> (bool, bool, i32) {
     (r.tmdb_id.is_some(), !r.has_noise_prefix, r.priority_score)
 }
@@ -214,6 +227,7 @@ pub async fn apply_sync_diff(
     };
     let mut new_folders_count = 0_i32;
     let mut touched_folder_ids: HashSet<i64> = HashSet::new();
+    let mut inserted_file_folder_ids: HashSet<i64> = HashSet::new();
 
     if !to_insert.is_empty() {
         // 按 root_dir 聚合出唯一的新增目录分组
@@ -359,7 +373,7 @@ pub async fn apply_sync_diff(
                 priority_scores.push(r.priority_score);
             }
 
-            sqlx::query(
+            let inserted_fids: Vec<i64> = sqlx::query_scalar(
                 r#"
                 INSERT INTO sync_files (
                     folder_id, season_number, episode_number, alist_path,
@@ -370,6 +384,7 @@ pub async fn apply_sync_diff(
                     $5::int8[], $6::text[], $7::text[], $8::text[], $9::int4[]
                 )
                 ON CONFLICT (path_hash) DO NOTHING
+                RETURNING folder_id
                 "#,
             )
             .bind(&folder_ids)
@@ -381,9 +396,10 @@ pub async fn apply_sync_diff(
             .bind(&containers)
             .bind(&version_tags)
             .bind(&priority_scores)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await
             .context("批量 INSERT sync_files 失败")?;
+            inserted_file_folder_ids.extend(inserted_fids);
         }
     }
 
@@ -429,23 +445,41 @@ pub async fn apply_sync_diff(
         .context("清理孤儿 sync_folders 失败")?;
     }
 
-    // 查出已绑定 work_id 但新增了分集的老目录，通知刮削器增量补齐新集元数据
+    // 查出已绑定 work_id 且本次确实新增了视频文件的老目录：
+    // 1) 推进对应正式作品的 updated_at，使海报墙“更新时间”与 Emby DateLastContentAdded 真实反映追更/新增版本源
+    // 2) 通知刮削器增量补齐新集元数据
     let mut updated_folder_ids = Vec::new();
-    if !touched_folder_ids.is_empty() {
-        let ids: Vec<i64> = touched_folder_ids.into_iter().collect();
-        updated_folder_ids = sqlx::query_scalar(
+    let active_touched_folder_ids =
+        select_folders_with_inserted_files(&touched_folder_ids, &inserted_file_folder_ids);
+    if !active_touched_folder_ids.is_empty() {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
             r#"
-            SELECT f.id
+            SELECT f.id, f.work_id
             FROM sync_folders f
             WHERE f.id = ANY($1)
               AND f.work_id IS NOT NULL
               AND f.is_ignored = FALSE
             "#,
         )
-        .bind(&ids)
+        .bind(&active_touched_folder_ids)
         .fetch_all(&mut *tx)
         .await
         .context("查询待补齐分集的已绑定目录失败")?;
+
+        let mut touched_work_ids = HashSet::with_capacity(rows.len());
+        for (fid, wid) in rows {
+            updated_folder_ids.push(fid);
+            touched_work_ids.insert(wid);
+        }
+
+        if !touched_work_ids.is_empty() {
+            let work_ids: Vec<i64> = touched_work_ids.into_iter().collect();
+            sqlx::query("UPDATE media_works SET updated_at = NOW() WHERE id = ANY($1)")
+                .bind(&work_ids)
+                .execute(&mut *tx)
+                .await
+                .context("推进已更新正式作品的 updated_at 失败")?;
+        }
     }
 
     tx.commit().await.context("提交同步事务失败")?;
@@ -462,8 +496,12 @@ pub async fn apply_sync_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{deduplicate_records, subtitle_digest_changed, subtitles_digest};
+    use super::{
+        deduplicate_records, select_folders_with_inserted_files, subtitle_digest_changed,
+        subtitles_digest,
+    };
     use crate::sync::parser::ParsedStrmRecord;
+    use std::collections::HashSet;
 
     fn sample_record(
         path_hash: i64,
@@ -519,5 +557,16 @@ mod tests {
         assert!(subtitle_digest_changed(Some(digest), &added));
         assert!(subtitle_digest_changed(Some(digest), &[]));
         assert!(!subtitle_digest_changed(None, &added));
+    }
+
+    #[test]
+    fn select_folders_with_inserted_files_filters_out_uninserted_folders() {
+        let touched = HashSet::from([30, 10, 20]);
+        let inserted = HashSet::from([20, 40, 10]);
+        assert_eq!(
+            select_folders_with_inserted_files(&touched, &inserted),
+            vec![10, 20]
+        );
+        assert!(select_folders_with_inserted_files(&touched, &HashSet::new()).is_empty());
     }
 }

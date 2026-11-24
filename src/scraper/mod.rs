@@ -697,22 +697,26 @@ async fn fetch_next_pending_task_with_mode(
         return Ok(Some(ScrapeTask::WorkSeasons(wid)));
     }
 
-    // 4. 被动刷新过期作品元数据
+    // 4. 被动刷新过期作品元数据（仅限仍有有效未忽略物理目录的在库作品）
     let stale_wid: Option<i64> = sqlx::query_scalar(
         r#"
-        SELECT id FROM media_works
-        WHERE NOT is_locked
-          AND tmdb_id IS NOT NULL
-          AND (metadata_retry_at IS NULL OR metadata_retry_at <= NOW())
-          AND metadata_retry_count < 3
+        SELECT w.id FROM media_works w
+        WHERE NOT w.is_locked
+          AND w.tmdb_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM sync_folders f
+              WHERE f.work_id = w.id AND f.is_ignored = FALSE
+          )
+          AND (w.metadata_retry_at IS NULL OR w.metadata_retry_at <= NOW())
+          AND w.metadata_retry_count < 3
           AND (
-              metadata_version < 2
-              OR metadata_fetched_at < NOW() - CASE
-                  WHEN tmdb_metadata->>'status' = 'Returning Series' THEN INTERVAL '1 day'
+              w.metadata_version < 2
+              OR w.metadata_fetched_at < NOW() - CASE
+                  WHEN w.tmdb_metadata->>'status' = 'Returning Series' THEN INTERVAL '1 day'
                   ELSE INTERVAL '7 days'
               END
           )
-        ORDER BY id ASC
+        ORDER BY w.id ASC
         LIMIT 1
         "#,
     )
@@ -814,7 +818,25 @@ fn verify_tmdb_match(candidate: TmdbMatch<'_>) -> std::result::Result<(), String
     Ok(())
 }
 
-async fn upsert_media_work(state: &AppState, meta: &ScrapedMetadata) -> Result<i64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkUpsertMode {
+    /// 新目录入库、多源归并或人工绑定：推进 `media_works.updated_at`
+    ContentChange,
+    /// 后台周期保鲜 / 按需补齐 TMDB 元数据：仅更新 `metadata_fetched_at`，保持 `updated_at` 不变
+    MetadataRefreshOnly,
+}
+
+impl WorkUpsertMode {
+    const fn touches_updated_at(self) -> bool {
+        matches!(self, Self::ContentChange)
+    }
+}
+
+async fn upsert_media_work(
+    state: &AppState,
+    meta: &ScrapedMetadata,
+    mode: WorkUpsertMode,
+) -> Result<i64> {
     let previous_images: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT poster_path, backdrop_path FROM media_works WHERE tmdb_id = $1 AND media_type = $2",
     )
@@ -854,7 +876,7 @@ async fn upsert_media_work(state: &AppState, meta: &ScrapedMetadata) -> Result<i
             metadata_refresh_requested = FALSE,
             metadata_retry_count = 0,
             metadata_retry_at = NULL,
-            updated_at = NOW()
+            updated_at = CASE WHEN $16 THEN NOW() ELSE media_works.updated_at END
         RETURNING id
         "#,
     )
@@ -873,6 +895,7 @@ async fn upsert_media_work(state: &AppState, meta: &ScrapedMetadata) -> Result<i
     .bind(&meta.genres)
     .bind(&meta.category)
     .bind(extra_json)
+    .bind(mode.touches_updated_at())
     .fetch_one(&state.db)
     .await?;
 
@@ -1005,6 +1028,10 @@ pub async fn scrape_single_folder_with_mode(
                 .bind(folder.id)
                 .execute(&state.db)
                 .await?;
+                sqlx::query("UPDATE media_works SET updated_at = NOW() WHERE id = $1")
+                    .bind(work.id)
+                    .execute(&state.db)
+                    .await?;
 
                 invalidate_admin_stats(state).await;
                 broadcast_verified_work(state, work.id, &folder.category);
@@ -1106,7 +1133,7 @@ pub async fn scrape_single_folder_with_mode(
 
     match fetch_res {
         Ok(Ok(meta)) => {
-            let work_id = upsert_media_work(state, &meta).await?;
+            let work_id = upsert_media_work(state, &meta, WorkUpsertMode::ContentChange).await?;
             sqlx::query(
                 r#"
                 UPDATE sync_folders SET
@@ -1227,9 +1254,31 @@ pub async fn scrape_work_seasons_by_id(state: &AppState, work_id: i64, is_p0: bo
             .scrape_tmdb_metadata(Some(tid), &work.media_type, &work.title, work.year)
             .await
         {
-            Ok(meta) => {
-                let _ = upsert_media_work(state, &meta).await?;
+            Ok(meta) if meta.media_type == work.media_type => {
+                let _ =
+                    upsert_media_work(state, &meta, WorkUpsertMode::MetadataRefreshOnly).await?;
                 invalidate_admin_stats(state).await;
+            }
+            Ok(meta) => {
+                let err = anyhow::anyhow!(
+                    "刷新作品元数据返回类型不匹配 work_id={} expected={} actual={} tmdb_id={}",
+                    work.id,
+                    work.media_type,
+                    meta.media_type,
+                    meta.tmdb_id
+                );
+                let retries = work.metadata_retry_count.saturating_add(1);
+                if let Err(update_err) = sqlx::query(
+                    "UPDATE media_works SET metadata_retry_count = $2, metadata_retry_at = NOW() + INTERVAL '1 day' WHERE id = $1",
+                )
+                .bind(work.id)
+                .bind(retries)
+                .execute(&state.db)
+                .await
+                {
+                    error!("更新作品元数据重试状态失败 work_id={}: {:#}", work.id, update_err);
+                }
+                return Err(err);
             }
             Err(e) => {
                 let retries = work.metadata_retry_count.saturating_add(1);
@@ -1581,7 +1630,7 @@ pub async fn promote_folder_manually(
         let meta = state
             .scrape_tmdb_metadata(Some(tid), mtype, &folder_row.1, folder_row.2)
             .await?;
-        let work_id = upsert_media_work(state, &meta).await?;
+        let work_id = upsert_media_work(state, &meta, WorkUpsertMode::ContentChange).await?;
 
         sqlx::query(
             r#"
@@ -1682,6 +1731,12 @@ mod scheduled_task_tests {
         assert!(!runtime.snapshot().running);
     }
 
+    #[test]
+    fn work_upsert_mode_separates_content_change_from_metadata_refresh() {
+        assert!(WorkUpsertMode::ContentChange.touches_updated_at());
+        assert!(!WorkUpsertMode::MetadataRefreshOnly.touches_updated_at());
+    }
+
     #[tokio::test]
     async fn manual_request_wakes_worker_and_enables_sweep() {
         let runtime = ScrapeRuntime::default();
@@ -1748,6 +1803,225 @@ mod scheduled_task_tests {
             fetch_next_pending_task(&state).await.unwrap(),
             Some(ScrapeTask::Folder(5))
         ));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "需要 TEST_DATABASE_URL；验证被动刷新不覆写 updated_at、过滤孤儿目录，且新增分集正确推进 updated_at"]
+    async fn passive_metadata_refresh_preserves_updated_at_and_skips_inactive_works() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("设置测试数据库连接");
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE media_works (
+                id BIGSERIAL PRIMARY KEY,
+                media_type VARCHAR(16) NOT NULL,
+                tmdb_id INTEGER,
+                title VARCHAR(255) NOT NULL,
+                original_title VARCHAR(255),
+                sort_title VARCHAR(255),
+                year INTEGER,
+                premiered_at VARCHAR(32),
+                overview TEXT,
+                rating REAL NOT NULL DEFAULT 0,
+                poster_path VARCHAR(255),
+                backdrop_path VARCHAR(255),
+                countries TEXT[] NOT NULL DEFAULT '{}',
+                networks TEXT[] NOT NULL DEFAULT '{}',
+                genres TEXT[] NOT NULL DEFAULT '{}',
+                tags TEXT[] NOT NULL DEFAULT '{}',
+                category VARCHAR(32) NOT NULL DEFAULT '电影',
+                tmdb_metadata JSONB NOT NULL DEFAULT '{}',
+                metadata_version SMALLINT NOT NULL DEFAULT 0,
+                metadata_fetched_at TIMESTAMPTZ,
+                metadata_refresh_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                metadata_retry_count SMALLINT NOT NULL DEFAULT 0,
+                metadata_retry_at TIMESTAMPTZ,
+                is_locked BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX idx_temp_media_works_tmdb
+                ON media_works(tmdb_id, media_type) WHERE tmdb_id IS NOT NULL;
+            CREATE TEMP TABLE sync_folders (
+                id BIGSERIAL PRIMARY KEY,
+                root_dir TEXT UNIQUE NOT NULL,
+                raw_folder_name VARCHAR(255) NOT NULL,
+                clean_title VARCHAR(255) NOT NULL,
+                year INTEGER,
+                inferred_media_type VARCHAR(16) NOT NULL,
+                category VARCHAR(32) NOT NULL,
+                parsed_tmdb_id INTEGER,
+                work_id BIGINT,
+                scrape_state VARCHAR(16) NOT NULL DEFAULT 'verified',
+                conflict_reason TEXT,
+                scrape_priority SMALLINT NOT NULL DEFAULT 3,
+                retry_count SMALLINT NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMPTZ,
+                is_locked BOOLEAN NOT NULL DEFAULT FALSE,
+                is_ignored BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TEMP TABLE sync_files (
+                id BIGSERIAL PRIMARY KEY,
+                folder_id BIGINT NOT NULL,
+                season_number INTEGER NOT NULL DEFAULT 0,
+                episode_number INTEGER NOT NULL DEFAULT 1,
+                alist_path TEXT NOT NULL,
+                path_hash BIGINT UNIQUE NOT NULL,
+                file_name VARCHAR(512) NOT NULL,
+                container VARCHAR(32) NOT NULL,
+                version_tag VARCHAR(128) NOT NULL DEFAULT '默认版本',
+                priority_score INTEGER NOT NULL DEFAULT 0,
+                subtitles TEXT[] NOT NULL DEFAULT '{}'
+            );
+            CREATE TEMP TABLE work_seasons (
+                work_id BIGINT NOT NULL,
+                season_number INTEGER NOT NULL,
+                scrape_attempts INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TEMP TABLE work_episodes (
+                work_id BIGINT NOT NULL,
+                season_number INTEGER NOT NULL,
+                meta_incomplete BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            INSERT INTO media_works (id, media_type, tmdb_id, title, category, metadata_version, metadata_fetched_at, updated_at)
+            VALUES
+                (1, 'movie', 1001, '孤儿作品', '电影', 2, NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days'),
+                (2, 'movie', 1002, '已屏蔽作品', '电影', 2, NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days'),
+                (3, 'movie', 1003, '在库老作品', '电影', 2, NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days');
+            INSERT INTO sync_folders (id, root_dir, raw_folder_name, clean_title, inferred_media_type, category, work_id, scrape_state, is_ignored)
+            VALUES
+                (20, '/ignored/2', '2', '已屏蔽作品', 'movie', '电影', 2, 'verified', TRUE),
+                (30, '/active/3', '3', '在库老作品', 'movie', '电影', 3, 'verified', FALSE);
+            INSERT INTO sync_files (folder_id, season_number, episode_number, alist_path, path_hash, file_name, container)
+            VALUES (30, 0, 1, '/active/3/old.mkv', 3001, 'old.mkv', 'mkv');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let mut cfg = crate::config::BootstrapFileConfig::default().into_dynamic();
+        cfg.tmdb_api_key = "fixture".into();
+        cfg.scraper_auto_background = true;
+        let (tx, _rx) = mpsc::channel(4);
+        let state = AppState::new(cfg, db.clone(), tx).unwrap();
+
+        // 第 4 优先级应跳过孤儿作品 #1 与已屏蔽作品 #2，仅捞出在库过期作品 #3
+        assert!(matches!(
+            fetch_next_pending_task(&state).await.unwrap(),
+            Some(ScrapeTask::WorkSeasons(3))
+        ));
+
+        let (before_updated, before_fetched): (chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>) =
+            sqlx::query_as("SELECT updated_at, metadata_fetched_at FROM media_works WHERE id = 3")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+
+        let meta = ScrapedMetadata {
+            media_type: "movie".into(),
+            tmdb_id: 1003,
+            title: "在库老作品".into(),
+            original_title: None,
+            year: Some(2020),
+            premiered_at: Some("2020-01-01".into()),
+            overview: Some("简介".into()),
+            rating: 8.1,
+            poster_path: None,
+            backdrop_path: None,
+            countries: vec!["CN".into()],
+            networks: vec![],
+            genres: vec!["剧情".into()],
+            extra: tmdb::TmdbExtraMetadata::default(),
+            category: "电影".into(),
+        };
+
+        // 被动元数据刷新：应推进 metadata_fetched_at，但绝不修改 updated_at
+        upsert_media_work(&state, &meta, WorkUpsertMode::MetadataRefreshOnly)
+            .await
+            .unwrap();
+        let (after_refresh_updated, after_refresh_fetched): (
+            chrono::DateTime<Utc>,
+            Option<chrono::DateTime<Utc>>,
+        ) = sqlx::query_as("SELECT updated_at, metadata_fetched_at FROM media_works WHERE id = 3")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(after_refresh_updated, before_updated);
+        assert!(after_refresh_fetched > before_fetched);
+
+        // 内容变更入库/新版本归并：应推进 updated_at
+        upsert_media_work(&state, &meta, WorkUpsertMode::ContentChange)
+            .await
+            .unwrap();
+        let after_content_updated: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM media_works WHERE id = 3")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(after_content_updated > before_updated);
+
+        // 重置 updated_at 后验证 sync 新增物理文件会推进已绑定作品的 updated_at
+        sqlx::query("UPDATE media_works SET updated_at = NOW() - INTERVAL '8 days' WHERE id = 3")
+            .execute(&db)
+            .await
+            .unwrap();
+        let before_sync_updated: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM media_works WHERE id = 3")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let existing_rec = crate::sync::parser::ParsedStrmRecord {
+            alist_path: "/active/3/old.mkv".into(),
+            path_hash: 3001,
+            root_dir: "/active/3".into(),
+            raw_folder_name: "3".into(),
+            clean_title: "在库老作品".into(),
+            year: Some(2020),
+            tmdb_id: Some(1003),
+            inferred_media_type: "movie".into(),
+            inferred_category: "电影".into(),
+            season_number: 0,
+            episode_number: 1,
+            file_name: "old.mkv".into(),
+            container: "mkv".into(),
+            version_tag: "1080P".into(),
+            priority_score: 10,
+            has_noise_prefix: false,
+            subtitles: vec![],
+        };
+        let new_version_rec = crate::sync::parser::ParsedStrmRecord {
+            alist_path: "/active/3/4k.mkv".into(),
+            path_hash: 3002,
+            file_name: "4k.mkv".into(),
+            version_tag: "4K".into(),
+            priority_score: 50,
+            ..existing_rec.clone()
+        };
+        let stats = crate::sync::batch_db::apply_sync_diff(
+            &db,
+            vec![existing_rec, new_version_rec],
+            2,
+            500,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.updated_folder_ids, vec![30]);
+        let after_sync_updated: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM media_works WHERE id = 3")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(after_sync_updated > before_sync_updated);
+
         db.close().await;
     }
 }

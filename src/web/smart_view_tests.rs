@@ -448,6 +448,20 @@ async fn verify_metadata_refresh(db: &sqlx::PgPool) {
     crate::scraper::scrape_single_folder(&state, 500)
         .await
         .unwrap();
+    sqlx::query("UPDATE media_works SET updated_at = NOW() - INTERVAL '8 days' WHERE id IN (500, 600)")
+        .execute(db)
+        .await
+        .unwrap();
+    let work_500_before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM media_works WHERE id = 500")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let work_600_before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM media_works WHERE id = 600")
+            .fetch_one(db)
+            .await
+            .unwrap();
     crate::scraper::scrape_single_folder(&state, 501)
         .await
         .unwrap();
@@ -462,9 +476,30 @@ async fn verify_metadata_refresh(db: &sqlx::PgPool) {
             .await
             .unwrap();
     assert_eq!(work_id_501, Some(500));
+    let work_500_after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM media_works WHERE id = 500")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert!(
+        work_500_after > work_500_before,
+        "新目录经 cached_work 归并至已有作品时应推进 updated_at"
+    );
     crate::scraper::scrape_work_seasons_by_id(&state, 600, true)
         .await
         .unwrap();
+    let (work_600_after, work_600_fetched): (
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as("SELECT updated_at, metadata_fetched_at FROM media_works WHERE id = 600")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(
+        work_600_after, work_600_before,
+        "元数据保鲜/分集刮削不得覆写 media_works.updated_at"
+    );
+    assert!(work_600_fetched.is_some());
     let season:(i32,i32)=sqlx::query_as("SELECT episode_count,scrape_attempts FROM work_seasons WHERE work_id=600 AND season_number=1").fetch_one(db).await.unwrap();
     assert_eq!(season, (3, 1), "真实集数与刮削次数分开保存");
     assert!(crate::scraper::scrape_single_folder(&state, 700)
