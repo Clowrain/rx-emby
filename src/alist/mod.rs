@@ -103,6 +103,38 @@ mod tests {
             "https://cdnfhnfile.115cdn.net/test.mp4"
         ));
     }
+
+    #[test]
+    fn recognizes_ua_bound_cdn_urls_accurately() {
+        assert!(super::is_ua_bound_cdn_url(
+            "https://cdnfhnfile.115cdn.net/video.mkv?t=123"
+        ));
+        assert!(super::is_ua_bound_cdn_url(
+            "https://d.pcs.baidu.com/file/test.mp4"
+        ));
+        assert!(!super::is_ua_bound_cdn_url(
+            "https://cn-beijing-data.aliyundrive.net/test.mkv"
+        ));
+        assert!(!super::is_ua_bound_cdn_url(
+            "https://pds-bj29.alicloudccp.com/test.mkv"
+        ));
+    }
+}
+
+/// 判断网盘 CDN 直链是否强绑定客户端 User-Agent（仅 115 与百度网盘 CDN 强校验 UA，阿里云盘/天翼/夸克/UC/移动等不校验 UA）
+fn is_ua_bound_cdn_url(target_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(target_url) else {
+        return true;
+    };
+    let Some(host) = parsed.host_str() else {
+        return true;
+    };
+    let host_lower = host.to_ascii_lowercase();
+    host_lower.contains("115cdn")
+        || host_lower.contains("115.com")
+        || host_lower.contains("baidupcs.com")
+        || host_lower.contains("baidu.com")
+        || host_lower.contains("bdimg.com")
 }
 
 fn is_internal_alist_redirect(base_url: &str, target_url: &str) -> bool {
@@ -299,7 +331,7 @@ impl AppState {
         }
     }
 
-    /// 获取播放器 302 跳转直链（Singleflight 并发合并、严格透传客户端 User-Agent、按 UA 隔离缓存，支持 401 重登与 /d/ 签名降级）
+    /// 获取播放器 302 跳转直链（支持路径级转存防撞车锁、跨 UA 通用直链复用、Singleflight 并发合并、阶梯超时自动重试与 /d/ 签名降级）
     pub async fn resolve_playback_url(
         &self,
         path_hash: i64,
@@ -315,17 +347,53 @@ impl AppState {
         let cache_key = format!("{}:{}", path_hash, effective_ua);
         if let Some(cached_url) = self.caches.alist_direct_urls.get(&cache_key).await {
             debug!(
-                "⚡ [DirectURL HIT] path_hash={} 命中直链内存缓存",
+                "⚡ [DirectURL HIT] path_hash={} 命中精确 UA 直链缓存",
                 path_hash
             );
             return Ok(ResolvedStream {
                 redirect_url: cached_url,
             });
         }
+        if let Some(agnostic_url) = self.caches.alist_ua_agnostic_urls.get(&path_hash).await {
+            debug!(
+                "⚡ [DirectURL UA-Agnostic HIT] path_hash={} 跨 UA 命中免校验网盘直链缓存",
+                path_hash
+            );
+            return Ok(ResolvedStream {
+                redirect_url: agnostic_url,
+            });
+        }
+
+        // 获取该 path_hash 的路径级互斥锁：
+        // 当 PlaybackInfo（客户端 UI 的 UA）与 /Videos/:id/stream（播放器内核的 UA）先后到达时，
+        // 严禁同时向小雅发起两个并发转存请求（避免小雅/ali2115 内部转存锁冲突导致首次拉起卡死）。
+        let path_mutex = self
+            .caches
+            .alist_path_locks
+            .get_with(path_hash, async { Arc::new( tokio::sync::Mutex::new(()) ) })
+            .await;
+        let _path_guard = path_mutex.lock().await;
+
+        // 拿到路径锁后二次检查缓存：若前序 PlaybackInfo 预热刚完成且为免 UA 校验网盘（如阿里云盘/夸克/天翼），直接 0ms 复用！
+        // 若为 115 等锁 UA 网盘，前序预热已完成最耗时的“分享转存到个人网盘”，接下来用播放器真实 UA 换链仅需 <200ms。
+        if let Some(cached_url) = self.caches.alist_direct_urls.get(&cache_key).await {
+            return Ok(ResolvedStream {
+                redirect_url: cached_url,
+            });
+        }
+        if let Some(agnostic_url) = self.caches.alist_ua_agnostic_urls.get(&path_hash).await {
+            debug!(
+                "⚡ [DirectURL Post-Lock HIT] path_hash={} 等待预热锁后直接复用直链",
+                path_hash
+            );
+            return Ok(ResolvedStream {
+                redirect_url: agnostic_url,
+            });
+        }
 
         let full_path = self.build_full_alist_path(alist_path);
         let db = self.db.clone();
-        // Singleflight：当 PlaybackInfo (IsPlayback=true) 预热与播放器 stream 并发到达时，共享同一个换链请求
+        // Singleflight：同 UA 并发请求共享同一个换链 Future
         let final_url = self
             .caches
             .alist_direct_urls
@@ -395,6 +463,13 @@ impl AppState {
             })
             .await
             .map_err(|e| anyhow!("{}", e))?;
+
+        if !is_ua_bound_cdn_url(&final_url) {
+            self.caches
+                .alist_ua_agnostic_urls
+                .insert(path_hash, final_url.clone())
+                .await;
+        }
 
         Ok(ResolvedStream {
             redirect_url: final_url,
@@ -564,6 +639,10 @@ impl AppState {
         client_ua: &str,
     ) -> Result<Option<String>> {
         const MAX_INTERNAL_HOPS: usize = 5;
+        // 单次请求阶梯超时（10 秒）：若冷资源首次触发小雅/ali2115 转存导致第 1 个连接挂起超过 10s，
+        // 服务端内部自动发起第 2 次重试（在服务端内部完成“退出重进”的二次请求），避免死等 35s 拖死播放器。
+        const FIRST_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const RETRY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
         let cfg = self.config.load();
         let encoded_path = utf8_percent_encode(full_path, PATH_ENCODE_SET).to_string();
@@ -572,25 +651,47 @@ impl AppState {
         let mut tried_signed = false;
 
         for hop in 0..MAX_INTERNAL_HOPS {
-            let mut resp = client
-                .get(&current_url)
-                .header("User-Agent", client_ua)
-                .header("Range", "bytes=0-0")
-                .send()
-                .await
-                .context("调用 AList /d/ 捕获直链失败")?;
+            let send_hop = |url: &str, timeout: std::time::Duration| {
+                client
+                    .get(url)
+                    .header("User-Agent", client_ua)
+                    .header("Range", "bytes=0-0")
+                    .timeout(timeout)
+                    .send()
+            };
+
+            let mut resp = match send_hop(&current_url, FIRST_ATTEMPT_TIMEOUT).await {
+                Ok(resp) => resp,
+                Err(first_err) if first_err.is_timeout() => {
+                    warn!(
+                        "⏳ [AList /d/ 冷启动首次 10s 超时] path={} | hop={}，服务端自动发起二次重连捕获已转存直链",
+                        full_path,
+                        hop + 1
+                    );
+                    send_hop(&current_url, RETRY_ATTEMPT_TIMEOUT)
+                        .await
+                        .context("调用 AList /d/ 二次重试捕获直链失败")?
+                }
+                Err(err) => return Err(err).context("调用 AList /d/ 捕获直链失败"),
+            };
 
             if hop == 0 && !tried_signed && matches!(resp.status().as_u16(), 401 | 403) {
                 tried_signed = true;
                 let token = self.get_alist_token(false).await?;
                 current_url = self.build_signed_d_url(full_path, &token, 14400)?;
-                resp = client
-                    .get(&current_url)
-                    .header("User-Agent", client_ua)
-                    .header("Range", "bytes=0-0")
-                    .send()
-                    .await
-                    .context("调用 AList 签名 /d/ 捕获直链失败")?;
+                resp = match send_hop(&current_url, FIRST_ATTEMPT_TIMEOUT).await {
+                    Ok(resp) => resp,
+                    Err(first_err) if first_err.is_timeout() => {
+                        warn!(
+                            "⏳ [AList 签名 /d/ 冷启动首次 10s 超时] path={}，服务端自动发起二次重连",
+                            full_path
+                        );
+                        send_hop(&current_url, RETRY_ATTEMPT_TIMEOUT)
+                            .await
+                            .context("调用 AList 签名 /d/ 二次重试捕获直链失败")?
+                    }
+                    Err(err) => return Err(err).context("调用 AList 签名 /d/ 捕获直链失败"),
+                };
             }
 
             if !resp.status().is_redirection() {

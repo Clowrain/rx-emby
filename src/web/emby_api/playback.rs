@@ -237,11 +237,20 @@ async fn get_playback_info_inner(
             }
             if let Some((_source_work_id, alist_path, path_hash)) = prewarm_source {
                 let state_clone = state.clone();
-                tokio::spawn(async move {
+                let mut prewarm_task = tokio::spawn(async move {
                     let _ = state_clone
                         .resolve_playback_url(path_hash, &alist_path, &client_ua)
                         .await;
                 });
+                // 智能软等待（Soft-Await 最多 3.5 秒）：
+                // 1. 常规/已预热资源（<3.5s）在 PlaybackInfo 返回前即可完成换链，播放器随后请求 /stream 0ms 拿 302；
+                // 2. 久未拉起的冷资源（8~15s 转存），在 PlaybackInfo 阶段先吃掉 3.5s 等待时间，后台 prewarm_task 继续执行，
+                //    播放器紧接着请求 /stream 时通过 path_hash 锁无缝接力剩余等待，彻底规避播放器内核 10s 流打开超时！
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(3500),
+                    &mut prewarm_task,
+                )
+                .await;
             }
         }
     }
@@ -627,6 +636,15 @@ pub(super) async fn stream_video(
 
     ensure_media_accessible(&state, &user_id, wid).await?;
     if method == Method::HEAD {
+        // 利用客户端（如 iOS AVPlayer / ExoPlayer）在正式 GET 拉流前先发 HEAD 探测的时间窗口，后台提前异步触发换链
+        let state_clone = state.clone();
+        let alist_path_clone = alist_path.clone();
+        let ua_clone = client_ua.to_string();
+        tokio::spawn(async move {
+            let _ = state_clone
+                .resolve_playback_url(path_hash, &alist_path_clone, &ua_clone)
+                .await;
+        });
         return head_stream_response(&alist_path);
     }
 

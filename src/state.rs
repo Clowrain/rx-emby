@@ -236,6 +236,11 @@ pub struct ScrapeScheduler {
 pub struct CacheLayer {
     /// Key = "{path_hash}:{client_ua}", Value = 网盘直链 raw_url
     pub alist_direct_urls: Cache<String, String>,
+    /// Key = path_hash，存储不绑定 UA 的通用网盘直链（如阿里云盘/天翼/夸克等，排除 115/百度等强校验 UA 的 CDN），
+    /// 实现 PlaybackInfo (UI UA) 预热后，/stream (播放器内核 UA) 0ms 直接跨 UA 命中！
+    pub alist_ua_agnostic_urls: Cache<i64, String>,
+    /// Key = path_hash，同一媒体文件的全局换链互斥锁：防止 PlaybackInfo 预热与播放器 /stream 因 UA 不同同时向小雅发起两次转存请求导致锁冲突
+    pub alist_path_locks: Cache<i64, Arc<Mutex<()>>>,
     /// Key = AList 父目录路径，记录已通过 fs/list 预热过寻址的目录（避免短时间重复 list）
     pub alist_dir_prewarmed: Cache<String, ()>,
     /// Key = "{size}/{file_name}", Value = 图片字节流。
@@ -271,6 +276,8 @@ impl CacheLayer {
     /// Moka 0.12 不启用后台淘汰线程；定时执行 pending tasks 才能在无请求时释放过期/失效条目。
     pub async fn run_pending_tasks(&self) {
         self.alist_direct_urls.run_pending_tasks().await;
+        self.alist_ua_agnostic_urls.run_pending_tasks().await;
+        self.alist_path_locks.run_pending_tasks().await;
         self.alist_dir_prewarmed.run_pending_tasks().await;
         self.image_hot_bytes.run_pending_tasks().await;
         self.collage_cache.run_pending_tasks().await;
@@ -348,6 +355,16 @@ impl AppState {
         let direct_urls = Cache::builder()
             .max_capacity(20_000)
             .time_to_live(Duration::from_secs(initial_cfg.direct_url_ttl_sec))
+            .build();
+
+        let ua_agnostic_urls = Cache::builder()
+            .max_capacity(20_000)
+            .time_to_live(Duration::from_secs(initial_cfg.direct_url_ttl_sec))
+            .build();
+
+        let path_locks = Cache::builder()
+            .max_capacity(10_000)
+            .time_to_idle(Duration::from_secs(120))
             .build();
 
         let dir_prewarmed = Cache::builder()
@@ -441,6 +458,8 @@ impl AppState {
             },
             caches: CacheLayer {
                 alist_direct_urls: direct_urls,
+                alist_ua_agnostic_urls: ua_agnostic_urls,
+                alist_path_locks: path_locks,
                 alist_dir_prewarmed: dir_prewarmed,
                 image_hot_bytes: inflight,
                 collage_cache,
@@ -575,6 +594,7 @@ impl AppState {
             *token_guard = None;
             *self.alist_auth.last_refresh_at.write().await = None;
             self.caches.alist_direct_urls.invalidate_all();
+            self.caches.alist_ua_agnostic_urls.invalidate_all();
             self.caches.alist_dir_prewarmed.invalidate_all();
             info!("AList 配置已变更，旧 Token、直链及目录预热缓存已清空");
         }

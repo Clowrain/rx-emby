@@ -255,6 +255,8 @@ async fn get_item_detail_inner(
 
     if let Some((wid, snum, epnum)) = parse_episode_id(item_id) {
         ensure_media_accessible(state, user_id, wid).await?;
+        // 补齐单集详情页（如从首页继续观看/NextUp 直接点进单集）的小雅父目录寻址与体积预热
+        state.spawn_prewarm_media_dirs(wid, Some(snum));
 
         let has_file: bool = sqlx::query_scalar(
             r#"
@@ -395,7 +397,7 @@ async fn get_season_detail(
         "IsFavorite": is_fav,
         "LastPlayedDate": season_histories.iter().filter_map(|h| h.last_played_date).max()
     });
-    state.spawn_prewarm_media_dirs(wid, None);
+    state.spawn_prewarm_media_dirs(wid, Some(snum));
 
     let row: Option<SeasonMetadata> = sqlx::query_as(
         r#"
