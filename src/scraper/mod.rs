@@ -989,6 +989,36 @@ pub async fn scrape_single_folder_with_mode(
         }
     }
 
+    // 0. 泛词/结构目录名安全拦截：禁止将 Specials / 国语版 / 第一季 / 剧场版 等非片名目录送往 TMDB 关键词搜索，
+    // 防止跨作品“黑洞归并”。若无有效 parsed_tmdb_id 则直接标记 conflict。
+    let is_generic_title = crate::sync::parser::is_generic_non_title(&folder.clean_title);
+    if is_generic_title && folder.parsed_tmdb_id.is_none() {
+        let conflict_reason = format!(
+            "泛词/结构目录名「{}」无法直接刮削，请检查目录归属或重新同步",
+            folder.clean_title
+        );
+        sqlx::query(
+            r#"
+            UPDATE sync_folders SET
+                scrape_state = 'conflict',
+                conflict_reason = $1,
+                work_id = NULL,
+                updated_at = NOW()
+            WHERE id = $2
+            "#,
+        )
+        .bind(&conflict_reason)
+        .bind(folder.id)
+        .execute(&state.db)
+        .await?;
+        invalidate_admin_stats(state).await;
+        info!(
+            "⚠️ [Scraper] 拦截泛词目录 folder_id={}: {}",
+            folder.id, conflict_reason
+        );
+        return Ok(());
+    }
+
     // 1. 若自带 parsed_tmdb_id 且库中已有新鲜且同类型的正式作品，先本地交叉校验后零开销复用
     if let Some(tid) = folder.parsed_tmdb_id {
         let cached_work: Option<WorkSummaryRow> = sqlx::query_as(
@@ -1070,36 +1100,47 @@ pub async fn scrape_single_folder_with_mode(
                 }) {
                     Ok(()) => Ok(Ok(meta)),
                     Err(reason) => {
-                        debug!(
-                            "⚠️ [Scraper] folder_id={} parsed_tmdb_id={} 校验未通过({}), 降级用片名搜索兜底",
-                            folder.id, tid, reason
-                        );
-                        match state
-                            .scrape_tmdb_metadata(
-                                None,
-                                effective_type,
-                                &folder.clean_title,
-                                folder.year,
-                            )
-                            .await
-                        {
-                            Ok(fb) => {
-                                match verify_tmdb_match(TmdbMatch {
-                                    clean_title: &folder.clean_title,
-                                    local_year: folder.year,
-                                    ep_count,
-                                    max_season,
-                                    strict_title_check: false,
-                                    media_type: &fb.media_type,
-                                    title: &fb.title,
-                                    original_title: fb.original_title.as_deref(),
-                                    year: fb.year,
-                                }) {
-                                    Ok(()) => Ok(Ok(fb)),
-                                    Err(fb_reason) => Ok(Err(fb_reason)),
+                        if is_generic_title {
+                            debug!(
+                                "⚠️ [Scraper] folder_id={} parsed_tmdb_id={} 校验未通过({}) 且目录名为泛词「{}」，禁止降级搜索",
+                                folder.id, tid, reason, folder.clean_title
+                            );
+                            Ok(Err(format!(
+                                "泛词/结构目录名「{}」与 TMDB({}) 校验冲突，禁止降级搜索：{}",
+                                folder.clean_title, tid, reason
+                            )))
+                        } else {
+                            debug!(
+                                "⚠️ [Scraper] folder_id={} parsed_tmdb_id={} 校验未通过({}), 降级用片名搜索兜底",
+                                folder.id, tid, reason
+                            );
+                            match state
+                                .scrape_tmdb_metadata(
+                                    None,
+                                    effective_type,
+                                    &folder.clean_title,
+                                    folder.year,
+                                )
+                                .await
+                            {
+                                Ok(fb) => {
+                                    match verify_tmdb_match(TmdbMatch {
+                                        clean_title: &folder.clean_title,
+                                        local_year: folder.year,
+                                        ep_count,
+                                        max_season,
+                                        strict_title_check: false,
+                                        media_type: &fb.media_type,
+                                        title: &fb.title,
+                                        original_title: fb.original_title.as_deref(),
+                                        year: fb.year,
+                                    }) {
+                                        Ok(()) => Ok(Ok(fb)),
+                                        Err(fb_reason) => Ok(Err(fb_reason)),
+                                    }
                                 }
+                                Err(_) => Ok(Err(reason)),
                             }
-                            Err(_) => Ok(Err(reason)),
                         }
                     }
                 }

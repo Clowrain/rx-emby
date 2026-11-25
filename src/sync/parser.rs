@@ -8,7 +8,7 @@ static TMDB_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\{tmdb-(\d+)\}").
 static YEAR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[\(\[（](19\d{2}|20\d{2})[\)\]）]|\b(19\d{2}|20\d{2})\b").unwrap());
 static SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?:S(\d{1,3})E(\d{1,4})|(?:^|[^A-Za-z0-9])E(\d{1,4})(?:$|[^0-9])|第\s*(\d{1,4})\s*[集话期])").unwrap()
+    Regex::new(r"(?i)(?:S(\d{1,3})E(\d{1,4})|(?:^|[^A-Za-z0-9])EP?(\d{1,4})(?:$|[^0-9])|第\s*(\d{1,4})\s*[集话期])").unwrap()
 });
 static CN_PART_EP_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:(?:^|[\s._\-\[\(（])(上|中|下)[集篇部卷]|[\(\[（](上|中|下)[\)\]）])(?:$|[\s._\-\]\)）])").unwrap()
@@ -23,7 +23,7 @@ static BARE_NUM_END_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?:^|[\s._\-])(?:EP?)?0*(\d{1,3})$").unwrap()
 });
 static SEASON_DIR_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?:(?:^|[\s._\-\[\(])Season\s*(\d{1,3})(?:$|[\s._\-\]\)])|(?:^|[\s._\-\[\(])S0*(\d{1,3})(?:$|[\s._\-\]\)])|第\s*(\d{1,3})\s*季)").unwrap()
+    Regex::new(r"(?i)(?:(?:^|[\s._\-\[\(])Season\s*(\d{1,4})(?:$|[\s._\-\]\)])|(?:^|[\s._\-\[\(])S0*(\d{1,3})(?:$|[\s._\-\]\)])|第\s*(\d{1,3})\s*季)").unwrap()
 });
 static NOISE_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?:刮削失败|每日更新|临时目录|未分类|115|阿里云盘|夸克网盘)/+").unwrap()
@@ -145,13 +145,28 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
 
     // 定位季集号（优先看右侧真实文件名，防止上游左侧误标如 S20E19，其次回退左侧文件名）
     let left_file = segments.last().copied().unwrap_or(&file_name);
-    let (mut season_opt, ep_num_opt) = extract_season_episode(&file_name)
-        .unwrap_or_else(|| extract_season_episode(left_file).unwrap_or((None, None)));
+    let mut suppress_year_season_backfill = false;
+    let (mut season_opt, ep_num_opt) = match extract_season_episode(&file_name) {
+        Some(pair) => pair,
+        None => match extract_season_episode(left_file) {
+            Some((Some(s), Some(e)))
+                if is_upstream_year_misparse_as_season_ep(s, e, &file_name) =>
+            {
+                suppress_year_season_backfill = true;
+                (None, None)
+            }
+            Some(pair) => pair,
+            None => (None, None),
+        },
+    };
 
-    // 若文件名未写明季号（如仅写了 "01.mkv" 或 "E01.mkv"），从父级目录（如 "Season 1" / "Season 0" / "第一季"）回溯季号
+    // 若文件名未写明季号（如仅写了 "01.mkv" / "E01.mkv" 或位于 Specials / Season X 下），从父级目录回溯季号
     if season_opt.is_none() && segments.len() >= 2 {
         for seg in segments.iter().rev().skip(1).take(2) {
             if let Some(s) = extract_season_from_dir(seg) {
+                if suppress_year_season_backfill && matches!(s, 19 | 20) {
+                    continue;
+                }
                 season_opt = Some(s);
                 break;
             }
@@ -170,7 +185,7 @@ pub fn parse_strm_line(raw_line: &str) -> Option<ParsedStrmRecord> {
         ("movie".to_string(), 0, 1)
     };
 
-    // 定位影视根目录（跳过末级文件名以及可能存在的 Season X 子目录）
+    // 定位影视根目录（跳过末级文件名以及可能存在的 Season X / Specials / 语言版本子目录）
     let (root_dir, raw_folder_name) = locate_media_root(&segments, is_tv, &file_name);
     let (clean_title, year) = extract_title_and_year(&raw_folder_name);
 
@@ -394,7 +409,95 @@ pub fn reparse_file_for_manual_preview(
     }
 }
 
+fn is_upstream_year_misparse_as_season_ep(season: i32, episode: i32, right_file_name: &str) -> bool {
+    if !matches!(season, 19 | 20) || !(0..=99).contains(&episode) {
+        return false;
+    }
+    let year_str = format!("{:02}{:02}", season, episode);
+    right_file_name.contains(&year_str)
+}
+
+fn parse_cn_season_dir(dir_name: &str) -> Option<i32> {
+    let trimmed = dir_name.trim();
+    let inner = trimmed.strip_prefix('第')?.strip_suffix('季')?.trim();
+    let val = match inner {
+        "一" => 1,
+        "二" | "两" => 2,
+        "三" => 3,
+        "四" => 4,
+        "五" => 5,
+        "六" => 6,
+        "七" => 7,
+        "八" => 8,
+        "九" => 9,
+        "十" => 10,
+        "十一" => 11,
+        "十二" => 12,
+        "十三" => 13,
+        "十四" => 14,
+        "十五" => 15,
+        "十六" => 16,
+        "十七" => 17,
+        "十八" => 18,
+        "十九" => 19,
+        "二十" => 20,
+        _ => return None,
+    };
+    Some(val)
+}
+
+fn is_special_season_dir(dir_name: &str) -> bool {
+    matches!(
+        dir_name.trim().to_ascii_lowercase().as_str(),
+        "specials"
+            | "special"
+            | "sp"
+            | "sps"
+            | "ova"
+            | "oad"
+            | "extras"
+            | "bonus"
+            | "oped"
+            | "特别篇"
+            | "番外"
+            | "番外篇"
+            | "特典"
+    )
+}
+
+fn is_auxiliary_subdir(dir_name: &str) -> bool {
+    matches!(
+        dir_name.trim().to_ascii_lowercase().as_str(),
+        "国语"
+            | "国语版"
+            | "粤语"
+            | "粤语版"
+            | "国粤双语"
+            | "英语"
+            | "英文原片"
+            | "subbed"
+            | "原声"
+            | "剧场版"
+            | "电影版"
+    )
+}
+
+/// 判断名称是否为非独立片名的通用结构词/季目录/语言版本目录，禁止直接送往 TMDB 关键词搜索
+pub fn is_generic_non_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    trimmed.is_empty()
+        || is_pure_tmdb_segment(trimmed)
+        || extract_season_from_dir(trimmed).is_some()
+        || is_auxiliary_subdir(trimmed)
+}
+
 fn extract_season_from_dir(dir_name: &str) -> Option<i32> {
+    if is_special_season_dir(dir_name) {
+        return Some(0);
+    }
+    if let Some(cn_season) = parse_cn_season_dir(dir_name) {
+        return Some(cn_season);
+    }
     let caps = SEASON_DIR_RE.captures(dir_name)?;
     caps.get(1)
         .or_else(|| caps.get(2))
@@ -408,27 +511,34 @@ fn locate_media_root(segments: &[&str], is_tv: bool, file_name: &str) -> (String
         return (name.clone(), name);
     }
 
-    // 去掉末级文件名
+    // 去掉末级文件名，并循环剥离末尾的季目录 / 特别篇目录 / 纯语言或附属子目录
     let mut dir_end = segments.len() - 1;
-    // 如果是剧集：
-    // 1) 倒数第二级是 Season X / 第一季，则再往上一级作为剧集根目录
-    // 2) 若末级目录是纯 {tmdb-xxx} 且再上一级是 Season X，同样跳过 Season X/{tmdb-xxx}，使多季聚合到同一剧集根目录
-    if is_tv {
+    loop {
+        // 如 ".../安妮卡 (2021)/Season 2/{tmdb-130273}" -> 跳过 Season 2/{tmdb-130273} 聚合到主剧集根目录
         if dir_end >= 3
             && is_pure_tmdb_segment(segments[dir_end - 1])
             && extract_season_from_dir(segments[dir_end - 2]).is_some()
         {
             dir_end -= 2;
-        } else if dir_end >= 2 && extract_season_from_dir(segments[dir_end - 1]).is_some() {
-            dir_end -= 1;
+            continue;
         }
+        // 如 ".../豪斯医生 (2004)/{tmdb-1408}/Specials"、".../黑死病 (2018)/{tmdb-76303}/Season 1/extras"、".../青春训练班 (2022)/{tmdb-155769}/国语"
+        if dir_end >= 2
+            && (extract_season_from_dir(segments[dir_end - 1]).is_some()
+                || is_auxiliary_subdir(segments[dir_end - 1]))
+        {
+            dir_end -= 1;
+            continue;
+        }
+        break;
     }
 
     let root_dir = segments[..dir_end].join("/");
     let mut raw_folder_name = segments[dir_end - 1].to_string();
 
-    // 若当前目录名仅为 {tmdb-xxx}（如 "电影/人人影视电影合集/{tmdb-54093}/Killing.Bono.2011.mkv"）：
-    // 仅当上级目录是无年份的合集/系列/分类目录、且非剧集、且文件名不是纯集号/分辨率标签时，才从文件名提取片名；
+    // 若当前目录名仅为 {tmdb-xxx}（如 "电影/人人影视电影合集/{tmdb-54093}/Killing.Bono.2011.mkv"
+    // 或 "动漫/【合集】迪士尼动画/国语版/{tmdb-10681}/WALL.E.2008.mkv"）：
+    // 仅当上级（或上上级）是无年份的合集/系列/分类目录、且非剧集、且文件名不是纯集号/分辨率标签时，才从文件名提取片名；
     // 否则保留上级真实片名目录（如 "传闻中的陈芊芊 (2020)/{tmdb-103635}/S01E01.mp4" 或 "扎职2/{tmdb-993100}/4K.帧琦映画.mp4"）。
     if is_pure_tmdb_segment(&raw_folder_name) {
         let parent_seg = if dir_end >= 2 {
@@ -436,7 +546,12 @@ fn locate_media_root(segments: &[&str], is_tv: bool, file_name: &str) -> (String
         } else {
             ""
         };
-        if should_extract_from_filename_for_pure_tmdb(parent_seg, is_tv) {
+        let grandparent_seg = if dir_end >= 3 {
+            Some(segments[dir_end - 3])
+        } else {
+            None
+        };
+        if should_extract_from_filename_for_pure_tmdb(parent_seg, grandparent_seg, is_tv) {
             if let Some(stem_clean) = clean_video_stem(file_name) {
                 raw_folder_name = stem_clean;
             } else if !parent_seg.is_empty() {
@@ -460,7 +575,11 @@ pub fn is_pure_tmdb_root_dir(root_dir: &str) -> bool {
         .is_some_and(is_pure_tmdb_segment)
 }
 
-fn should_extract_from_filename_for_pure_tmdb(parent_seg: &str, is_tv: bool) -> bool {
+fn should_extract_from_filename_for_pure_tmdb(
+    parent_seg: &str,
+    grandparent_seg: Option<&str>,
+    is_tv: bool,
+) -> bool {
     if is_tv {
         return false;
     }
@@ -469,7 +588,81 @@ fn should_extract_from_filename_for_pure_tmdb(parent_seg: &str, is_tv: bool) -> 
         return true;
     }
     let (_, parent_year) = extract_title_and_year(trimmed);
-    parent_year.is_none() && is_collection_or_category_folder(trimmed)
+    if parent_year.is_some() {
+        return false;
+    }
+    if is_collection_or_category_folder(trimmed) || is_auxiliary_subdir(trimmed) {
+        return true;
+    }
+    grandparent_seg.is_some_and(|gp| {
+        let gp_trimmed = gp.trim();
+        !gp_trimmed.is_empty() && is_collection_or_category_folder(gp_trimmed)
+    })
+}
+
+/// 批量结构 Pass：识别同一父目录下直接挂载了 >= 2 个不同纯 `{tmdb-xxx}` 的非剧集合集容器
+/// （如 `动漫/【合集】迪士尼动画/国语版`、`电影/4K系列/憨豆先生电影5部+短片`、`音乐/演唱会/雅尼音乐会` 等），
+/// 自动从视频文件名回填真实片名与年份；严格排除季目录、带年份的单作品目录及剧集，确保 0 误伤。
+pub fn refine_multi_tmdb_collection_titles(records: &mut [ParsedStrmRecord]) {
+    use std::collections::HashMap;
+
+    let mut parent_to_tmdbs: HashMap<String, HashSet<i32>> = HashMap::new();
+    for rec in records.iter() {
+        if rec.inferred_media_type != "movie" {
+            continue;
+        }
+        let Some(tid) = rec.tmdb_id else {
+            continue;
+        };
+        let Some((parent_dir, last_seg)) = rec.root_dir.rsplit_once('/') else {
+            continue;
+        };
+        if !is_pure_tmdb_segment(last_seg) || parent_dir.is_empty() {
+            continue;
+        }
+        let parent_leaf = parent_dir.rsplit('/').next().unwrap_or("");
+        if extract_season_from_dir(parent_leaf).is_some() {
+            continue;
+        }
+        let (_, parent_year) = extract_title_and_year(parent_leaf);
+        if parent_year.is_some() {
+            continue;
+        }
+        parent_to_tmdbs
+            .entry(parent_dir.to_string())
+            .or_default()
+            .insert(tid);
+    }
+
+    let collection_parents: HashSet<String> = parent_to_tmdbs
+        .into_iter()
+        .filter_map(|(parent, tids)| (tids.len() >= 2).then_some(parent))
+        .collect();
+    if collection_parents.is_empty() {
+        return;
+    }
+
+    for rec in records.iter_mut() {
+        if rec.inferred_media_type != "movie" {
+            continue;
+        }
+        let Some((parent_dir, last_seg)) = rec.root_dir.rsplit_once('/') else {
+            continue;
+        };
+        if !is_pure_tmdb_segment(last_seg) || !collection_parents.contains(parent_dir) {
+            continue;
+        }
+        if let Some(stem_clean) = clean_video_stem(&rec.file_name) {
+            let (new_title, new_year) = extract_title_and_year(&stem_clean);
+            if !new_title.is_empty() && !is_generic_non_title(&new_title) {
+                rec.raw_folder_name = stem_clean;
+                rec.clean_title = new_title;
+                if new_year.is_some() {
+                    rec.year = new_year;
+                }
+            }
+        }
+    }
 }
 
 fn is_collection_or_category_folder(seg: &str) -> bool {
@@ -548,7 +741,8 @@ pub fn resolve_pure_tmdb_folder_title_year(
         return None;
     }
 
-    if should_extract_from_filename_for_pure_tmdb(parent_seg, false) {
+    let grandparent_seg = rev_segs.next();
+    if should_extract_from_filename_for_pure_tmdb(parent_seg, grandparent_seg, false) {
         for fname in file_names {
             if let Some(parsed) = extract_title_and_year_from_filename(fname) {
                 return Some(parsed);
@@ -1180,5 +1374,170 @@ mod tests {
             5,
         );
         assert_eq!((bare.season_number, bare.episode_number), (1, 3));
+    }
+
+    #[test]
+    fn test_specials_and_nested_structural_subdirs_collapse_to_show_root() {
+        // 1. 豪斯医生 {tmdb-1408}/Specials -> 归回主剧根目录并保留正确剧名与年份
+        let house = parse_strm_line(
+            "电视剧/欧美/美剧（已刮削）/豪斯医生 (2004)/{tmdb-1408}/Specials/House.S08E23.1080p.strm#http://127.0.0.1:5678/d/电视剧/欧美/美剧（已刮削）/豪斯医生 (2004)/House.S08/House.S08E23.1080p.mkv",
+        )
+        .unwrap();
+        assert_eq!(
+            house.root_dir,
+            "电视剧/欧美/美剧（已刮削）/豪斯医生 (2004)/{tmdb-1408}"
+        );
+        assert_eq!(house.clean_title, "豪斯医生");
+        assert_eq!(house.year, Some(2004));
+        assert_eq!(house.tmdb_id, Some(1408));
+
+        // 2. Specials 下仅含“第01话” -> 应回溯为 Season 0 Episode 1（不能落到 S01E01）
+        let zichuan = parse_strm_line(
+            "动漫/国漫/2021/紫川 (2021)/{tmdb-153869}/Specials/紫川·隐藏互动剧 第01话.strm#http://127.0.0.1:5678/d/每日更新/动漫/国漫/2021/2021.紫川/紫川·隐藏互动剧 第01话.mp4",
+        )
+        .unwrap();
+        assert_eq!(zichuan.root_dir, "动漫/国漫/2021/紫川 (2021)/{tmdb-153869}");
+        assert_eq!(zichuan.clean_title, "紫川");
+        assert_eq!(zichuan.season_number, 0);
+        assert_eq!(zichuan.episode_number, 1);
+
+        // 3. 多层嵌套：Season 1/extras、Season 03/Subbed、{tmdb}/国语、第一季、Season 2020
+        let extras = parse_strm_line(
+            "电视剧/欧美/美剧（已刮削）/黑死病 (2018)/{tmdb-76303}/Season 1/extras/bonus.strm#http://127.0.0.1:5678/d/电视剧/黑死病/bonus.mkv",
+        )
+        .unwrap();
+        assert_eq!(
+            extras.root_dir,
+            "电视剧/欧美/美剧（已刮削）/黑死病 (2018)/{tmdb-76303}"
+        );
+        assert_eq!(extras.clean_title, "黑死病");
+        assert_eq!(extras.season_number, 0);
+
+        let subbed = parse_strm_line(
+            "刮削失败/动漫/爷青回/飞哥与小佛 (2007)/Season 03/Subbed/S03E01.strm#http://127.0.0.1:5678/d/飞哥与小佛/S03E01.mkv",
+        )
+        .unwrap();
+        assert_eq!(subbed.root_dir, "动漫/爷青回/飞哥与小佛 (2007)");
+        assert_eq!(subbed.clean_title, "飞哥与小佛");
+        assert_eq!(subbed.season_number, 3);
+
+        let lang_sub = parse_strm_line(
+            "电视剧/港台/TVB/青春训练班 (2022)/{tmdb-155769}/国语/S01E01.strm#http://127.0.0.1:5678/d/青春训练班/01.mkv",
+        )
+        .unwrap();
+        assert_eq!(
+            lang_sub.root_dir,
+            "电视剧/港台/TVB/青春训练班 (2022)/{tmdb-155769}"
+        );
+        assert_eq!(lang_sub.clean_title, "青春训练班");
+
+        let cn_season = parse_strm_line(
+            "115/电视剧/欧洲其它/追迹 (2018)/{tmdb-81987}/第二季/S02E01.strm#http://127.0.0.1:5678/d/追迹/S02E01.mkv",
+        )
+        .unwrap();
+        assert_eq!(cn_season.root_dir, "电视剧/欧洲其它/追迹 (2018)/{tmdb-81987}");
+        assert_eq!(cn_season.clean_title, "追迹");
+        assert_eq!(cn_season.season_number, 2);
+
+        let year_season = parse_strm_line(
+            "115/电视剧/中国/2020s/二十不惑 (2020)/{tmdb-137680}/Season 2020/S2020E01.strm#http://127.0.0.1:5678/d/二十不惑/01.mkv",
+        )
+        .unwrap();
+        assert_eq!(
+            year_season.root_dir,
+            "电视剧/中国/2020s/二十不惑 (2020)/{tmdb-137680}"
+        );
+        assert_eq!(year_season.clean_title, "二十不惑");
+
+        // 4. 真实衍生剧子目录（爱·回家之八时入席）不得被误剥
+        let spinoff = parse_strm_line(
+            "电视剧/港台/TVB/爱·回家 (2012)/{tmdb-84791}/爱·回家之八时入席/S01E01.strm#http://127.0.0.1:5678/d/爱回家/S01E01.mkv",
+        )
+        .unwrap();
+        assert_eq!(spinoff.clean_title, "爱·回家之八时入席");
+    }
+
+    #[test]
+    fn test_upstream_s20_year_misparse_and_ep_regex_safety() {
+        // 1. 左侧 S20E19 与右侧文件名年份 2019 撞号 -> 拦截误标，不落成 S20E19
+        let s20 = parse_strm_line(
+            "115/电视剧/中国/2010s/致我们暖暖的小时光 (2019)/{tmdb-88548}/致我们暖暖的小时光.2019.S20E19.1080p.strm#http://127.0.0.1:5678/d/小时光/致我们暖暖的小时光.Put.Your.Head.on.My.Shoulder.2019.Bonus.1080p.mp4",
+        )
+        .unwrap();
+        assert_eq!(s20.season_number, 0);
+        assert_eq!(s20.episode_number, 1);
+
+        // 2. 即使上游顺手建了 Season 20 子目录，撞号年份 2017 也不得回填为 S20
+        let s20_dir = parse_strm_line(
+            "115/电视剧/日本/2010s/哥哥太爱我了怎么办 (2017)/{tmdb-78544}/Season 20/哥哥太爱我了怎么办.2017.S20E17.strm#http://127.0.0.1:5678/d/哥哥/2017 哥哥太爱我了怎么办-电影版.mp4",
+        )
+        .unwrap();
+        assert_eq!(s20_dir.season_number, 0);
+        assert_eq!(s20_dir.clean_title, "哥哥太爱我了怎么办");
+
+        // 3. EP001 正确识别为 E01
+        let ep_rec = parse_strm_line(
+            "动漫/儿童/米老鼠和唐老鸭 (1986)/米老鼠和唐老鸭EP001.strm#http://127.0.0.1:5678/d/米老鼠/米老鼠和唐老鸭EP001.mp4",
+        )
+        .unwrap();
+        assert_eq!(ep_rec.inferred_media_type, "tv");
+        assert_eq!(ep_rec.season_number, 1);
+        assert_eq!(ep_rec.episode_number, 1);
+
+        // 4. 电影合集原盘 "最佳拍档1-5集" 不得误判为电视剧
+        let movie_iso = parse_strm_line(
+            "ISO/电影/香港/1980s/最佳拍档 (1982)/{tmdb-2644}/最佳拍档.strm#http://127.0.0.1:5678/d/ISO/[最佳拍档1-5集 Aces Go Places1-5 1982-1989]最佳拍档1 1982.iso",
+        )
+        .unwrap();
+        assert_eq!(movie_iso.inferred_media_type, "movie");
+        assert_eq!(movie_iso.season_number, 0);
+        assert_eq!(movie_iso.episode_number, 1);
+    }
+
+    #[test]
+    fn test_multi_tmdb_collection_refinement_and_tv_guard() {
+        // 1. 迪士尼动画/国语版/{tmdb-xxx}（合集在祖父层 + 父层为国语版）-> 直接从文件名取片名
+        let disney = parse_strm_line(
+            "动漫/【合集】迪士尼动画/国语版/{tmdb-10681}/WALL.E.2008.1080p.strm#http://127.0.0.1:5678/d/迪士尼/WALL.E.2008.1080p.mkv",
+        )
+        .unwrap();
+        assert_eq!(disney.clean_title, "WALL E");
+        assert_eq!(disney.year, Some(2008));
+
+        // 2. 无关键词但下辖 >=2 个不同纯 {tmdb-xxx} 的非剧集合集 -> 批量 Pass 自动回填片名
+        let mut records = vec![
+            parse_strm_line(
+                "纪录片/音乐，艺术与设计/诗画中国/{tmdb-1001}/诗画中国之山水.2022.strm#http://127.0.0.1:5678/d/doc/诗画中国之山水.2022.mp4",
+            )
+            .unwrap(),
+            parse_strm_line(
+                "纪录片/音乐，艺术与设计/诗画中国/{tmdb-1002}/诗画中国之花鸟.2023.strm#http://127.0.0.1:5678/d/doc/诗画中国之花鸟.2023.mp4",
+            )
+            .unwrap(),
+            // 剧集 Season 1 下多 tmdb 不得被拆成合集
+            parse_strm_line(
+                "电视剧/韩国/密会 (2014)/Season 1/{tmdb-2001}/S01E01.strm#http://127.0.0.1:5678/d/密会/S01E01.mkv",
+            )
+            .unwrap(),
+            parse_strm_line(
+                "电视剧/韩国/密会 (2014)/Season 1/{tmdb-2002}/S01E02.strm#http://127.0.0.1:5678/d/密会/S01E02.mkv",
+            )
+            .unwrap(),
+        ];
+        refine_multi_tmdb_collection_titles(&mut records);
+        assert_eq!(records[0].clean_title, "诗画中国之山水");
+        assert_eq!(records[0].year, Some(2022));
+        assert_eq!(records[1].clean_title, "诗画中国之花鸟");
+        assert_eq!(records[1].year, Some(2023));
+        assert_eq!(records[2].clean_title, "密会");
+        assert_eq!(records[3].clean_title, "密会");
+
+        // 3. 泛词拦截校验
+        assert!(is_generic_non_title("Specials"));
+        assert!(is_generic_non_title("Special"));
+        assert!(is_generic_non_title("国语版"));
+        assert!(is_generic_non_title("第一季"));
+        assert!(is_generic_non_title("Season 5"));
+        assert!(!is_generic_non_title("豪斯医生"));
     }
 }

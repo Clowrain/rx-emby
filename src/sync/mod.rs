@@ -893,6 +893,7 @@ async fn execute_sync_pipeline(state: &AppState, force: bool) -> Result<()> {
 
         subtitle_index.attach(&mut parsed_records);
         drop(subtitle_index);
+        parser::refine_multi_tmdb_collection_titles(&mut parsed_records);
         let deduped = deduplicate_records(parsed_records);
 
         set_sync_progress(
