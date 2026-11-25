@@ -203,8 +203,12 @@ impl ScrapeRuntime {
             let succeeded = self.batch_succeeded.load(Ordering::Relaxed);
             let failed = self.batch_failed.load(Ordering::Relaxed);
             let total = self.batch_total.load(Ordering::Relaxed);
-            if let Some(front) = hist.front_mut() {
-                if matches!(front.status.as_str(), "running" | "paused") {
+            let front_is_active = hist
+                .front()
+                .is_some_and(|f| matches!(f.status.as_str(), "running" | "paused"));
+
+            if front_is_active {
+                if let Some(front) = hist.front_mut() {
                     front.done = done;
                     front.succeeded = succeeded;
                     front.failed = failed;
@@ -235,6 +239,9 @@ impl ScrapeRuntime {
                     succeeded,
                     failed,
                 });
+                while hist.len() > 20 {
+                    hist.pop_back();
+                }
             }
         }
     }
@@ -303,15 +310,13 @@ impl ScrapeRuntime {
 
     pub fn clear_idle_counters_if_done(&self) {
         if self.active.load(Ordering::Relaxed) == 0 && !self.paused.load(Ordering::Relaxed) {
-            let total = self.batch_total.load(Ordering::Relaxed);
-            let done = self.batch_done.load(Ordering::Relaxed);
-            if total == 0 || done >= total {
-                self.sync_front_history(Some("completed"));
-                if total == 0 {
-                    self.batch_done.store(0, Ordering::Relaxed);
-                    self.batch_succeeded.store(0, Ordering::Relaxed);
-                    self.batch_failed.store(0, Ordering::Relaxed);
-                }
+            self.sync_front_history(Some("completed"));
+            self.batch_total.store(0, Ordering::SeqCst);
+            self.batch_done.store(0, Ordering::SeqCst);
+            self.batch_succeeded.store(0, Ordering::SeqCst);
+            self.batch_failed.store(0, Ordering::SeqCst);
+            if let Ok(mut guard) = self.task_name.lock() {
+                *guard = None;
             }
         }
     }
@@ -1776,6 +1781,48 @@ mod scheduled_task_tests {
     fn work_upsert_mode_separates_content_change_from_metadata_refresh() {
         assert!(WorkUpsertMode::ContentChange.touches_updated_at());
         assert!(!WorkUpsertMode::MetadataRefreshOnly.touches_updated_at());
+    }
+
+    #[test]
+    fn history_creates_separate_records_across_completed_batches_and_auto_scrapes() {
+        let runtime = ScrapeRuntime::default();
+
+        // 1. 批次 #1：提交 5 项但仅执行 3 项后队列变空 -> 仍应结算为 completed 并清零计数
+        runtime.add_batch_items("批量刮削指定目录", 5);
+        runtime.record_item_result(true);
+        runtime.record_item_result(true);
+        runtime.record_item_result(false);
+        runtime.clear_idle_counters_if_done();
+
+        // 2. 批次 #2：再次调用 add_batch_items -> 应新建 #2 而非覆盖 #1
+        runtime.add_batch_items("补齐正式作品 TMDB 元数据", 2);
+        runtime.record_item_result(true);
+        runtime.record_item_result(true);
+        runtime.clear_idle_counters_if_done();
+
+        // 3. 批次 #3：后台自动/P0 刮削（不走 start_batch）-> 应新建 #3 而非丢弃或覆盖 #2
+        runtime.record_item_result(true);
+        runtime.clear_idle_counters_if_done();
+
+        let hist = runtime.history.lock().unwrap();
+        assert_eq!(hist.len(), 3);
+        assert_eq!(hist[0].id, 3);
+        assert_eq!(hist[0].task_name, "后台全库自动刮削");
+        assert_eq!(hist[0].done, 1);
+        assert_eq!(hist[0].status, "completed");
+
+        assert_eq!(hist[1].id, 2);
+        assert_eq!(hist[1].task_name, "补齐正式作品 TMDB 元数据");
+        assert_eq!(hist[1].done, 2);
+        assert_eq!(hist[1].succeeded, 2);
+        assert_eq!(hist[1].status, "completed");
+
+        assert_eq!(hist[2].id, 1);
+        assert_eq!(hist[2].task_name, "批量刮削指定目录");
+        assert_eq!(hist[2].done, 3);
+        assert_eq!(hist[2].succeeded, 2);
+        assert_eq!(hist[2].failed, 1);
+        assert_eq!(hist[2].status, "completed");
     }
 
     #[tokio::test]
